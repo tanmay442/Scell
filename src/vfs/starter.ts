@@ -98,6 +98,21 @@ export function seedStarterProject(vfs: Vfs): void {
   }
 }
 
+/**
+ * Some earlier builds saved a broken workspace: the migration wrote only the
+ * dotfiles and the starter project never landed. Heal those homes — seed the
+ * project files whenever ~/project is gone and nothing but dotfiles remain,
+ * so a deliberate `rm -rf ~/project` next to real work is respected.
+ */
+export function ensureStarterProject(vfs: Vfs): void {
+  if (vfs.exists(`${PROJECT}/README.md`)) return
+  const hasRealContent = vfs.listAllFiles().some((path) => !path.slice(path.lastIndexOf('/') + 1).startsWith('.'))
+  if (hasRealContent) return
+  for (const [path, content] of Object.entries(FILES)) {
+    if (path.startsWith(`${PROJECT}/`) && vfs.read(path) === null) vfs.write(path, content)
+  }
+}
+
 const LEGACY_STARTER_PACKAGE_JSON = `{
   "name": "starter",
   "private": true,

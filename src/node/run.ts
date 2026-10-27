@@ -24,7 +24,7 @@ export interface NodeRunResult {
  * scaffolders (create-* templates) that write files land in the tree.
  */
 export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeRunResult> {
-  const { entry, argv = [], cwd = '/', timeoutMs = 60_000 } = options
+  const { entry, argv = [], cwd = '/', timeoutMs = 300_000 } = options
 
   return new Promise<NodeRunResult>((resolve) => {
     const files: Record<string, string> = {}

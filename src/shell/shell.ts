@@ -6,6 +6,8 @@ import { nodeCommand } from './commands/node-cmd'
 import { npmCommand, npx, pnpmCommand, type CommandResult } from './commands/npm'
 import { gitCommand } from './commands/git'
 import { tscCommand } from './commands/tsc-cmd'
+import { cellCommand } from './commands/cell-cmd'
+import { curlCommand } from './commands/curl'
 
 export interface ShellResult {
   stdout: string
@@ -76,6 +78,8 @@ export function createShell(vfs?: Vfs): Shell {
   register('pnpm', (args, { cwd }) => pnpmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell() }))
   register('npx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
   register('pnpx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
+  register('cell', (args, { cwd }) => cellCommand(vfs ?? platform().vfs, args, { cwd }))
+  register('curl', (args, { cwd }) => curlCommand(vfs ?? platform().vfs, args, { cwd }))
 
   return shell
 }

@@ -29,7 +29,7 @@ const WASM_URL = '/wasm/lg2_async.wasm'
 const GIT_ROOT = '/'
 const HOME = '/home/user'
 const GITCONFIG_MEMFS = '/home/web_user/.gitconfig'
-const DEFAULT_RELAY = 'https://cors.isomorphic-git.org/'
+const DEFAULT_RELAYS = ['https://gh-proxy.com/', 'https://cors.isomorphic-git.org/']
 /** MEMFS paths that are emscripten/git internals, never workspace files */
 const MEMFS_SKIP = new Set(['/home/web_user', '/tmp', '/dev', '/proc', '/etc', '/var', '/usr', '/bin', '/lib', '/opt', '/workspace'])
 
@@ -404,10 +404,10 @@ async function originBlocked(url: string): Promise<boolean> {
   return blocked
 }
 
-/** The relay from ~/.gitconfig [cell] corsproxy, or the public default. */
-function relayFor(vfs: Vfs): string | null {
+/** Relays from ~/.gitconfig [cell] corsproxy (comma-separated), or public defaults. Empty when disabled. */
+function relaysFor(vfs: Vfs): string[] {
   const config = vfs.read(`${HOME}/.gitconfig`)
-  if (config === null) return DEFAULT_RELAY
+  if (config === null) return DEFAULT_RELAYS
   let inCellSection = false
   for (const rawLine of config.split('\n')) {
     const line = rawLine.trim()
@@ -418,11 +418,15 @@ function relayFor(vfs: Vfs): string | null {
     const match = /^corsproxy\s*=\s*(.*)$/.exec(line)
     if (match && inCellSection) {
       const value = match[1].trim().replace(/^["']|["']$/g, '')
-      if (!value || value === 'off' || value === 'disabled') return null
-      return value.endsWith('/') ? value : `${value}/`
+      if (!value || value === 'off' || value === 'disabled') return []
+      return value
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .map((entry) => (entry.endsWith('/') ? entry : `${entry}/`))
     }
   }
-  return DEFAULT_RELAY
+  return DEFAULT_RELAYS
 }
 
 function relayedUrl(relay: string, url: string): string {
@@ -571,7 +575,7 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<C
     ? normalizePath(`${gitCwd}/${explicitDir}`)
     : normalizePath(`${gitCwd}/${repoNameFromUrl(url)}`)
 
-  const relay = relayFor(vfs)
+  const relays = relaysFor(vfs)
   const blocked = await originBlocked(url)
 
   // direct attempt only for reachable origins — a blocked XHR wedges lg2
@@ -592,14 +596,11 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<C
     return finish(direct)
   }
 
-  if (relay) {
+  const failures: { label: string; run: LgRun }[] = [{ label: 'direct', run: direct }]
+  for (const relay of relays) {
     const relayUrl = relayedUrl(relay, url)
+    if (await originBlocked(relayUrl)) continue // unreachable from this browser
     const note = `cloning via CORS relay ${relay} — ${hostOf(url)} does not allow direct browser access`
-    if (await originBlocked(relayUrl)) {
-      return cloneFailureOutput(`${note}\nrelay ${relay} is unreachable from this browser`, [
-        { label: 'direct', run: direct },
-      ])
-    }
     const relayed = await attemptClone(vfs, relayUrl, target, gitCwd)
     if (relayed.ok && relayed.mod) {
       syncMemfsToVfs(relayed.mod, vfs)
@@ -612,12 +613,9 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<C
       relayed.out.unshift(note)
       return finish(relayed)
     }
-    return cloneFailureOutput(note, [
-      { label: 'direct', run: direct },
-      { label: `relay ${relay}`, run: relayed },
-    ])
+    failures.push({ label: `relay ${relay}`, run: relayed })
   }
-  return cloneFailureOutput(`clone of ${url} failed`, [{ label: 'direct', run: direct }])
+  return cloneFailureOutput(`clone of ${url} failed`, failures)
 }
 
 function finish(run: LgRun): CommandResult {
@@ -642,18 +640,26 @@ async function runNetworkCommand(
   const config = memfsReadConfig(mod, gitCwd)
   const remoteUrl = config !== null ? parseRemoteUrl(config) : null
   const blocked = remoteUrl !== null && /^https?:\/\//i.test(remoteUrl) && (await originBlocked(remoteUrl))
-  const relay = relayFor(vfs)
 
-  const useRelay = blocked && relay !== null && remoteUrl !== null && !(await originBlocked(relayedUrl(relay, remoteUrl)))
+  let relay: string | null = null
+  if (blocked && remoteUrl) {
+    for (const candidate of relaysFor(vfs)) {
+      if (!(await originBlocked(relayedUrl(candidate, remoteUrl)))) {
+        relay = candidate
+        break
+      }
+    }
+  }
 
-  if (useRelay && remoteUrl) {
-    memfsSetRemoteUrl(mod, gitCwd, relayedUrl(relay!, remoteUrl))
+  const useRelay = relay !== null && remoteUrl !== null
+  if (useRelay) {
+    memfsSetRemoteUrl(mod, gitCwd, relayedUrl(relay!, remoteUrl!))
   }
   const note = useRelay
     ? `${lgArgs[0]}ing via CORS relay ${relay} — ${hostOf(remoteUrl!)} does not allow direct browser access`
     : null
 
-  let run: LgRun | null = null
+  let run: LgRun
   try {
     const race = await Promise.race([
       runLg(mod, lgArgs).then((r) => ({ r })),
@@ -673,8 +679,6 @@ async function runNetworkCommand(
     return { stdout: '', stderr: `git: ${describeError(err)}\n`, exitCode: 1 }
   }
 
-  // a wedged transport surfaces through the timeout above; a fast failure
-  // (DNS, TLS, 404) returns normally and is reported honestly below
   if (useRelay && remoteUrl) {
     memfsSetRemoteUrl(mod, gitCwd, remoteUrl)
   }

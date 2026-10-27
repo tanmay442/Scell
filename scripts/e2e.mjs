@@ -290,12 +290,36 @@ try {
     await evalJS(`[...document.querySelectorAll('.sidebar-body *')].some((el) => el.textContent === '.git' && el.children.length === 0)`),
   )
 
-  // --- github through the relay (informational; relay availability varies) -
+  // --- agent toolbox: shell utilities, curl, cell status -------------------
+  await run('which node')
+  record('which resolves platform commands', (await termText()).includes('node'))
+  await run("find ~/project -name '*.ts' | head -n 3")
+  record('find walks the VFS', (await termRows()).some((row) => row.endsWith('index.ts')))
+  await run("sed -n '1p' ~/project/README.md")
+  record('sed edits streams', (await termText()).includes('# Starter project'))
+  await typeLine('curl -s https://registry.npmjs.org/ms/latest')
+  record('curl fetches cross-origin JSON', await waitUntil(
+    async () => (await termText()).includes('"name"'),
+    30000,
+    'curl output',
+  ))
+  await run('')
+  await run('cell status')
+  record('cell status reports unconfigured storage', (await termText()).includes('not configured'))
+
+  // --- github clone through the CORS relay (gh-proxy.com) ------------------
   await run('cd ~')
-  await run('git clone https://github.com/octocat/Hello-World.git hw', 150000)
-  const infoRows = await termRows()
-  console.log(`INFO  github clone tail: ${JSON.stringify(infoRows.slice(-6))}`)
-  console.log(`INFO  hw dir in tree: ${(await sidebarText()).includes('hw')}`)
+  await run('git clone https://github.com/octocat/Hello-World.git hw', 240000)
+  record('github clone works through the relay', await waitUntil(
+    async () => (await evalJS(`[...document.querySelectorAll('.sidebar-body *')].some((el) => el.textContent === 'hw' && el.children.length === 0)`)),
+    20000,
+    'hw dir in tree',
+  ))
+  await run('cd hw')
+  await run('ls')
+  record('github-cloned repo has files', (await termRows()).includes('README'))
+  await run('git log --oneline')
+  record('github-cloned repo has real history', (await termText()).includes('Merge pull request'))
 
   // --- reload: workspace, repos and dotfiles persist through IndexedDB -----
   await conn.send('Page.reload', {}, sessionId)
