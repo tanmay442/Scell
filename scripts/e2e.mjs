@@ -382,6 +382,21 @@ try {
   const homeRows = await termRows()
   record('reload keeps dotfiles', homeRows.includes('.gitconfig'))
 
+  // editor scroll: a long file must overflow the scroller and really scroll
+  await run('seq 1 400 > ~/project/long.txt')
+  await evalJS(`(function () { const rows = Array.from(document.querySelectorAll('.tree-row.is-file')); const el = rows.find(function (r) { return r.textContent.indexOf('long.txt') !== -1 }); if (el) el.click(); return 'ok' })()`)
+  record('editor scrolls long files', await waitUntil(async () => {
+    const state = await evalJS(`(function () { const s = document.querySelector('.cm-scroller'); if (!s) return null; const b = s.scrollTop; s.scrollTop = 5000; return { can: s.scrollHeight > s.clientHeight, moved: s.scrollTop > 1000 } })()`)
+    return state !== null && state.can === true && state.moved === true
+  }, 20000, 'editor scroll'))
+
+  // sidebar scroll: many files must overflow the tree and really scroll
+  await run('for i in $(seq 1 120); do touch ~/project/generated-$i.txt; done', 120000)
+  record('sidebar tree scrolls many files', await waitUntil(async () => {
+    const state = await evalJS(`(function () { const b = document.querySelector('.sidebar-body'); if (!b) return null; const scroller = b.scrollHeight > b.clientHeight ? b : (b.querySelector('*') || b); b.scrollTop = 99999; return { can: b.scrollHeight > b.clientHeight, moved: b.scrollTop > 500, count: document.querySelectorAll('.tree-row.is-file').length } })()`)
+    return state !== null && state.can === true && state.moved === true
+  }, 20000, 'sidebar scroll'))
+
   record('no page errors during the whole run', pageErrors.length === 0)
   if (pageErrors.length > 0) console.log(`  page errors: ${JSON.stringify(pageErrors.slice(0, 4))}`)
 } catch (err) {

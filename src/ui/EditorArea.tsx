@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Binary, Hexagon, X } from 'lucide-react'
 import { platform } from '../platform'
 import { workspaceActions, useWorkspace } from './workspace-store'
@@ -81,9 +81,10 @@ export function EditorArea() {
           <Welcome />
         ) : (
           ws.openPaths.map((path) => {
-            // binary files (packfiles, indexes, images…) get a placeholder,
-            // not a lossy text editor
+            // images render; other binaries get a placeholder, not a lossy
+            // text editor
             if (vfs.isFile(path) && !vfs.isText(path)) {
+              if (isImage(path)) return <ImageView key={path} path={path} active={path === ws.activePath} />
               return <BinaryView key={path} path={path} active={path === ws.activePath} />
             }
             const draft = workspaceActions.draft(path)
@@ -108,6 +109,41 @@ export function EditorArea() {
 }
 
 const PROJECT = '/home/user/project'
+
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'bmp', 'ico'])
+
+function isImage(path: string): boolean {
+  return IMAGE_EXTS.has(path.slice(path.lastIndexOf('.') + 1).toLowerCase())
+}
+
+/** Renders image files straight from the VFS bytes (webp, png, svg, …). */
+function ImageView({ path, active }: { path: string; active: boolean }) {
+  const { vfs, bus } = platform()
+  const [url, setUrl] = useState<string | null>(null)
+  const [version, setVersion] = useState(0)
+  useEffect(() => bus.on('vfs:changed', (event) => {
+    if (event.path === path) setVersion((v) => v + 1)
+  }), [bus, path])
+  useEffect(() => {
+    const bytes = vfs.readBytes(path)
+    if (bytes === null) return
+    const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase()
+    const mime = ext === 'svg' ? 'image/svg+xml' : `image/${ext === 'jpg' ? 'jpeg' : ext}`
+    const created = URL.createObjectURL(new Blob([bytes as unknown as BlobPart], { type: mime }))
+    setUrl(created)
+    return () => URL.revokeObjectURL(created)
+  }, [vfs, path, version])
+  const stat = vfs.stat(path)
+  const size = stat ? (stat.size >= 1024 ? `${(stat.size / 1024).toFixed(1)} KB` : `${stat.size} B`) : ''
+  return (
+    <div className={`image-view ${active ? '' : 'hidden'}`}>
+      {url !== null ? <img src={url} alt={path} /> : <span>cannot read {path}</span>}
+      <span className="image-meta">
+        {path.split('/').pop()} — {size}
+      </span>
+    </div>
+  )
+}
 
 function BinaryView({ path, active }: { path: string; active: boolean }) {
   const { vfs } = platform()

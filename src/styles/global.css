@@ -448,6 +448,16 @@ input:focus-visible {
 .editor-instance.hidden-editor {
   visibility: hidden;
 }
+/* uiw/react-codemirror inserts its own .cm-theme wrapper between our
+   container and .cm-editor — without a height there the editor is
+   content-sized and .editor-host clips it silently (no scrollbar) */
+.editor-instance > .cm-theme,
+.editor-instance > .cm-theme-dark,
+.editor-instance > .cm-theme-light,
+.editor-instance > div {
+  height: 100%;
+  overflow: hidden;
+}
 .editor-instance .cm-editor {
   height: 100%;
 }
@@ -988,3 +998,30 @@ kbd {
 }
 .preview-logs .log-error { color: var(--error); }
 .preview-logs .log-dim { opacity: 0.6; }
+
+/* image viewer */
+.image-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  overflow: auto;
+  padding: 24px;
+  background: repeating-conic-gradient(#1e1e1e 0% 25%, #252526 0% 50%) 50% / 20px 20px;
+}
+.image-view.hidden { display: none; }
+.image-view img {
+  max-width: 90%;
+  max-height: 80%;
+  object-fit: contain;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+.image-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.7;
+}

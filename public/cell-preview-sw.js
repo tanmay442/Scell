@@ -4,19 +4,23 @@
  * match their routes; about:srcdoc breaks them and history.replaceState is
  * forbidden there). The panel generates the document, hands it over here,
  * waits for the ack, then points the iframe at /?cellpreview=<token>.
+ *
+ * PLAIN JAVASCRIPT — the browser parses service worker scripts without a
+ * transpiler; a type annotation here silently kills the whole preview.
  */
 
 const CACHE = 'cell-preview-v2'
 
-self.addEventListener('install', (event) => {
+self.addEventListener('install', function (event) {
   self.skipWaiting()
   event.waitUntil(caches.open(CACHE))
 })
 
-self.addEventListener('activate', (event) => {
+self.addEventListener('activate', function (event) {
   event.waitUntil(
-    (async () => {
-      for (const name of await caches.keys()) {
+    (async function () {
+      const names = await caches.keys()
+      for (const name of names) {
         if (name !== CACHE) await caches.delete(name)
       }
       await self.clients.claim()
@@ -24,44 +28,45 @@ self.addEventListener('activate', (event) => {
   )
 })
 
-self.addEventListener('message', (event) => {
+self.addEventListener('message', function (event) {
   const msg = event.data
   if (!msg || msg.type !== 'cell-preview-put') return
-  const reply = (payload: unknown) => {
-    if (event.source && 'postMessage' in event.source) {
-      ;(event.source as Window).postMessage(payload)
+  const reply = function (payload) {
+    if (event.source && event.source.postMessage) {
+      event.source.postMessage(payload)
     }
   }
   event.waitUntil(
-    (async () => {
+    (async function () {
       try {
         const cache = await caches.open(CACHE)
         // put FIRST, then evict everything except the fresh entry — a
         // delete-all before the put raced navigations into "preview expired"
         await cache.put(msg.url, new Response(msg.html, { headers: { 'content-type': 'text/html; charset=utf-8' } }))
-        for (const key of await cache.keys()) {
+        const keys = await cache.keys()
+        for (const key of keys) {
           if (key.url !== msg.url) await cache.delete(key)
         }
         reply({ type: 'cell-preview-put-done', url: msg.url })
       } catch (err) {
-        reply({ type: 'cell-preview-put-done', url: msg.url, error: err instanceof Error ? err.message : String(err) })
+        reply({ type: 'cell-preview-put-done', url: msg.url, error: String(err && err.message ? err.message : err) })
       }
     })(),
   )
 })
 
-self.addEventListener('fetch', (event) => {
+self.addEventListener('fetch', function (event) {
   const url = new URL(event.request.url)
   if (event.request.mode === 'navigate' && url.pathname === '/' && url.searchParams.has('cellpreview')) {
     event.respondWith(
-      (async () => {
+      (async function () {
         const cache = await caches.open(CACHE)
         const hit = await cache.match(event.request)
         if (hit) return hit
         // the document may still be mid-put (reload raced the write) —
         // wait briefly before declaring it expired
         for (let i = 0; i < 20; i++) {
-          await new Promise((resolve) => setTimeout(resolve, 250))
+          await new Promise(function (resolve) { setTimeout(resolve, 250) })
           const retry = await cache.match(event.request)
           if (retry) return retry
         }
