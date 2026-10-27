@@ -41,7 +41,10 @@ export function App() {
             <EditorArea />
             <PreviewPanel />
           </div>
-          {panelVisible && <BottomPanel onToggle={() => setPanelVisible(false)} />}
+          <BottomPanel
+            onToggle={() => setPanelVisible(false)}
+            collapsed={!panelVisible}
+          />
         </div>
       </div>
       <StatusBar onTogglePanel={() => setPanelVisible((v) => !v)} panelVisible={panelVisible} />

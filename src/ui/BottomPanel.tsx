@@ -8,7 +8,7 @@ const TerminalPanel = lazy(() => import('../terminal/TerminalPanel'))
 const MIN_HEIGHT = 120
 const MAX_HEIGHT_VH = 0.6
 
-export function BottomPanel({ onToggle }: { onToggle: () => void }) {
+export function BottomPanel({ onToggle, collapsed }: { onToggle: () => void; collapsed?: boolean }) {
   const [tab, setTab] = useState<'terminal' | 'problems'>('terminal')
   const [height, setHeight] = useState(280)
   const [resizing, setResizing] = useState(false)
@@ -41,7 +41,10 @@ export function BottomPanel({ onToggle }: { onToggle: () => void }) {
   }, [])
 
   return (
-    <section className={`bottom-panel ${resizing ? 'resizing' : ''}`} style={{ height }}>
+    <section
+      className={`bottom-panel ${resizing ? 'resizing' : ''} ${collapsed ? 'collapsed' : ''}`}
+      style={collapsed ? undefined : { height }}
+    >
       <div
         className="panel-resize-handle"
         onPointerDown={onHandleDown}
@@ -61,13 +64,16 @@ export function BottomPanel({ onToggle }: { onToggle: () => void }) {
         </button>
       </div>
       <div className="panel-body">
-        {tab === 'terminal' ? (
+        {/* both stay mounted — unmounting the terminal destroys xterm
+            scrollback, history and cwd tracking */}
+        <div className={`panel-pane ${tab === 'terminal' ? '' : 'hidden'}`}>
           <Suspense fallback={<div className="panel-fallback">loading shell…</div>}>
             <TerminalPanel />
           </Suspense>
-        ) : (
+        </div>
+        <div className={`panel-pane ${tab === 'problems' ? '' : 'hidden'}`}>
           <ProblemsPanel />
-        )}
+        </div>
       </div>
     </section>
   )

@@ -24,9 +24,13 @@ export function PreviewPanel() {
   const [error, setError] = useState<string | null>(null)
   const [version, setVersion] = useState(0)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [logs, setLogs] = useState<{ text: string; tone: 'info' | 'error' }[]>([])
   const [status, setStatus] = useState('idle')
   const buildRef = useRef<PreviewBuild | null>(null)
   buildRef.current = build
+  const pushLog = useCallback((text: string, tone: 'info' | 'error' = 'info') => {
+    setLogs((prev) => [...prev.slice(-40), { text, tone }])
+  }, [])
 
   const rebuild = useCallback(
     (target: string) => {
@@ -63,7 +67,27 @@ export function PreviewPanel() {
           if (registration?.active) {
             const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
             url = `/?cellpreview=${token}`
+            // navigate only after the worker confirms the document is cached —
+            // racing the write was the 'preview expired' bug
+            const ack = new Promise<boolean>((resolve) => {
+              const listener = (event: MessageEvent) => {
+                if (event.data?.type === 'cell-preview-put-done' && event.data.url === url) {
+                  navigator.serviceWorker.removeEventListener('message', listener)
+                  resolve(event.data.error === undefined)
+                }
+              }
+              navigator.serviceWorker.addEventListener('message', listener)
+              setTimeout(() => {
+                navigator.serviceWorker.removeEventListener('message', listener)
+                resolve(false)
+              }, 3000)
+            })
             registration.active.postMessage({ type: 'cell-preview-put', url, html: result.html })
+            const stored = await ack
+            if (!stored) {
+              pushLog('preview service worker did not confirm the document', 'error')
+              url = null
+            }
           }
         } catch {
           url = null
@@ -77,12 +101,21 @@ export function PreviewPanel() {
   )
 
   useEffect(() => {
+    // survive reloads: the last previewed dir reopens automatically
+    const saved = localStorage.getItem('cell-preview-dir')
+    if (saved !== null && vfs.isDir(saved)) {
+      pushLog(`preview restored for ${saved.replace(/^\/home\/user/, '~')}`)
+      setDir(saved)
+      rebuild(saved)
+    }
     const off = bus.on('preview:open', (payload: { dir: string }) => {
+      pushLog(`preview opened for ${payload.dir.replace(/^\/home\/user/, '~')}`)
+      localStorage.setItem('cell-preview-dir', payload.dir)
       setDir(payload.dir)
       rebuild(payload.dir)
     })
     return off
-  }, [bus, rebuild])
+  }, [bus, rebuild, pushLog, vfs])
 
   // /api/* calls from the iframe → node sandbox → back
   useEffect(() => {
@@ -91,23 +124,30 @@ export function PreviewPanel() {
       if (!msg || msg.__cellApi !== true || typeof msg.id !== 'number') return
       const target = dir
       if (target === null) return
+      const started = performance.now()
+      pushLog(`→ ${msg.method} ${msg.path.split('?')[0]}`)
       setStatus(`${msg.method} ${msg.path.split('?')[0]}`)
       void runApiFunction(vfs, target, { method: msg.method, path: msg.path, body: msg.body })
         .catch((err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }))
         .then((response) => {
           const frame = document.querySelector('.preview-frame') as HTMLIFrameElement | null
+          const ms = Math.round(performance.now() - started)
           if ('error' in (response as { error?: string }) && (response as { error?: string }).error) {
-            setStatus(`error: ${(response as { error: string }).error}`)
-            frame?.contentWindow?.postMessage({ __cellApiReply: true, id: msg.id, ok: false, error: (response as { error: string }).error }, '*')
+            const why = (response as { error: string }).error
+            setStatus(`error: ${why}`)
+            pushLog(`✗ ${msg.method} ${msg.path.split('?')[0]} — ${ms}ms — ${why.slice(0, 200)}`, 'error')
+            frame?.contentWindow?.postMessage({ __cellApiReply: true, id: msg.id, ok: false, error: why }, '*')
           } else {
+            const done = response as { status: number }
             setStatus('idle')
+            pushLog(`✓ ${msg.method} ${msg.path.split('?')[0]} → ${done.status} (${ms}ms)`)
             frame?.contentWindow?.postMessage({ __cellApiReply: true, id: msg.id, ok: true, response }, '*')
           }
         })
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [vfs, dir])
+  }, [vfs, dir, pushLog])
 
   // live reload: filesystem changes rebuild the document (debounced)
   useEffect(() => {
@@ -150,8 +190,10 @@ export function PreviewPanel() {
             title="Close preview"
             onClick={() => {
               if (build) for (const url of build.objectUrls) URL.revokeObjectURL(url)
+              localStorage.removeItem('cell-preview-dir')
               setDir(null)
               setBuild(null)
+              setPreviewUrl(null)
             }}
           >
             <X size={13} />
@@ -173,6 +215,13 @@ export function PreviewPanel() {
           <div className="preview-error">building…</div>
         )}
       </div>
+      {logs.length > 0 ? (
+        <div className="preview-logs">
+          {logs.slice(-14).map((line, i) => (
+            <div key={`${i}-${line.text}`} className={line.tone === 'error' ? 'log-error' : ''}>{line.text}</div>
+          ))}
+        </div>
+      ) : null}
     </div>
   )
 }
