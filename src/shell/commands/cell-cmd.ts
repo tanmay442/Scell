@@ -3,8 +3,18 @@ import type { Vfs, VfsFileMap } from '../../vfs/types'
 import { looksLikeText } from './git'
 import { s3Fetch, type S3Config } from './sigv4'
 import { runAgent } from './agent'
+import { vfsPath } from '../../vfs/types'
 import { tarFiles, untar } from './untar'
 import type { CommandResult, ShellLike } from './npm'
+import { platform } from '../../platform'
+
+function platformBusEmit(payload: { dir: string }): void {
+  try {
+    platform().bus.emit('preview:open', payload)
+  } catch {
+    // platform not up (unit tests) — the preview command is a no-op then
+  }
+}
 
 /**
  * `cell` — workspace-level tooling for long agentic sessions:
@@ -106,6 +116,21 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
     return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell })
   }
 
+  if (sub === 'preview') {
+    const positional = args.slice(1).filter((a) => !a.startsWith('-'))
+    const dir = positional[0] !== undefined ? vfsPath.normalize(positional[0].replace(/^~/, '/home/user').startsWith('/') ? positional[0].replace(/^~/, '/home/user') : `${opts.cwd}/${positional[0]}`) : opts.cwd
+    if (!vfs.isFile(vfsPath.join(dir, 'index.html'))) {
+      return { stdout: '', stderr: `cell preview: no index.html in ${dir}\n`, exitCode: 1 }
+    }
+    const functions = vfs.isDir(`${dir}/api`) ? vfs.readDir(`${dir}/api`).filter((name) => name.endsWith('.js')) : []
+    platformBusEmit({ dir })
+    return {
+      stdout: `preview opened for ${dir.replace(/^\/home\/user/, '~')} — the panel renders index.html live.\n${functions.length > 0 ? `api functions: ${functions.map((name) => `/api/${name.replace(/\.js$/, '')}`).join(', ')} run in the node isolate on every call.\n` : ''}edits reload it automatically (600ms debounce).\n`,
+      stderr: '',
+      exitCode: 0,
+    }
+  }
+
   if (sub === 'status') {
     const configured = readConfig(vfs)
     const paths = vfs.listAllFiles()
@@ -182,7 +207,7 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
 
   return {
     stdout:
-      'usage: cell <command>\n\nagent   run the headless AI agent: cell agent "fix the failing test" [--steps N]\nsave    snapshot the whole workspace to object storage (tar.gz, SigV4 PUT)\nlist    snapshots in the bucket\nload    restore a snapshot: `cell load` (latest) or `cell load 3`\nstatus  configuration and workspace summary\n\nagent config: ~/.cell/agent.json — storage config: ~/.cell/storage.json\n',
+      'usage: cell <command>\n\npreview run the app right here: cell preview [dir] — static + Vercel-style api/\nagent   run the headless AI agent: cell agent "fix the failing test" [--steps N]\nsave    snapshot the whole workspace to object storage (tar.gz, SigV4 PUT)\nlist    snapshots in the bucket\nload    restore a snapshot: `cell load` (latest) or `cell load 3`\nstatus  configuration and workspace summary\n\nagent config: ~/.cell/agent.json — storage: ~/.cell/storage.json — env keys: ~/.cell/env.json\n',
     stderr: '',
     exitCode: sub === 'help' ? 0 : 1,
   }

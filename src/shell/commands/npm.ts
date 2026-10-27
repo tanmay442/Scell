@@ -95,6 +95,18 @@ export async function npx(vfs: Vfs, args: string[], opts: { cwd: string }): Prom
 
 /** Run a package bin through the node sandbox (native binaries are caught honestly). */
 export async function runNodeEntry(vfs: Vfs, entry: string, argv: string[], cwd: string, displayName?: string): Promise<CommandResult> {
+  // ESM-only CLIs (top-level await / import-export syntax) cannot run in the
+  // CommonJS sandbox — fail fast with the reason instead of a SyntaxError
+  // installed files are byte-stored — read() returns null for them
+  const entryBytes = vfs.readBytes(entry)
+  const entrySource = entryBytes === null ? null : new TextDecoder('utf-8', { fatal: false }).decode(entryBytes.subarray(0, 4096))
+  if (entrySource !== null && looksLikeEsm(entrySource)) {
+    return {
+      stdout: '',
+      stderr: `${displayName ?? vfsPath.basename(entry)}: this CLI is an ES module (top-level await or import/export) and cannot run in Cell's CommonJS isolate yet.\nFor static apps and Vercel-style api/ functions, use: cell preview\n`,
+      exitCode: 1,
+    }
+  }
   // native platform binaries (e.g. opencode's bin/opencode.exe) can never run
   // inside a browser isolate — say so instead of executing garbage
   if (/\.(exe|node|wasm)$/i.test(entry) || !looksLikeJs(vfs, entry)) {
@@ -106,6 +118,13 @@ export async function runNodeEntry(vfs: Vfs, entry: string, argv: string[], cwd:
   }
   const result = await runNodeProcess(vfs, { entry, argv, cwd })
   return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
+}
+
+/** ESM markers: static import/export statements or a top-level await. */
+function looksLikeEsm(source: string): boolean {
+  if (/^\s*(import\s+[^(]|import\s+["']|export\s+(default|const|function|class|\{))/m.test(source)) return true
+  if (/^await\s/m.test(source)) return true
+  return false
 }
 
 function looksLikeJs(vfs: Vfs, entry: string): boolean {

@@ -37,8 +37,19 @@ async function boot() {
   initPlatform({ vfs, bus })
   startAutoSave(vfs, persistence)
   // every VFS mutation is mirrored onto the bus — the tree, status bar and
-  // tab bookkeeping all listen there, not to the VFS directly
-  vfs.watch((event) => bus.emit('vfs:changed', event))
+  // tab bookkeeping all listen there, not to the VFS directly. Events
+  // coalesce into one per quiet window: an npm install writes thousands of
+  // files, and a UI rebuild per file froze the tab.
+  let vfsEventTimer: ReturnType<typeof setTimeout> | null = null
+  let lastVfsEvent: import('./vfs/types').VfsEvent = { kind: 'write', path: '/' }
+  vfs.watch((event) => {
+    lastVfsEvent = event
+    if (vfsEventTimer !== null) return
+    vfsEventTimer = setTimeout(() => {
+      vfsEventTimer = null
+      bus.emit('vfs:changed', lastVfsEvent)
+    }, 120)
+  })
 
   const root = createRoot(document.getElementById('root')!)
   root.render(<App />)

@@ -61,7 +61,10 @@ class LanguageService {
 
   private textFiles(): Record<string, string> {
     const files: Record<string, string> = {}
+    // node_modules and .git are never typechecked — shipping a freshly
+    // installed 100MB CLI to the checker on every keystroke kills the tab
     for (const path of this.vfs.listAllFiles()) {
+      if (path.includes('/node_modules/') || path.includes('/.git/')) continue
       const text = this.vfs.read(path)
       if (text !== null) files[`/project${path}`] = text
     }

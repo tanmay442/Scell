@@ -910,3 +910,55 @@ kbd {
   color: var(--text);
 }
 .binary-size { font-size: 11px; }
+
+/* app preview panel (cell preview) */
+.editor-preview-row {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.preview-panel {
+  display: none;
+  flex-direction: column;
+  width: 420px;
+  min-width: 320px;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+.preview-panel:not(:empty) { display: flex; }
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.preview-title { color: var(--text); font-family: var(--mono); }
+.preview-status { color: var(--text); opacity: 0.6; flex: 1; }
+.preview-status.busy { color: var(--accent); opacity: 1; }
+.preview-actions { display: flex; gap: 4px; }
+.preview-actions button {
+  background: none;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 3px;
+}
+.preview-actions button:hover { background: var(--hover); }
+.preview-body { flex: 1; min-height: 0; position: relative; }
+.preview-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: none; background: #fff; }
+.preview-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--warning);
+  font-size: 12px;
+  padding: 16px;
+  text-align: center;
+}

@@ -74,6 +74,8 @@ export interface Vfs {
 export interface VfsPersistence {
   load(): Promise<VfsFileMap | null>
   save(files: VfsFileMap): Promise<void>
+  /** incremental save when the backend supports it */
+  saveChanges?(upserts: VfsFileMap, deletes: string[]): Promise<void>
 }
 
 /** Shared path helpers — every module must normalize through these. */

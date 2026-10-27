@@ -1,7 +1,17 @@
 import { openDB, type IDBPDatabase } from 'idb'
-import type { VfsPersistence } from './types'
+import type { VfsFileMap, VfsPersistence } from './types'
 
 const STORE = 'files'
+
+/**
+ * node_modules never persists: browsers abort multi-hundred-MB IndexedDB
+ * transactions (quota), and dependencies are reproducible with one
+ * `npm install` (registry metadata is cached in memory per session). Source,
+ * dotfiles and .git always persist.
+ */
+function persistable(path: string): boolean {
+  return !path.includes('/node_modules/')
+}
 
 /**
  * IndexedDB-backed persistence: one object store, path -> content string.
@@ -24,6 +34,30 @@ export function createIdbPersistence(dbName = 'cell-workspace-v2'): VfsPersisten
   }
 
   return {
+    /**
+     * Incremental save: upsert changed files, delete removed ones — one
+     * transaction, no full rewrite. A workspace with a 90MB installed CLI
+     * cannot survive clear-and-rewrite on every keystroke.
+     */
+    async saveChanges(upserts: VfsFileMap, deletes: string[]) {
+      try {
+        const conn = db()
+        if (!conn) return
+        const database = await conn
+        if (database.objectStoreNames.contains(STORE)) {
+          const tx = database.transaction(STORE, 'readwrite')
+          const store = tx.objectStore(STORE)
+          for (const path of deletes) if (persistable(path)) void store.delete(path)
+          for (const [path, content] of Object.entries(upserts)) {
+            if (!persistable(path)) continue
+            void store.put(content, path)
+          }
+          await tx.done
+        }
+      } catch {
+        // storage unavailable — the in-memory VFS keeps working
+      }
+    },
     async load() {
       try {
         const conn = db()
@@ -34,7 +68,7 @@ export function createIdbPersistence(dbName = 'cell-workspace-v2'): VfsPersisten
         const files: Record<string, string | Uint8Array> = {}
         for (const key of keys) {
           const value = await database.get(STORE, key)
-          if (typeof key === 'string' && (typeof value === 'string' || value instanceof Uint8Array)) {
+          if (typeof key === 'string' && persistable(key) && (typeof value === 'string' || value instanceof Uint8Array)) {
             files[key] = value
           }
         }
@@ -51,6 +85,7 @@ export function createIdbPersistence(dbName = 'cell-workspace-v2'): VfsPersisten
         const tx = database.transaction(STORE, 'readwrite')
         await tx.objectStore(STORE).clear()
         for (const [path, content] of Object.entries(files)) {
+          if (!persistable(path)) continue
           void tx.objectStore(STORE).put(content, path)
         }
         await tx.done

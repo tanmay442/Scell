@@ -32,6 +32,26 @@ interface Queued {
   installRoot: string
 }
 
+/**
+ * npm aliases: a dependency of the form `"<alias>": "npm:<real>@<version>"`
+ * installs the REAL package under the ALIAS name — dependents require it by
+ * the alias key. vercel and many modern packages lean on these.
+ */
+function expandAlias(name: string, range?: string): { realName: string; realRange?: string } {
+  if (range !== undefined && range.startsWith('npm:')) {
+    const spec = range.slice(4)
+    const at = spec.lastIndexOf('@')
+    if (at > 0) return { realName: spec.slice(0, at), realRange: spec.slice(at + 1) }
+    return { realName: spec }
+  }
+  return { realName: name, realRange: range }
+}
+
+/** keep the tab responsive: breathe between packages and file batches */
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
 export async function installPackages(
   vfs: Vfs,
   requests: { name: string; range?: string }[],
@@ -50,15 +70,16 @@ export async function installPackages(
     if (seen.has(key)) continue
     seen.add(key)
 
+    const { realName, realRange } = expandAlias(name, range)
     const manifestPath = `${modulesDir(installRoot)}/${name}/package.json`
     const existing = readManifest(vfs, manifestPath)
     if (existing !== null) {
       try {
         const installedVersion = (existing as { version?: string }).version
         // already satisfied? then this edge of the graph is done
-        const metadata = await fetchMetadata(name)
+        const metadata = await fetchMetadata(realName)
         try {
-          const resolved = pickVersion(metadata, range)
+          const resolved = pickVersion(metadata, realRange)
           if (resolved.version === installedVersion) continue
         } catch {
           continue // range unresolvable but the package is present — keep it
@@ -69,8 +90,8 @@ export async function installPackages(
     }
 
     onProgress?.(`resolving ${name}${range ? `@${range}` : ''}`)
-    const metadata = await fetchMetadata(name)
-    const version = pickVersion(metadata, range)
+    const metadata = await fetchMetadata(realName)
+    const version = pickVersion(metadata, realRange)
     if (version.deprecated) {
       report.warnings.push(`npm WARN deprecated ${name}@${version.version}: ${version.deprecated}`)
     }
@@ -97,9 +118,12 @@ export async function installPackages(
     onProgress?.(`fetching ${name}@${version.version}`)
     const entries = await fetchTarballEntries(version, name)
     const prefix = `${installDir}/`
-    for (const entry of entries) {
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]
       vfs.writeBytes(vfsPath.join(prefix, entry.path), entry.data)
+      if (i % 64 === 63) await yieldToUi()
     }
+    await yieldToUi()
     report.added.push({ name, version: version.version, nested })
 
     for (const [depName, depRange] of Object.entries(version.dependencies ?? {})) {

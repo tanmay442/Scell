@@ -34,6 +34,9 @@ const DEFAULT_RELAYS = ['https://gh-proxy.com/', 'https://cors.isomorphic-git.or
 const MEMFS_SKIP = new Set(['/home/web_user', '/tmp', '/dev', '/proc', '/etc', '/var', '/usr', '/bin', '/lib', '/opt', '/workspace'])
 
 function isMemfsSkip(path: string): boolean {
+  // node_modules is never synced: git wouldn't track it anyway, and moving
+  // a freshly installed 100MB CLI through MEMFS per status call kills the tab
+  if (path.includes('/node_modules/')) return true
   if (MEMFS_SKIP.has(path)) return true
   for (const skip of MEMFS_SKIP) {
     if (path.startsWith(`${skip}/`)) return true

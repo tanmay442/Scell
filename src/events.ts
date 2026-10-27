@@ -23,6 +23,7 @@ export interface AppEvents {
   'terminal:cwd': { cwd: string }
   'app:status': { message: string; tone: 'info' | 'ok' | 'error' }
   'app:ready': Record<string, never>
+  'preview:open': { dir: string }
 }
 
 type Handler<T> = (payload: T) => void

@@ -7,6 +7,7 @@ import { ActivityBar } from './ActivityBar'
 import { Sidebar } from './Sidebar'
 import { EditorArea } from './EditorArea'
 import { BottomPanel } from './BottomPanel'
+import { PreviewPanel } from './PreviewPanel'
 import { StatusBar } from './StatusBar'
 
 export type SidebarView = 'explorer' | 'git'
@@ -36,7 +37,10 @@ export function App() {
         <ActivityBar active={sidebarView} onSelect={(view) => setSidebarView(view)} />
         <Sidebar view={sidebarView} />
         <div className="app-main">
-          <EditorArea />
+          <div className="editor-preview-row">
+            <EditorArea />
+            <PreviewPanel />
+          </div>
           {panelVisible && <BottomPanel onToggle={() => setPanelVisible(false)} />}
         </div>
       </div>

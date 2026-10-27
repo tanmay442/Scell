@@ -14,6 +14,8 @@ interface ExecRequest {
   id: number
   /** zero-copy workspace snapshot: one byte buffer + [path, offset, length] */
   payload: { buffer: Uint8Array; index: [string, number, number][] }
+  /** user env from ~/.cell/env.json */
+  env?: Record<string, string>
   entry: string
   argv: string[]
   cwd: string
@@ -22,9 +24,51 @@ interface ExecRequest {
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: false })
 
-let files = new Map<string, string>()
-const initial = new Map<string, string>()
+// Lazy file table: contents decode from the payload buffer on first use —
+// eagerly decoding a whole installed-CLI workspace (90MB+) killed renderers.
+// Writes land in an overlay; deletes in a set; the exit diff uses only those.
+let payloadBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0)
+const payloadIndex = new Map<string, [number, number]>()
+const decoded = new Map<string, string>()
+const overlay = new Map<string, string>()
+const removed = new Set<string>()
 let currentId = 0
+
+function fileList(): Set<string> {
+  const set = new Set<string>([...payloadIndex.keys(), ...overlay.keys()])
+  for (const path of removed) set.delete(path)
+  return set
+}
+
+function fileHas(path: string): boolean {
+  return overlay.has(path) || (payloadIndex.has(path) && !removed.has(path))
+}
+
+function fileRead(path: string): string | undefined {
+  const written = overlay.get(path)
+  if (written !== undefined) return written
+  if (removed.has(path)) return undefined
+  const span = payloadIndex.get(path)
+  if (span === undefined) return undefined
+  let text = decoded.get(path)
+  if (text === undefined) {
+    text = decoder.decode(payloadBuffer.subarray(span[0], span[0] + span[1]))
+    decoded.set(path, text)
+  }
+  return text
+}
+
+function fileWrite(path: string, text: string) {
+  overlay.set(path, text)
+  decoded.set(path, text)
+  removed.delete(path)
+}
+
+function fileDelete(path: string) {
+  overlay.delete(path)
+  decoded.delete(path)
+  removed.add(path)
+}
 
 function send(message: unknown) {
   self.postMessage(message)
@@ -34,7 +78,7 @@ function send(message: unknown) {
 
 function listDirs(): Set<string> {
   const dirs = new Set<string>(['/'])
-  for (const path of files.keys()) {
+  for (const path of fileList()) {
     let dir = path
     while ((dir = dir.slice(0, dir.lastIndexOf('/')))) dirs.add(dir)
     dirs.add('/')
@@ -55,11 +99,11 @@ function normalizePath(p: string, cwd: string): string {
 
 const sandboxFs = {
   existsSync(path: string) {
-    return files.has(path)
+    return fileHas(path)
   },
   statSync(path: string) {
-    if (files.has(path)) {
-      return { isFile: () => true, isDirectory: () => false, size: files.get(path)!.length }
+    if (fileHas(path)) {
+      return { isFile: () => true, isDirectory: () => false, size: (fileRead(path) ?? '').length }
     }
     if (listDirs().has(path)) {
       return { isFile: () => false, isDirectory: () => true, size: 0 }
@@ -69,7 +113,7 @@ const sandboxFs = {
     throw err
   },
   readFileSync(path: string, encoding?: string) {
-    const content = files.get(path)
+    const content = fileRead(path)
     if (content === undefined) {
       const err = new Error(`ENOENT: no such file or directory, open '${path}'`) as Error & { code: string }
       err.code = 'ENOENT'
@@ -78,35 +122,35 @@ const sandboxFs = {
     return encoding === 'utf8' || encoding === 'utf-8' || encoding === undefined ? content : BufferShim.from(content, 'utf8')
   },
   writeFileSync(path: string, data: string | Uint8Array) {
-    files.set(path, typeof data === 'string' ? data : decoder.decode(data))
+    fileWrite(path, typeof data === 'string' ? data : decoder.decode(data))
   },
   appendFileSync(path: string, data: string | Uint8Array) {
-    const prev = files.get(path) ?? ''
-    files.set(path, prev + (typeof data === 'string' ? data : decoder.decode(data)))
+    const prev = fileRead(path) ?? ''
+    fileWrite(path, prev + (typeof data === 'string' ? data : decoder.decode(data)))
   },
   unlinkSync(path: string) {
-    files.delete(path)
+    fileDelete(path)
   },
   mkdirSync(path: string, _options?: { recursive?: boolean }) {
     // the in-memory fs is flat; directories are implied
   },
   rmdirSync(path: string) {
-    for (const key of [...files.keys()]) {
-      if (key.startsWith(`${path}/`)) files.delete(key)
+    for (const key of fileList()) {
+      if (key.startsWith(`${path}/`)) fileDelete(key)
     }
   },
   rmSync(path: string, options?: { recursive?: boolean }) {
-    if (files.has(path)) files.delete(path)
+    if (fileHas(path)) fileDelete(path)
     else if (options?.recursive) {
-      for (const key of [...files.keys()]) {
-        if (key.startsWith(`${path}/`)) files.delete(key)
+      for (const key of fileList()) {
+        if (key.startsWith(`${path}/`)) fileDelete(key)
       }
     }
   },
   readdirSync(path: string): string[] {
     const prefix = path === '/' ? '/' : `${path}/`
     const names = new Set<string>()
-    for (const key of files.keys()) {
+    for (const key of fileList()) {
       if (key.startsWith(prefix)) {
         const rest = key.slice(prefix.length)
         if (rest) names.add(rest.split('/')[0])
@@ -475,10 +519,10 @@ class ExitError extends Error {
 
 const resolverFs: ResolverFs = {
   isFile(path) {
-    return files.has(path)
+    return fileHas(path)
   },
   readText(path) {
-    return files.get(path) ?? null
+    return fileRead(path) ?? null
   },
 }
 
@@ -502,7 +546,7 @@ function makeRequire(fromFile: string) {
     }
     if (moduleCache.has(resolved.path)) return moduleCache.get(resolved.path)!.exports
     if (resolved.path.endsWith('.json')) {
-      const text = files.get(resolved.path)!
+      const text = fileRead(resolved.path)!
       let parsed: unknown
       try {
         parsed = JSON.parse(text)
@@ -517,7 +561,7 @@ function makeRequire(fromFile: string) {
     // node strips a leading hashbang before parsing; a bare "#!" is a
     // SyntaxError anywhere else in the file. Keep the newline so stack
     // traces keep their line numbers.
-    const source = files.get(resolved.path)!.replace(/^#![^\n]*\n/, '\n')
+    const source = (fileRead(resolved.path) ?? '').replace(/^#![^\n]*\n/, '\n')
     const dirname = pathShim.dirname(resolved.path)
 
     const fn = new Function(
@@ -664,15 +708,17 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
   if (msg.type !== 'exec') return
   currentId = msg.id
   moduleCache.clear()
+  if (msg.env) Object.assign(processShim.env, msg.env)
   // the sandbox speaks strings; binaries decode lossily on load — same
   // semantics as always, just off the main thread now
-  const snapshot = new Map<string, string>()
+  payloadBuffer = msg.payload.buffer
+  payloadIndex.clear()
+  decoded.clear()
+  overlay.clear()
+  removed.clear()
   for (const [path, offset, length] of msg.payload.index) {
-    snapshot.set(path, decoder.decode(msg.payload.buffer.subarray(offset, offset + length)))
+    payloadIndex.set(path, [offset, length])
   }
-  files = snapshot
-  initial.clear()
-  for (const [path, content] of snapshot) initial.set(path, content)
 
   processShim.argv = [argv0, msg.entry, ...msg.argv]
   processShim.cwd = () => msg.cwd
@@ -686,7 +732,7 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
 
   try {
     const entry = msg.entry
-    if (!files.has(entry)) {
+    if (!fileHas(entry)) {
       throw nodeError('MODULE_NOT_FOUND', `Cannot find module '${entry}'`)
     }
     const entryBase = entry.slice(entry.lastIndexOf('/') + 1)
@@ -701,14 +747,17 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
     }
   }
 
-  // report the filesystem diff so the host can apply it to the real VFS
-  for (const [path, content] of files) {
-    if (initial.get(path) !== content) {
+  // report the filesystem diff so the host can apply it to the real VFS —
+  // only what this process actually touched
+  for (const [path, content] of overlay) {
+    const span = payloadIndex.get(path)
+    const original = span === undefined ? undefined : decoder.decode(payloadBuffer.subarray(span[0], span[0] + span[1]))
+    if (original !== content) {
       send({ type: 'vfs-write', id: msg.id, path, content })
     }
   }
-  for (const path of initial.keys()) {
-    if (!files.has(path)) {
+  for (const path of removed) {
+    if (payloadIndex.has(path)) {
       send({ type: 'vfs-delete', id: msg.id, path })
     }
   }

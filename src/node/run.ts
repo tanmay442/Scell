@@ -90,11 +90,42 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
     let stdout = ''
     let stderr = ''
     let settled = false
+    const pendingOut: (boolean | string)[] = []
+    let flushTimer: ReturnType<typeof setTimeout> | null = null
+    const MAX_OUTPUT = 4 * 1024 * 1024
+    const scheduleFlush = () => {
+      if (flushTimer !== null || settled) return
+      flushTimer = setTimeout(() => {
+        flushTimer = null
+        for (let i = 0; i + 1 < pendingOut.length; i += 2) {
+          const text = pendingOut[i + 1] ?? ''
+          if (pendingOut[i] === true) {
+            if (stderr.length < MAX_OUTPUT) stderr = (stderr + text).slice(0, MAX_OUTPUT)
+          } else if (stdout.length < MAX_OUTPUT) {
+            stdout = (stdout + text).slice(0, MAX_OUTPUT)
+          }
+        }
+        pendingOut.length = 0
+      }, 40)
+    }
 
     const finish = (result: Omit<NodeRunResult, 'stdout' | 'stderr'>) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer)
+        flushTimer = null
+      }
+      for (let i = 0; i + 1 < pendingOut.length; i += 2) {
+        const text = pendingOut[i + 1] ?? ''
+        if (pendingOut[i] === true) {
+          if (stderr.length < MAX_OUTPUT) stderr = (stderr + text).slice(0, MAX_OUTPUT)
+        } else if (stdout.length < MAX_OUTPUT) {
+          stdout = (stdout + text).slice(0, MAX_OUTPUT)
+        }
+      }
+      pendingOut.length = 0
       worker.terminate()
       resolve({ stdout, stderr, ...result })
     }
@@ -111,8 +142,11 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
         | { type: 'exit'; id: number; code: number }
       switch (msg.type) {
         case 'out':
-          if (msg.stream === 'stdout') stdout += msg.text
-          else stderr += msg.text
+          // CLIs emit spinner frames character-by-character; appending per
+          // message plus React re-renders froze the tab. Coalesce to a
+          // trickle and cap the buffers so a chatty process can't OOM us.
+          pendingOut.push(msg.stream === 'stderr', msg.text)
+          scheduleFlush()
           break
         case 'vfs-write':
           if (msg.path.startsWith('/')) vfs.write(msg.path, msg.content)
@@ -131,7 +165,22 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
       finish({ exitCode: 1, timedOut: false })
     }
 
-    worker.postMessage({ type: 'exec', id: 1, payload, entry, argv, cwd }, [payload.buffer.buffer as ArrayBuffer])
+    // user-provided env (API keys and friends) from ~/.cell/env.json rides
+    // along: {"GOOGLE_API_KEY": "..."} — the same file cell agent documents
+    let env: Record<string, string> | undefined
+    const envRaw = vfs.read('/home/user/.cell/env.json')
+    if (envRaw !== null) {
+      try {
+        const parsed = JSON.parse(envRaw) as Record<string, unknown>
+        env = {}
+        for (const [key, value] of Object.entries(parsed)) {
+          if (typeof value === 'string') env[key] = value
+        }
+      } catch {
+        // malformed env file — run with defaults
+      }
+    }
+    worker.postMessage({ type: 'exec', id: 1, payload, entry, argv, cwd, env }, [payload.buffer.buffer as ArrayBuffer])
   })
 }
 

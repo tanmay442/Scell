@@ -86,3 +86,50 @@ export async function transformEntry(vfs: Vfs, entry: string): Promise<Transform
   const hidden = vfs.listAllFiles().filter((p) => TS_EXTS.has(vfsPath.ext(p)))
   return { ok: true, entry: jsEntry, emitted, hidden }
 }
+
+/**
+ * ESM .js → CommonJS for the sandbox (Vercel-style api/*.js functions are
+ * ESM: `import … from`; the runtime's module system is CommonJS). Reuses the
+ * same ts-rust pipeline with --allowJs --module commonjs.
+ */
+export async function transpileEsmJs(vfs: Vfs, file: string): Promise<TransformResult> {
+  const service = langService()
+  if (!service) {
+    return { ok: false, entry: file, emitted: {}, hidden: [], errorText: 'language service not started' }
+  }
+  // emit into <project>/.cell-build/api so require() walks up to the
+  // project's own node_modules — the runtime's resolver climbs parents
+  const projectDir = vfsPath.dirname(vfsPath.dirname(file)) // .../api/x.js -> ...
+  const outDir = `${projectDir}/.cell-build/api`
+  const result = await service.tscRun([
+    `/project${file}`,
+    '--outDir',
+    '/__emit',
+    '--rootDir',
+    `/project${vfsPath.dirname(file)}`,
+    '--allowJs',
+    '--module',
+    'commonjs',
+    '--target',
+    'ES2020',
+    '--esModuleInterop',
+    '--skipLibCheck',
+  ])
+  const emitted: Record<string, string> = {}
+  for (const [path, content] of result.files) {
+    if (!path.startsWith('/__emit/')) continue
+    emitted[`${outDir}${path.slice('/__emit'.length)}`] = content
+  }
+  const base = vfsPath.basename(file)
+  const jsPath = `${outDir}/${base}`
+  if (emitted[jsPath] === undefined) {
+    return {
+      ok: false,
+      entry: jsPath,
+      emitted,
+      hidden: [],
+      errorText: formatDiagnostics(result.diagnostics) || `preview: could not transform '${file}'`,
+    }
+  }
+  return { ok: true, entry: jsPath, emitted, hidden: [] }
+}
