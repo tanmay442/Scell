@@ -55,8 +55,10 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   if (sub === 'exec' || sub === 'x') return npx(vfs, rest, { cwd })
   if (sub === 'info' || sub === 'view' || sub === 'show') return npmInfo(rest)
 
-  // pnpm shorthand: `pnpm dev` == `pnpm run dev`
-  if (flavor === 'pnpm' && !['help', 'uninstall', 'remove', 'rm', 'update', 'link', 'unlink', 'pack', 'publish', 'audit', 'outdated', 'ci'].includes(sub)) {
+  // `npm dev` == `npm run dev` for anything that isn't a real subcommand —
+  // npm itself has worked this way since v7; runScript's missing-script
+  // error lists what does exist
+  if (!['help', 'uninstall', 'remove', 'rm', 'update', 'link', 'unlink', 'pack', 'publish', 'audit', 'outdated', 'ci'].includes(sub)) {
     return runScript(vfs, sub, rest, { cwd, shell })
   }
 
@@ -168,6 +170,8 @@ async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registe
       const at = pkg.lastIndexOf('@')
       return { name: at > 0 ? pkg.slice(0, at) : pkg, range: at > 0 ? pkg.slice(at + 1) : undefined }
     })
+    // older builds nested one node_modules too deep — heal that in place
+    if (vfs.isDir(`${GLOBAL_ROOT}/node_modules`)) vfs.delete(`${GLOBAL_ROOT}/node_modules`)
     const report = await installPackages(vfs, requests, GLOBAL_ROOT)
     const freshBins = [...collectBins(vfs, GLOBAL_ROOT).keys()]
     for (const bin of freshBins) opts.registerLive?.(bin)

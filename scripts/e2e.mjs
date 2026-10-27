@@ -317,9 +317,16 @@ try {
   ))
   await run('')
 
-  // --- native-only packages fail honestly -----------------------------------
-  await run('npx -y opencode-ai --version', 120000).catch(() => {})
-  record('native-binary packages explain instead of crashing', (await termText()).includes('native platform binary'))
+  // --- scoped global package: @opencode/cli registers its bin, fails native -
+  await run('npm install -g @opencode/cli', 120000)
+  record('scoped global packages register their bins', (await termText()).includes('commands now on PATH: opencode'))
+  await typeLine('opencode')
+  record('opencode explains the native-binary limit', await waitUntil(
+    async () => (await termText()).includes('native platform binary'),
+    20000,
+    'opencode guard',
+  ))
+  await run('')
 
   // --- agent harness without a key points at the config ----------------------
   await run('cell agent "hello"')

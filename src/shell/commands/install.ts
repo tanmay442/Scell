@@ -15,6 +15,11 @@ import { fetchMetadata, fetchTarballEntries, pickVersion, type RegistryVersion }
 
 export const GLOBAL_ROOT = '/home/user/.local/lib/node_modules'
 
+/** The node_modules dir of an install root (GLOBAL_ROOT already is one). */
+function modulesDir(root: string): string {
+  return root.endsWith('/node_modules') ? root : `${root === '/' ? '' : root}/node_modules`
+}
+
 export interface InstallReport {
   added: { name: string; version: string; nested: boolean }[]
   warnings: string[]
@@ -45,7 +50,7 @@ export async function installPackages(
     if (seen.has(key)) continue
     seen.add(key)
 
-    const manifestPath = `${installRoot === '/' ? '' : installRoot}/node_modules/${name}/package.json`
+    const manifestPath = `${modulesDir(installRoot)}/${name}/package.json`
     const existing = readManifest(vfs, manifestPath)
     if (existing !== null) {
       try {
@@ -70,7 +75,7 @@ export async function installPackages(
       report.warnings.push(`npm WARN deprecated ${name}@${version.version}: ${version.deprecated}`)
     }
     for (const [peer, peerRange] of Object.entries(version.peerDependencies ?? {})) {
-      const peerManifest = readManifest(vfs, `${base}/node_modules/${peer}/package.json`)
+      const peerManifest = readManifest(vfs, `${modulesDir(root)}/${peer}/package.json`)
       if (peerManifest === null && !requests.some((r) => r.name === peer)) {
         report.warnings.push(`npm WARN ${name}@${version.version} requires a peer of ${peer}@${peerRange} but none was installed`)
       }
@@ -78,7 +83,7 @@ export async function installPackages(
 
     // pick install dir: project root for top-level requests, otherwise nested
     // under the dependent package — version conflicts never clobber the root
-    const installDir = `${installRoot === '/' ? '' : installRoot}/node_modules/${name}`
+    const installDir = `${modulesDir(installRoot)}/${name}`
     const nested = installRoot !== root
     if (installRoot === root) {
       const rootVersion = rootInstalled.get(name)
@@ -151,16 +156,27 @@ export function writeManifest(vfs: Vfs, manifest: Record<string, unknown>, path 
 /** bin command map for one node_modules root: name -> absolute js/exe path. */
 export function collectBins(vfs: Vfs, root = '/'): Map<string, string> {
   const bins = new Map<string, string>()
-  // GLOBAL_ROOT (and any dir already ending in node_modules) IS the modules dir
-  const modules = root.endsWith('/node_modules') ? root : `${root === '/' ? '' : root}/node_modules`
+  const modules = modulesDir(root)
   if (!vfs.isDir(modules)) return bins
-  for (const pkgName of vfs.readDir(modules)) {
+  // scoped packages live under @scope/name — expand each @dir into its children
+  const packageDirs: string[] = []
+  for (const entry of vfs.readDir(modules)) {
+    if (entry.startsWith('@') && vfs.isDir(`${modules}/${entry}`)) {
+      for (const scoped of vfs.readDir(`${modules}/${entry}`)) {
+        packageDirs.push(`${entry}/${scoped}`)
+      }
+    } else {
+      packageDirs.push(entry)
+    }
+  }
+  for (const pkgName of packageDirs) {
     const manifest = readManifest(vfs, `${modules}/${pkgName}/package.json`)
     if (!manifest || typeof manifest.bin !== 'string' && typeof manifest.bin !== 'object') continue
     const pkgDir = `${modules}/${pkgName}`
     const resolveBin = (rel: string) => `${pkgDir}/${rel.replace(/^\.\//, '')}`
     if (typeof manifest.bin === 'string') {
-      bins.set(pkgName, resolveBin(manifest.bin))
+      // a string bin is named after the package, unscoped for @scope/name
+      bins.set(pkgName.split('/').pop()!, resolveBin(manifest.bin))
     } else {
       for (const [command, rel] of Object.entries(manifest.bin as Record<string, string>)) {
         bins.set(command, resolveBin(rel))

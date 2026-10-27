@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createVfs } from '../../vfs'
 import { runAgent } from './agent'
-import { projectRoot, findBins, GLOBAL_ROOT } from './install'
+import { projectRoot, findBins, collectBins, GLOBAL_ROOT } from './install'
 
 function agentVfs() {
   const vfs = createVfs()
@@ -107,5 +107,24 @@ describe('npm project roots and bins', () => {
     expect(fromProject.get('semver')).toBe('/home/user/repo/node_modules/semver/bin/semver.js')
     const fromHome = findBins(vfs, '/home/user')
     expect(fromHome.get('semver')).toBe(`${GLOBAL_ROOT}/semver/bin/semver.js`)
+  })
+
+  it('discovers bins of scoped packages (@scope/name) everywhere', () => {
+    const vfs = createVfs()
+    vfs.write(
+      `${GLOBAL_ROOT}/@opencode/cli/package.json`,
+      JSON.stringify({ name: '@opencode/cli', bin: { opencode: 'bin/opencode.exe', opencode2: 'bin/opencode.exe' } }),
+    )
+    vfs.writeBytes(`${GLOBAL_ROOT}/@opencode/cli/bin/opencode.exe`, new Uint8Array([0x7f, 0x45, 0x4c, 0x46]))
+    vfs.write('/home/user/repo/package.json', '{}')
+    vfs.write(
+      '/home/user/repo/node_modules/@vercel/pkg/package.json',
+      JSON.stringify({ name: '@vercel/pkg', bin: 'cli.js' }),
+    )
+    vfs.write('/home/user/repo/node_modules/@vercel/pkg/cli.js', '#!/usr/bin/env node\n')
+    expect(collectBins(vfs, GLOBAL_ROOT).get('opencode')).toBe(`${GLOBAL_ROOT}/@opencode/cli/bin/opencode.exe`)
+    expect(collectBins(vfs, GLOBAL_ROOT).get('opencode2')).toBe(`${GLOBAL_ROOT}/@opencode/cli/bin/opencode.exe`)
+    // string bin of a scoped package is named after the unscoped part
+    expect(findBins(vfs, '/home/user/repo/src').get('pkg')).toBe('/home/user/repo/node_modules/@vercel/pkg/cli.js')
   })
 })
