@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, FilePlus, FolderPlus, ListCollapse, RefreshCw, Check, X } from 'lucide-react'
 import { platform } from '../platform'
 import { vfsPath } from '../vfs/types'
+import { downloadVfsFile } from './download'
 import { workspaceActions } from './workspace-store'
 import { FileIcon } from './file-icon'
 import { ContextMenu, type ContextMenuItem, type ContextMenuState } from './ContextMenu'
@@ -127,6 +128,7 @@ function Explorer() {
       : [
           { label: 'New File', onClick: () => beginCreate(parentDir, 'file') },
           { label: 'Rename', onClick: () => setEditing({ mode: 'rename', path: entry.path, dir: false }) },
+          { label: 'Download', onClick: () => downloadVfsFile(entry.path) },
           { label: 'Delete', danger: true, onClick: () => setConfirmDelete(entry.path) },
           { label: 'Copy Path', onClick: () => void navigator.clipboard?.writeText(entry.path).catch(() => {}) },
         ]

@@ -1,0 +1,196 @@
+/**
+ * The python execution core — framework-agnostic: it receives a loaded
+ * Pyodide instance and runs one script against it. Used by the web worker
+ * (browser) and directly by the node-side tests, so both exercise the exact
+ * same semantics: argv, env, cwd, stdin files, package loading from imports,
+ * matplotlib output, and a filesystem write-back diff.
+ */
+
+export interface PythonPayload {
+  buffer: Uint8Array
+  index: [path: string, offset: number, length: number][]
+}
+
+export interface PythonRunOptions {
+  /** the python source to execute */
+  code: string
+  /** path of the script (sys.argv[0]); '-' when reading code from stdin/-c */
+  entry: string
+  argv: string[]
+  cwd: string
+  env: Record<string, string>
+  payload: PythonPayload
+  /** loading progress (package installs) */
+  onStatus?: (text: string) => void
+  onOut: (stream: 'stdout' | 'stderr', text: string) => void
+}
+
+export interface PythonWrittenFile {
+  path: string
+  bytes: Uint8Array
+}
+
+export interface PythonRunResult {
+  exitCode: number
+  written: PythonWrittenFile[]
+  deleted: string[]
+}
+
+/** dirs of the pyodide filesystem that belong to the runtime, not the user */
+const FS_SKIP = new Set(['/lib', '/usr', '/dev', '/proc', '/sys', '/bin', '/home/pydide', '/python312.zip', '/.webpy', '/tmp'])
+
+function inSkip(path: string): boolean {
+  if (FS_SKIP.has(path)) return true
+  for (const skip of FS_SKIP) {
+    if (path.startsWith(`${skip}/`)) return true
+  }
+  return false
+}
+
+/** A python error surfaces as PythonError with the full traceback text. */
+function describeError(err: unknown): { text: string; exitCode: number } {
+  const message = String((err as { message?: string })?.message ?? err)
+  // SystemExit arrives inside the traceback, not as a typed error
+  const match = /SystemExit:\s*(\d+)?/.exec(message)
+  if (match !== null) {
+    const code = match[1] !== undefined ? Number.parseInt(match[1], 10) : 0
+    return { text: '', exitCode: Number.isFinite(code) ? code : 0 }
+  }
+  return { text: message, exitCode: 1 }
+}
+
+export async function runPython(pyodide: any, options: PythonRunOptions): Promise<PythonRunResult> {
+  const { FS } = pyodide
+  const { payload, cwd, env } = options
+
+  // ---- filesystem in: the caller's snapshot ----
+  for (const [path, offset, length] of payload.index) {
+    const dir = path.slice(0, path.lastIndexOf('/')) || '/'
+    try {
+      FS.mkdirTree(dir)
+    } catch {
+      // exists
+    }
+    FS.writeFile(path, payload.buffer.subarray(offset, offset + length))
+  }
+  try {
+    FS.mkdirTree(cwd)
+  } catch {
+    // exists
+  }
+  // the artifacts convention: python visuals land in ~/artifacts (see UI
+  // download affordances) — pre-create it so savefig never needs mkdir
+  try {
+    FS.mkdirTree('/home/user/artifacts')
+  } catch {
+    // exists
+  }
+  FS.chdir(cwd)
+
+  // ---- environment: MPLBACKEND for headless plots, then the session's ----
+  // update, never clear: pyodide presets HOME/MPLCONFIGDIR etc. that the
+  // data-science stack depends on
+  const mergedEnv: Record<string, string> = { MPLBACKEND: 'AGG', ...env }
+  const envJson = JSON.stringify(mergedEnv)
+  await pyodide.runPythonAsync(
+    `import os, json as _json\nos.environ.update(_json.loads(${JSON.stringify(envJson)}))\ndel _json`,
+  )
+
+  // ---- streams ----
+  pyodide.setStdout({ batched: (text: string) => options.onOut('stdout', `${text}\n`) })
+  pyodide.setStderr({ batched: (text: string) => options.onOut('stderr', `${text}\n`) })
+
+  // ---- argv ----
+  const argv = [options.entry, ...options.argv]
+  await pyodide.runPythonAsync(
+    `import sys as _sys\n_sys.argv = ${JSON.stringify(argv)}\nimport os as _os\n_os.chdir(${JSON.stringify(cwd)})\nif ${JSON.stringify(cwd)} not in _sys.path: _sys.path.insert(0, ${JSON.stringify(cwd)})\ndel _sys, _os`,
+  )
+
+  // ---- packages: whatever the script imports that pyodide can provide ----
+  let statusHandler: ((text: string) => void) | undefined = options.onStatus
+  const prevLoadPackage = pyodide.loadedPackages
+  try {
+    await pyodide.loadPackagesFromImports(options.code, {
+      messageCallback: (text: string) => statusHandler?.(text),
+    })
+  } catch (err) {
+    options.onOut('stderr', `python: package resolution failed: ${describeError(err).text}\n`)
+    return { exitCode: 1, written: [], deleted: [] }
+  }
+  const fresh = Object.keys(pyodide.loadedPackages ?? {}).filter((p) => !(prevLoadPackage ?? {})[p])
+  for (const pkg of fresh) options.onStatus?.(`installed ${pkg}`)
+
+  // pyodide ships only its curated set — anything else the script imports
+  // that is pure-python gets installed from PyPI via micropip (best effort)
+  try {
+    const missing = JSON.parse(
+      (await pyodide.runPythonAsync(
+        `import ast, importlib.util, json as _json\n_missing = []\n_tree = ast.parse(${JSON.stringify(options.code)})\nfor _node in ast.walk(_tree):\n    if isinstance(_node, ast.Import):\n        for _a in _node.names:\n            _name = _a.name.split('.')[0]\n            if importlib.util.find_spec(_name) is None and _name not in _missing:\n                _missing.append(_name)\n    elif isinstance(_node, ast.ImportFrom) and _node.module:\n        _name = _node.module.split('.')[0]\n        if _node.level == 0 and importlib.util.find_spec(_name) is None and _name not in _missing:\n            _missing.append(_name)\n_json.dumps(_missing)`,
+      )) as string,
+    ) as string[]
+    for (const name of missing) {
+      options.onStatus?.(`pip installing ${name}…`)
+      try {
+        await pyodide.loadPackage('micropip')
+        await pyodide.runPythonAsync(`import micropip\nawait micropip.install(${JSON.stringify(name)})`)
+        options.onStatus?.(`pip installed ${name}`)
+      } catch (err) {
+        options.onStatus?.(`pip: ${name} unavailable (${describeError(err).text.slice(0, 80)})`)
+      }
+    }
+  } catch {
+    // the ast scan itself must never fail the run
+  }
+
+  // ---- execute ----
+  let exitCode = 0
+  try {
+    await pyodide.runPythonAsync(options.code)
+  } catch (err) {
+    const described = describeError(err)
+    if (described.text) options.onOut('stderr', `${described.text}\n`)
+    exitCode = described.exitCode
+  }
+
+  // ---- filesystem out: diff against what came in. Walk ONLY the payload's
+  // top-level prefixes — wheels unpack package data into the pyodide root
+  // (/share, /lib, …) which must never sync back to the workspace.
+  const input = new Map<string, number>()
+  const roots = new Set<string>()
+  for (const [path, , length] of payload.index) {
+    input.set(path, length)
+    roots.add('/' + (path.slice(1).split('/')[0] ?? ''))
+  }
+  const written: PythonWrittenFile[] = []
+  const walk = (dir: string) => {
+    let names: string[]
+    try {
+      names = FS.readdir(dir)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      if (name === '.' || name === '..') continue
+      const full = dir === '/' ? `/${name}` : `${dir}/${name}`
+      if (inSkip(full)) continue
+      let stat: any
+      try {
+        stat = FS.stat(full)
+      } catch {
+        continue
+      }
+      if (FS.isDir(stat.mode)) {
+        walk(full)
+      } else {
+        const bytes: Uint8Array = FS.readFile(full)
+        if (input.get(full) !== bytes.length) {
+          written.push({ path: full, bytes: new Uint8Array(bytes) })
+        }
+      }
+    }
+  }
+  for (const root of roots) {
+    if (root !== '/' && root !== '') walk(root)
+  }
+  return { exitCode, written, deleted: [] }
+}

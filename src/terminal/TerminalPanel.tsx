@@ -96,7 +96,27 @@ export default function TerminalPanel() {
       return vfsPath.normalize(base)
     }
 
-    const runLine = async (cmd: string) => {
+    // heredoc continuation (PS2): `cat > f <<EOF` collects lines until the
+    // delimiter, then runs the whole thing as one script — like a real
+    // terminal, where each interactive line is parsed in order
+    let heredoc: { delim: string; matched: string; head: string; lines: string[] } | null = null
+
+    const runLine = async (cmd: string, fromHeredoc = false) => {
+      if (heredoc !== null) {
+        if (cmd.trim() === heredoc.delim) {
+          // just-bash's heredoc parser cannot handle quoted delimiters —
+          // normalize the head to the bare delimiter when assembling
+          const head = heredoc.matched !== '' ? heredoc.head.replace(heredoc.matched, `<<${heredoc.delim}`) : heredoc.head
+          const script = [head, ...heredoc.lines].join('\n')
+          heredoc = null
+          await runLine(script, true)
+        } else {
+          heredoc.lines.push(cmd)
+          term.write('\r\n')
+          printPrompt()
+        }
+        return
+      }
       const trimmed = cmd.trim()
       if (trimmed) {
         history.push(trimmed)
@@ -130,9 +150,21 @@ export default function TerminalPanel() {
         return
       }
 
+      // a heredoc-assembled script contains its own <<DELIM — only fresh
+      // interactive lines may open a new one
+      const heredocMatch = fromHeredoc
+        ? null
+        : /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(trimmed)
+      if (heredocMatch !== null && !heredocMatch[0].includes('<<<')) {
+        heredoc = { delim: heredocMatch[2], matched: heredocMatch[0], head: cmd, lines: [] }
+        term.write('\r\n')
+        printPrompt()
+        return
+      }
+
       running = true
       try {
-        const result = await shell.exec(trimmed, cwd)
+        const result = await shell.exec(heredoc !== null ? cmd : trimmed, cwd)
         if (result.stdout) writeOut(result.stdout)
         if (result.stderr) writeErr(result.stderr)
         if (!result.stdout && !result.stderr && result.exitCode !== 0) {

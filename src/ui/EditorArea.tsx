@@ -4,6 +4,7 @@ import { platform } from '../platform'
 import { workspaceActions, useWorkspace } from './workspace-store'
 import { FileIcon } from './file-icon'
 import CodeEditor from '../editor/CodeEditor'
+import { downloadVfsFile } from './download'
 
 export function EditorArea() {
   const ws = useWorkspace()
@@ -141,6 +142,9 @@ function ImageView({ path, active }: { path: string; active: boolean }) {
       <span className="image-meta">
         {path.split('/').pop()} — {size}
       </span>
+      <button className="view-download" onClick={() => downloadVfsFile(path)}>
+        Download
+      </button>
     </div>
   )
 }
@@ -154,6 +158,9 @@ function BinaryView({ path, active }: { path: string; active: boolean }) {
       <Binary size={28} />
       <span className="binary-name">{path.split('/').pop()}</span>
       <span className="binary-size">{size} — binary file, not editable</span>
+      <button className="view-download" onClick={() => downloadVfsFile(path)}>
+        Download
+      </button>
     </div>
   )
 }

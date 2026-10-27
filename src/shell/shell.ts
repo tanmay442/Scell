@@ -9,6 +9,7 @@ import { gitCommand } from './commands/git'
 import { tscCommand } from './commands/tsc-cmd'
 import { cellCommand } from './commands/cell-cmd'
 import { curlCommand } from './commands/curl'
+import { pythonCommand } from './commands/python-cmd'
 
 export interface ShellResult {
   stdout: string
@@ -78,14 +79,17 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
           ? `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
           : `{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
       const result = await bash.exec(wrapped, options)
+      // the dump may CONCATENATE onto the command's own output (no trailing
+      // newline) — find the marker anywhere and cut to its end of line
       const marker = '__CELL_ENV__:'
-      const lines = result.stdout.split('\n')
-      const dumpIndex = lines.map((line) => line.startsWith(marker)).lastIndexOf(true)
       let stdout = result.stdout
-      if (dumpIndex !== -1) {
-        stdout = lines.filter((_, i) => i !== dumpIndex).join('\n')
+      const markerAt = stdout.lastIndexOf(marker)
+      if (markerAt !== -1) {
+        const lineEnd = stdout.indexOf('\n', markerAt)
+        const dumpText = lineEnd === -1 ? stdout.slice(markerAt) : stdout.slice(markerAt, lineEnd)
+        stdout = lineEnd === -1 ? stdout.slice(0, markerAt) : stdout.slice(0, markerAt) + stdout.slice(lineEnd + 1)
         try {
-          const parsed = JSON.parse(lines[dumpIndex].slice(marker.length)) as Record<string, unknown>
+          const parsed = JSON.parse(dumpText.slice(marker.length)) as Record<string, unknown>
           for (const [key, value] of Object.entries(parsed)) {
             if (typeof value === 'string' && !ENV_BLOCKLIST.has(key)) sessionEnv[key] = value
           }
@@ -102,12 +106,12 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
 
   const register = (
     name: string,
-    fn: (args: string[], ctx: { cwd: string; env: Map<string, string> }) => Promise<CommandResult> | CommandResult,
+    fn: (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown }) => Promise<CommandResult> | CommandResult,
   ) => {
     bash.registerCommand(
-      defineCommand(name, async (args: string[], ctx: { cwd?: string; env?: Map<string, string> }) => {
+      defineCommand(name, async (args: string[], ctx: { cwd?: string; env?: Map<string, string>; stdin?: unknown }) => {
         try {
-          return toResult(await fn(args, { cwd: ctx.cwd ?? HOME_DIR, env: ctx.env ?? new Map() }))
+          return toResult(await fn(args, { cwd: ctx.cwd ?? HOME_DIR, env: ctx.env ?? new Map(), stdin: ctx.stdin }))
         } catch (err) {
           const detail =
             err instanceof Error
@@ -322,7 +326,11 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
   register('npx', (args, { cwd }) => npx(v, args, { cwd }))
   register('pnpx', (args, { cwd }) => npx(v, args, { cwd }))
   register('cell', (args, { cwd }) => cellCommand(v, args, { cwd, shell: nestedShell() }))
+  const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown }) =>
+    pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined })
   register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))
+  register('python', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined }))
+  register('python3', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined }))
 
   // global package bins (~/.local/lib/node_modules) are real PATH commands:
   // registered at shell creation for bins installed in earlier sessions, and

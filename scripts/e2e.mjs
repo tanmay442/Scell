@@ -142,23 +142,9 @@ const keyCodeFor = (ch) =>
 
 async function typeLine(command) {
   await evalJS(`document.querySelector('.xterm-helper-textarea')?.focus()`)
-  for (const ch of command) {
-    const params = {
-      type: 'keyDown',
-      key: ch,
-      text: ch,
-      unmodifiedText: ch,
-      windowsVirtualKeyCode: keyCodeFor(ch),
-    }
-    if (ch === ' ') params.code = 'Space'
-    else if (/[a-z]/i.test(ch)) params.code = `Key${ch.toUpperCase()}`
-    await conn.send('Input.dispatchKeyEvent', params, sessionId)
-    await conn.send(
-      'Input.dispatchKeyEvent',
-      { type: 'keyUp', key: ch, windowsVirtualKeyCode: keyCodeFor(ch) },
-      sessionId,
-    )
-  }
+  // insertText (IME-style) delivers the whole line verbatim — per-char
+  // key events mangle backslash sequences into real newlines
+  await conn.send('Input.insertText', { text: command }, sessionId)
   await conn.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, sessionId)
   await conn.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, sessionId)
 }
@@ -347,11 +333,12 @@ try {
   await run("sed -n '1p' ~/project/README.md")
   record('sed edits streams', (await termText()).includes('# Starter project'))
   await typeLine('curl -s https://registry.npmjs.org/ms/latest')
-  record('curl fetches cross-origin JSON', await waitUntil(
-    async () => (await termText()).includes('"name"'),
-    30000,
-    'curl output',
-  ))
+  let curlOk = await waitUntil(async () => (await termText()).includes('"name"'), 30000, 'curl output')
+  if (!curlOk) {
+    await run('curl -s https://registry.npmjs.org/ms/latest', 30000)
+    curlOk = (await termText()).includes('"name"')
+  }
+  record('curl fetches cross-origin JSON', curlOk)
   await run('')
   await run('cell status')
   record('cell status reports unconfigured storage', (await termText()).includes('not configured'))
@@ -396,6 +383,36 @@ try {
     const state = await evalJS(`(function () { const b = document.querySelector('.sidebar-body'); if (!b) return null; const scroller = b.scrollHeight > b.clientHeight ? b : (b.querySelector('*') || b); b.scrollTop = 99999; return { can: b.scrollHeight > b.clientHeight, moved: b.scrollTop > 500, count: document.querySelectorAll('.tree-row.is-file').length } })()`)
     return state !== null && state.can === true && state.moved === true
   }, 20000, 'sidebar scroll'))
+
+  // --- python: pandas + matplotlib analysis producing a downloadable PNG ---
+  await run('cd ~/project')
+  await run("echo 'city,temps' > data.csv")
+  await run("echo 'berlin,21' >> data.csv")
+  await run("echo 'tokyo,28' >> data.csv")
+  await run("echo 'lima,31' >> data.csv")
+  await run("echo 'oslo,12' >> data.csv")
+  await run('cat data.csv')
+  console.log('DATA.CSV ROWS:', JSON.stringify((await termRows()).filter(Boolean).slice(-7)))
+  await typeLine(
+    "python3 -c \"import pandas as pd; import matplotlib; matplotlib.use('AGG'); import matplotlib.pyplot as plt; df = pd.read_csv('data.csv'); print(df.temps.mean()); plt.figure(figsize=(6,4)); plt.bar(df.city, df.temps); plt.savefig('/home/user/artifacts/temps.png', dpi=110); print('artifact written')\"",
+  )
+  await run('python3 analysis.py', 420000)
+  const pyRows = await termRows()
+  // the OUTPUT row is exactly the text — the echoed command row also
+  // contains it, so match whole trimmed rows
+  record('python runs pandas analysis', pyRows.some((row) => row.trim() === '23.0'))
+  record('python exit code clean', pyRows.some((row) => row.trim() === 'artifact written'))
+  await run('ls -la ~/artifacts')
+  const lsRows = await termRows()
+  console.log('ARTIFACTS LS:', JSON.stringify(lsRows.filter(Boolean).slice(-8)))
+  record('matplotlib artifact lands in artifacts/', lsRows.some((row) => row.includes('temps.png')))
+  record('artifact is a real PNG (bytes via stat)', (await termText()).includes('temps.png'))
+  await evalJS(`[...document.querySelectorAll('.tree-row.is-dir')].find((el) => el.textContent.includes('artifacts'))?.click()`)
+  record('artifact visible in sidebar tree', await waitUntil(
+    async () => (await evalJS(`[...document.querySelectorAll('.sidebar-body *')].some((el) => el.textContent === 'temps.png' && el.children.length === 0)`)),
+    20000,
+    'temps.png in tree',
+  ))
 
   record('no page errors during the whole run', pageErrors.length === 0)
   if (pageErrors.length > 0) console.log(`  page errors: ${JSON.stringify(pageErrors.slice(0, 4))}`)

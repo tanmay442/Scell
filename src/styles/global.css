@@ -1025,3 +1025,14 @@ kbd {
   color: var(--text);
   opacity: 0.7;
 }
+
+.view-download {
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.view-download:hover { background: #0068b8; }
