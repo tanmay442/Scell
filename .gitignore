@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+vendor/
+*.local
+.DS_Store
+nohup.out
