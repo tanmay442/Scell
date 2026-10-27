@@ -23,23 +23,55 @@ export function PreviewPanel() {
   const [build, setBuild] = useState<PreviewBuild | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [version, setVersion] = useState(0)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [status, setStatus] = useState('idle')
   const buildRef = useRef<PreviewBuild | null>(null)
   buildRef.current = build
 
   const rebuild = useCallback(
     (target: string) => {
-      const previous = buildRef.current
-      if (previous) for (const url of previous.objectUrls) URL.revokeObjectURL(url)
-      const result = buildPreviewDocument(vfs, target)
-      if ('error' in result) {
-        setBuild(null)
-        setError(result.error)
-        return
-      }
-      setError(null)
-      setBuild(result)
-      setVersion((v) => v + 1)
+      setStatus('bundling…')
+      void (async () => {
+        const previous = buildRef.current
+        if (previous) for (const url of previous.objectUrls) URL.revokeObjectURL(url)
+        const result = await buildPreviewDocument(vfs, target)
+        if ('error' in result) {
+          setBuild(null)
+          setError(result.error)
+          setStatus('idle')
+          return
+        }
+        setError(null)
+        setBuild(result)
+        // router apps need a real pathname (/) — about:srcdoc matches no
+        // route. The service worker serves the document at
+        // /?cellpreview=<token>; fall back to srcDoc when unavailable.
+        let url: string | null = null
+        try {
+          // register once; ready never resolves without it — race a timeout
+          // so unavailable service workers (private mode, no https) fall back
+          const registration =
+            navigator.serviceWorker !== undefined
+              ? await Promise.race([
+                  (async () => {
+                    await navigator.serviceWorker.register('/cell-preview-sw.js')
+                    return navigator.serviceWorker.ready
+                  })(),
+                  new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+                ])
+              : null
+          if (registration?.active) {
+            const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+            url = `/?cellpreview=${token}`
+            registration.active.postMessage({ type: 'cell-preview-put', url, html: result.html })
+          }
+        } catch {
+          url = null
+        }
+        setPreviewUrl(url)
+        setVersion((v) => v + 1)
+        setStatus('idle')
+      })()
     },
     [vfs],
   )
@@ -130,7 +162,13 @@ export function PreviewPanel() {
         {error ? (
           <div className="preview-error">{error}</div>
         ) : build ? (
-          <iframe key={version} className="preview-frame" title="app preview" sandbox="allow-scripts allow-same-origin allow-forms" srcDoc={build.html} />
+          <iframe
+            key={version}
+            className="preview-frame"
+            title="app preview"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+            {...(previewUrl !== null ? { src: previewUrl } : { srcDoc: build.html })}
+          />
         ) : (
           <div className="preview-error">building…</div>
         )}

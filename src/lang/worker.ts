@@ -10,7 +10,19 @@ function findTsconfig(files: Record<string, string>): { path: string; synthesize
   const candidates = Object.keys(files)
     .filter((key) => key.endsWith('/tsconfig.json') && !key.includes('/node_modules/'))
     .sort((a, b) => a.split('/').length - b.split('/').length || a.length - b.length)
-  if (candidates.length > 0) return { path: candidates[0], synthesized: false }
+  // solution-style tsconfigs (project references, no include/files of their
+  // own, like vite's tsconfig.json) are not checkable — pick the first real one
+  for (const candidate of candidates) {
+    let parsed: Record<string, unknown> = {}
+    try {
+      parsed = JSON.parse(files[candidate]) as Record<string, unknown>
+    } catch {
+      continue
+    }
+    if (parsed.include !== undefined || parsed.files !== undefined || (parsed.compilerOptions !== undefined && parsed.references === undefined)) {
+      return { path: candidate, synthesized: false }
+    }
+  }
   return null
 }
 
