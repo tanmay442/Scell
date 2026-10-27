@@ -1,7 +1,8 @@
 import type { Vfs } from '../../vfs/types'
+import { vfsPath } from '../../vfs/types'
 import { runNodeProcess } from '../../node/run'
 import { TEMPLATES, templateNames } from '../../node/templates'
-import { installPackages, rootDependencies, readManifest, writeManifest, collectBins } from './install'
+import { GLOBAL_ROOT, installPackages, projectRoot, rootDependencies, readManifest, writeManifest, collectBins, findBins } from './install'
 import { fetchMetadata, pickVersion } from './registry'
 
 export interface CommandResult {
@@ -21,7 +22,7 @@ export interface ShellLike {
  * npm (and pnpm, which routes here): init with templates, install from the
  * real registry, run scripts through a fresh shell, and npx for bins.
  */
-export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell: ShellLike; flavor: 'npm' | 'pnpm' }): Promise<CommandResult> {
+export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell: ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void }): Promise<CommandResult> {
   const { cwd, shell, flavor } = opts
   const [sub = 'help', ...rest] = args
 
@@ -32,7 +33,11 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   }
 
   if (sub === 'install' || sub === 'i' || sub === 'add') {
-    return npmInstall(vfs, rest, { cwd })
+    return npmInstall(vfs, rest, { cwd, registerLive: opts.registerLive })
+  }
+
+  if (sub === 'uninstall' || sub === 'remove' || sub === 'rm' || sub === 'un') {
+    return npmUninstall(vfs, rest, { cwd })
   }
 
   if (sub === 'run' || sub === 'run-script') {
@@ -55,40 +60,57 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
     return runScript(vfs, sub, rest, { cwd, shell })
   }
 
-  return fail(`${flavor}: '${sub}' is not implemented in Cell yet. Supported: init, install, run, test, start, ls, exec/npx, info.\n`)
+  return fail(`${flavor}: '${sub}' is not implemented in Cell yet. Supported: init, install (-g), uninstall, run, test, start, ls, exec/npx, info.\n`)
 }
 
 export async function npx(vfs: Vfs, args: string[], opts: { cwd: string }): Promise<CommandResult> {
-  const name = args[0]
+  const name = args.find((a) => !a.startsWith('-'))
   if (!name) return fail('npx: specify a package binary to run, e.g. npx cowsay hi\n')
   const binArgs = args.slice(1)
 
-  // 1. an installed bin?
-  const bins = collectBins(vfs)
-  const direct = bins.get(name)
+  // 1. an installed bin — project-local first (walk up), then global
+  const direct = findBins(vfs, opts.cwd).get(name)
   if (direct) {
-    return runNodeEntry(vfs, direct, binArgs, opts.cwd)
+    return runNodeEntry(vfs, direct, binArgs, opts.cwd, name)
   }
 
   // 2. treat it as a package: install it, then run its (newly exposed) bin
-  const before = new Set(collectBins(vfs).keys())
+  const root = projectRoot(vfs, opts.cwd) ?? opts.cwd
+  const before = new Set(findBins(vfs, opts.cwd).keys())
   try {
-    await installPackages(vfs, [{ name }])
+    await installPackages(vfs, [{ name }], root)
   } catch (err) {
     return fail(`npx: could not install ${name}: ${err instanceof Error ? err.message : String(err)}\n`)
   }
-  const binsAfter = collectBins(vfs)
+  const binsAfter = findBins(vfs, opts.cwd)
   const fresh = [...binsAfter.keys()].filter((key) => !before.has(key))
   const binPath = binsAfter.get(name) ?? (fresh.length === 1 ? binsAfter.get(fresh[0]) : undefined)
   if (!binPath) {
     return fail(`npx: package ${name} installed but exposes no runnable bin\n`)
   }
-  return runNodeEntry(vfs, binPath, binArgs, opts.cwd)
+  return runNodeEntry(vfs, binPath, binArgs, opts.cwd, name)
 }
 
-async function runNodeEntry(vfs: Vfs, entry: string, argv: string[], cwd: string): Promise<CommandResult> {
+/** Run a package bin through the node sandbox (native binaries are caught honestly). */
+export async function runNodeEntry(vfs: Vfs, entry: string, argv: string[], cwd: string, displayName?: string): Promise<CommandResult> {
+  // native platform binaries (e.g. opencode's bin/opencode.exe) can never run
+  // inside a browser isolate — say so instead of executing garbage
+  if (/\.(exe|node|wasm)$/i.test(entry) || !looksLikeJs(vfs, entry)) {
+    return {
+      stdout: '',
+      stderr: `${displayName ?? vfsPath.basename(entry)}: this package ships a native platform binary, which no browser can execute (there is no WASM build).\nFor an agent harness that does run here, see: cell agent --help\n`,
+      exitCode: 1,
+    }
+  }
   const result = await runNodeProcess(vfs, { entry, argv, cwd })
   return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
+}
+
+function looksLikeJs(vfs: Vfs, entry: string): boolean {
+  const bytes = vfs.readBytes(entry)
+  if (bytes === null) return false
+  const head = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, 512))
+  return /^\s*(#!.*\n)?\s*(\/\/|\/\*|"use strict"|import |const |let |var |require\(|async |function )/m.test(head)
 }
 
 async function npmInit(vfs: Vfs, args: string[], opts: { cwd: string; flavor: 'npm' | 'pnpm' }): Promise<CommandResult> {
@@ -131,19 +153,42 @@ async function npmInit(vfs: Vfs, args: string[], opts: { cwd: string; flavor: 'n
   return ok(`Wrote to ${inDir(cwd, '/package.json')}\n\n${JSON.stringify(manifest, null, 2)}\n`)
 }
 
-async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string }): Promise<CommandResult> {
+async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registerLive?: (name: string) => void }): Promise<CommandResult> {
   const { cwd } = opts
+  const global = args.includes('-g') || args.includes('--global')
   const saveDev = args.includes('--save-dev') || args.includes('-D')
   const saveExact = args.includes('--save-exact') || args.includes('-E')
   const pkgs = args.filter((a) => !a.startsWith('-'))
 
-  if (pkgs.length === 0) {
-    const deps = rootDependencies(vfs)
-    if (deps.length === 0) {
-      return fail('npm ERR! no package.json found — run `npm init` first\n')
+  if (global) {
+    if (pkgs.length === 0) {
+      return fail('npm ERR! -g needs at least one package\n')
     }
-    const report = await installPackages(vfs, deps)
-    return finishInstall(report, 'up to date', cwd)
+    const requests = pkgs.map((pkg) => {
+      const at = pkg.lastIndexOf('@')
+      return { name: at > 0 ? pkg.slice(0, at) : pkg, range: at > 0 ? pkg.slice(at + 1) : undefined }
+    })
+    const report = await installPackages(vfs, requests, GLOBAL_ROOT)
+    const freshBins = [...collectBins(vfs, GLOBAL_ROOT).keys()]
+    for (const bin of freshBins) opts.registerLive?.(bin)
+    const lines = [...report.warnings, `added ${report.added.length} package${report.added.length === 1 ? '' : 's'} globally to ~/.local/lib/node_modules`]
+    for (const item of report.added.slice(0, 8)) lines.push(`  + ${item.name}@${item.version}`)
+    if (freshBins.length > 0) lines.push(`commands now on PATH: ${freshBins.join(', ')}`)
+    return ok(`${lines.join('\n')}\n`)
+  }
+
+  const root = projectRoot(vfs, cwd)
+  if (root === null) {
+    return fail(`npm ERR! no package.json in ${cwd} or any parent — run \`npm init -y\` first (npm ERR! enoent)\n`)
+  }
+
+  if (pkgs.length === 0) {
+    const deps = rootDependencies(vfs, root)
+    if (deps.length === 0) {
+      return fail(`npm ERR! package.json at ${root} declares no dependencies — nothing to do\n`)
+    }
+    const report = await installPackages(vfs, deps, root)
+    return finishInstall(report, 'up to date', root)
   }
 
   const requests: { name: string; range?: string }[] = []
@@ -155,12 +200,13 @@ async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string }): Prom
     requests.push({ name, range })
   }
 
-  const manifest = readManifest(vfs, inDir(cwd, '/package.json'))
+  const manifestPath = `${root}/package.json`
+  const manifest = readManifest(vfs, manifestPath)
   if (!manifest) {
-    return fail(`npm ERR! no package.json in ${cwd} — run \`npm init -y\` first (npm ERR! enoent)\n`)
+    return fail(`npm ERR! no package.json in ${root} — run \`npm init -y\` first (npm ERR! enoent)\n`)
   }
 
-  const report = await installPackages(vfs, requests)
+  const report = await installPackages(vfs, requests, root)
 
   // record the resolved versions in package.json
   for (const { name, range } of requests) {
@@ -172,9 +218,39 @@ async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string }): Prom
     bucket[name] = spec
     manifest[key] = bucket
   }
-  writeManifest(vfs, manifest, inDir(cwd, '/package.json'))
+  writeManifest(vfs, manifest, manifestPath)
 
-  return finishInstall(report, 'installed', cwd)
+  return finishInstall(report, 'installed', root)
+}
+
+async function npmUninstall(vfs: Vfs, args: string[], opts: { cwd: string }): Promise<CommandResult> {
+  const global = args.includes('-g') || args.includes('--global')
+  const pkgs = args.filter((a) => !a.startsWith('-'))
+  if (pkgs.length === 0) return fail('npm ERR! uninstall needs a package name\n')
+  const root = global ? GLOBAL_ROOT : (projectRoot(vfs, opts.cwd) ?? '/')
+  const removed: string[] = []
+  for (const name of pkgs) {
+    const dir = `${root}/node_modules/${name}`
+    if (vfs.exists(dir)) {
+      vfs.delete(dir)
+      removed.push(name)
+    }
+  }
+  if (!global && removed.length > 0) {
+    const manifestPath = `${root}/package.json`
+    const manifest = readManifest(vfs, manifestPath)
+    if (manifest) {
+      for (const name of removed) {
+        for (const key of ['dependencies', 'devDependencies']) {
+          const bucket = manifest[key] as Record<string, string> | undefined
+          if (bucket) delete bucket[name]
+        }
+      }
+      writeManifest(vfs, manifest, manifestPath)
+    }
+  }
+  if (removed.length === 0) return fail(`npm ERR! not installed: ${pkgs.join(', ')}\n`)
+  return ok(`removed ${removed.length} package${removed.length === 1 ? '' : 's'}: ${removed.join(', ')}\n`)
 }
 
 function finishInstall(report: { added: { name: string; version: string; nested: boolean }[]; warnings: string[]}, verb: string, cwd: string): CommandResult {
@@ -192,7 +268,7 @@ function finishInstall(report: { added: { name: string; version: string; nested:
 }
 
 function listScripts(vfs: Vfs, cwd: string): CommandResult {
-  const manifest = readManifest(vfs, inDir(cwd, '/package.json'))
+  const manifest = readManifest(vfs, `${projectRoot(vfs, cwd) ?? cwd}/package.json`)
   const scripts = (manifest?.scripts as Record<string, string> | undefined) ?? {}
   const names = Object.keys(scripts)
   if (names.length === 0) return ok('no scripts available\n')
@@ -201,7 +277,7 @@ function listScripts(vfs: Vfs, cwd: string): CommandResult {
 
 async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; shell: ShellLike }): Promise<CommandResult> {
   const { cwd, shell } = opts
-  const manifest = readManifest(vfs, inDir(cwd, '/package.json'))
+  const manifest = readManifest(vfs, `${projectRoot(vfs, cwd) ?? cwd}/package.json`)
   if (!manifest) return fail(`npm ERR! no package.json in ${cwd}\n`)
   const scripts = (manifest.scripts as Record<string, string> | undefined) ?? {}
   const command = scripts[script]
@@ -218,18 +294,19 @@ async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { 
   const full = `${parts.join(' && ')}${extraArgs.length ? ` ${extraArgs.join(' ')}` : ''}`
 
   // scripts run through a fresh shell so nested node/npm/npx/tsc calls work
-  const result = await shell.exec(full, `/workspace${cwd === '/' ? '' : cwd}`)
+  const result = await shell.exec(full, cwd)
   return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
 }
 
 function npmLs(vfs: Vfs, cwd: string): CommandResult {
-  const root = inDir(cwd, '/node_modules')
-  if (!vfs.isDir(root)) return ok(`${vfsPathBasename(cwd)}@ ${cwd}\n(empty — nothing installed)\n`)
-  const manifest = readManifest(vfs, inDir(cwd, '/package.json'))
-  const lines = [`${(manifest?.name as string) ?? vfsPathBasename(cwd)}@${(manifest?.version as string) ?? '0.0.0'} ${cwd}`]
-  const declared = rootDependencies(vfs)
-  for (const name of vfs.readDir(root)) {
-    const pkgManifest = readManifest(vfs, `${root}/${name}/package.json`)
+  const root = projectRoot(vfs, cwd) ?? cwd
+  const modules = `${root}/node_modules`
+  if (!vfs.isDir(modules)) return ok(`${vfsPathBasename(root)}@ ${root}\n(empty — nothing installed)\n`)
+  const manifest = readManifest(vfs, `${root}/package.json`)
+  const lines = [`${(manifest?.name as string) ?? vfsPathBasename(root)}@${(manifest?.version as string) ?? '0.0.0'} ${root}`]
+  const declared = rootDependencies(vfs, root)
+  for (const name of vfs.readDir(modules)) {
+    const pkgManifest = readManifest(vfs, `${modules}/${name}/package.json`)
     const version = (pkgManifest?.version as string) ?? '?'
     const wanted = declared.find((d) => d.name === name)?.range ?? 'extraneous'
     lines.push(`├── ${name}@${version} (${wanted})`)
@@ -261,7 +338,7 @@ function vfsPathBasename(cwd: string): string {
   return n === '' ? 'workspace' : n.slice(n.lastIndexOf('/') + 1)
 }
 
-export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; shell: ShellLike }) =>
+export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; shell: ShellLike; registerLive?: (name: string) => void }) =>
   args[0] === 'dlx'
     ? npx(vfs, args.slice(1), { cwd: opts.cwd })
     : npmCommand(vfs, args, { ...opts, flavor: 'pnpm' })

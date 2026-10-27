@@ -20,7 +20,7 @@ export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string 
   if (args[0] === '-e' || args[0] === '--eval') {
     const code = args[1]
     if (code === undefined) return { stdout: '', stderr: 'node: -e requires a script string\n', exitCode: 1 }
-    const evalPath = `${HOME}/.cell-eval.js`
+    const evalPath = `${opts.cwd === '/' ? '' : opts.cwd}/.cell-eval.js`
     vfs.write(evalPath, code)
     const result = await runNodeProcess(vfs, { entry: evalPath, argv: [], cwd: opts.cwd })
     vfs.delete(evalPath)

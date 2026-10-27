@@ -3,7 +3,8 @@ import { platform } from '../platform'
 import type { Vfs } from '../vfs/types'
 import { VfsBackedFs } from './vfs-fs'
 import { nodeCommand } from './commands/node-cmd'
-import { npmCommand, npx, pnpmCommand, type CommandResult } from './commands/npm'
+import { npmCommand, npx, pnpmCommand, runNodeEntry, type CommandResult } from './commands/npm'
+import { collectBins, GLOBAL_ROOT } from './commands/install'
 import { gitCommand } from './commands/git'
 import { tscCommand } from './commands/tsc-cmd'
 import { cellCommand } from './commands/cell-cmd'
@@ -74,12 +75,31 @@ export function createShell(vfs?: Vfs): Shell {
   register('node', (args, { cwd }) => nodeCommand(vfs ?? platform().vfs, args, { cwd }))
   register('tsc', (args, { cwd }) => tscCommand(vfs ?? platform().vfs, args, { cwd }))
   register('git', (args, { cwd }) => gitCommand(vfs ?? platform().vfs, args, { cwd }))
-  register('npm', (args, { cwd }) => npmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell(), flavor: 'npm' }))
-  register('pnpm', (args, { cwd }) => pnpmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell() }))
+  register('npm', (args, { cwd }) =>
+    npmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell(), flavor: 'npm', registerLive }),
+  )
+  register('pnpm', (args, { cwd }) => pnpmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell(), registerLive }))
   register('npx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
   register('pnpx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
-  register('cell', (args, { cwd }) => cellCommand(vfs ?? platform().vfs, args, { cwd }))
+  register('cell', (args, { cwd }) => cellCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell() }))
   register('curl', (args, { cwd }) => curlCommand(vfs ?? platform().vfs, args, { cwd }))
+
+  // global package bins (~/.local/lib/node_modules) are real PATH commands:
+  // registered at shell creation for bins installed in earlier sessions, and
+  // re-registered live when `npm install -g` adds new ones
+  const registeredBins = new Set<string>()
+  const registerGlobalBin = (binName: string, entry: string) => {
+    if (registeredBins.has(binName)) return
+    registeredBins.add(binName)
+    register(binName, (args, { cwd }) => runNodeEntry(vfs ?? platform().vfs, entry, args, cwd, binName))
+  }
+  for (const [binName, entry] of collectBins(vfs ?? platform().vfs, GLOBAL_ROOT)) {
+    registerGlobalBin(binName, entry)
+  }
+  const registerLive = (binName: string) => {
+    const entry = collectBins(vfs ?? platform().vfs, GLOBAL_ROOT).get(binName)
+    if (entry !== undefined) registerGlobalBin(binName, entry)
+  }
 
   return shell
 }

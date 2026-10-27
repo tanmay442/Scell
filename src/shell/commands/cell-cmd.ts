@@ -2,8 +2,9 @@ import { gunzipSync, gzipSync } from 'fflate'
 import type { Vfs, VfsFileMap } from '../../vfs/types'
 import { looksLikeText } from './git'
 import { s3Fetch, type S3Config } from './sigv4'
+import { runAgent } from './agent'
 import { tarFiles, untar } from './untar'
-import type { CommandResult } from './npm'
+import type { CommandResult, ShellLike } from './npm'
 
 /**
  * `cell` — workspace-level tooling for long agentic sessions:
@@ -97,8 +98,13 @@ async function safeText(response: Response): Promise<string> {
   }
 }
 
-export async function cellCommand(vfs: Vfs, args: string[], _opts: { cwd: string }): Promise<CommandResult> {
+export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike }): Promise<CommandResult> {
   const sub = args[0] ?? 'help'
+
+  if (sub === 'agent') {
+    if (!opts.shell) return { stdout: '', stderr: 'cell agent: no shell available in this context\n', exitCode: 1 }
+    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell })
+  }
 
   if (sub === 'status') {
     const configured = readConfig(vfs)
@@ -176,7 +182,7 @@ export async function cellCommand(vfs: Vfs, args: string[], _opts: { cwd: string
 
   return {
     stdout:
-      'usage: cell <command>\n\nsave    snapshot the whole workspace to object storage (tar.gz, SigV4 PUT)\nlist    snapshots in the bucket\nload    restore a snapshot: `cell load` (latest) or `cell load 3`\nstatus  configuration and workspace summary\n\nconfigure ~/.cell/storage.json (any S3-compatible endpoint with CORS)\n',
+      'usage: cell <command>\n\nagent   run the headless AI agent: cell agent "fix the failing test" [--steps N]\nsave    snapshot the whole workspace to object storage (tar.gz, SigV4 PUT)\nlist    snapshots in the bucket\nload    restore a snapshot: `cell load` (latest) or `cell load 3`\nstatus  configuration and workspace summary\n\nagent config: ~/.cell/agent.json — storage config: ~/.cell/storage.json\n',
     stderr: '',
     exitCode: sub === 'help' ? 0 : 1,
   }

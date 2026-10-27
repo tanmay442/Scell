@@ -290,6 +290,41 @@ try {
     await evalJS(`[...document.querySelectorAll('.sidebar-body *')].some((el) => el.textContent === '.git' && el.children.length === 0)`),
   )
 
+  // --- npm inside the cloned project (the subdir install flow) -------------
+  await run('npm install', 120000)
+  record('npm install works inside a cloned project', (await termText()).includes('added 1 package'))
+  await run('ls')
+  record('install creates node_modules in the project', (await termRows()).includes('node_modules'))
+  await typeLine("node -e \"console.log(require('ms')('2 days'))\"")
+  record('installed packages resolve from the project', await waitUntil(
+    async () => (await termText()).includes('172800000'),
+    30000,
+    'ms resolve',
+  ))
+  await run('')
+  await run('npm run hi')
+  record('npm run executes project scripts', (await termText()).includes('from testrepo'))
+
+  // --- global install: bins become real PATH commands -----------------------
+  await run('cd ~')
+  await run('npm install -g semver', 120000)
+  record('npm install -g adds to the global root', (await termText()).includes('added 1 package globally'))
+  await typeLine('semver 1.2.3')
+  record('global bins run as shell commands', await waitUntil(
+    async () => (await termText()).includes('1.2.3'),
+    20000,
+    'semver output',
+  ))
+  await run('')
+
+  // --- native-only packages fail honestly -----------------------------------
+  await run('npx -y opencode-ai --version', 120000).catch(() => {})
+  record('native-binary packages explain instead of crashing', (await termText()).includes('native platform binary'))
+
+  // --- agent harness without a key points at the config ----------------------
+  await run('cell agent "hello"')
+  record('cell agent without config explains setup', (await termText()).includes('~/.cell/agent.json'))
+
   // --- agent toolbox: shell utilities, curl, cell status -------------------
   await run('which node')
   record('which resolves platform commands', (await termText()).includes('node'))

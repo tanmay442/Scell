@@ -28,6 +28,20 @@ git(work, 'config', 'user.email', 'seed@e2e.local')
 writeFileSync(join(work, 'hello.txt'), 'hello from the e2e git server\n')
 mkdirSync(join(work, 'src'))
 writeFileSync(join(work, 'src', 'main.js'), 'console.log("from testrepo")\n')
+writeFileSync(
+  join(work, 'package.json'),
+  JSON.stringify(
+    {
+      name: 'testrepo',
+      version: '1.0.0',
+      private: true,
+      dependencies: { ms: '^2.1.3' },
+      scripts: { hi: 'node src/main.js' },
+    },
+    null,
+    2,
+  ) + '\n',
+)
 git(work, 'add', '.')
 git(work, 'commit', '-m', 'e2e seed commit')
 spawnSync('git', ['init', '--bare', '-b', 'master', bare], { encoding: 'utf8' })
