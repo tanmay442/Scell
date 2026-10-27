@@ -11,7 +11,7 @@ import type { CommandResult } from './npm'
  */
 export async function tscCommand(_vfs: Vfs, args: string[], opts?: { cwd?: string }): Promise<CommandResult> {
   if (args[0] === '--version' || args[0] === '-v') {
-    return { stdout: 'Version 7.1.0-beta (ts-rust — the Rust port of TypeScript 7, WASM)\n', stderr: '', exitCode: 0 }
+    return { stdout: 'Version 7.1.0-beta\n', stderr: '', exitCode: 0 }
   }
   const service = langService()
   if (!service) {

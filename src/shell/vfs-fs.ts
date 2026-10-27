@@ -89,6 +89,15 @@ export class VfsBackedFs implements IFileSystem {
     ['/etc/group', 'root:x:0:\nuser:x:1000:\nsudo:x:27:user\ndocker:x:999:user\n'],
     ['/etc/resolv.conf', 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'],
     ['/proc/version', 'Linux version 6.8.0-cell (cell@cell) (gcc 13.2.0) #1 SMP PREEMPT_DYNAMIC\n'],
+    ['/proc/loadavg', '0.31 0.24 0.19 1/412 8301\n'],
+    ['/proc/self/cmdline', '/bin/bash\n'],
+    ['/proc/1/cmdline', '/bin/bash\n'],
+    ['/proc/mounts', '/dev/sda1 / ext4 rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec 0 0\ntmpfs /run tmpfs rw,nosuid 0 0\n'],
+    ['/proc/1/cgroup', '0::/init\n'],
+    ['/sys/fs/cgroup/memory.max', '17179869184\n'],
+    ['/etc/debian_version', '12.7\n'],
+    ['/etc/issue', 'Cell Linux 1.0 \\n \\l\n\n'],
+
     ['/proc/uptime', '8640.00 31200.00\n'],
     ['/proc/meminfo', [
       'MemTotal:       16254912 kB',
@@ -333,12 +342,31 @@ export class VfsBackedFs implements IFileSystem {
     if (z.zone === 'vfs') {
       if (!this.vfs.isDir(z.vpath)) throw new Error(`ENOTDIR: not a directory '${path}'`)
       const names = this.vfs.readDir(z.vpath)
-      return names.map((name) => ({
+      const entries: Dirent[] = names.map((name) => ({
         name,
         isFile: this.vfs.isFile(`${z.vpath === '/' ? '' : z.vpath}/${name}`),
         isDirectory: this.vfs.isDir(`${z.vpath === '/' ? '' : z.vpath}/${name}`),
         isSymbolicLink: this.symlinks.has(`${z.vpath === '/' ? '' : z.vpath}/${name}`),
       }))
+      // the root lists BOTH zones: the workspace and the system dirs
+      if (z.vpath === '/') {
+        const seen = new Set(entries.map((entry) => entry.name))
+        for (const dir of this.sysDirs) {
+          if (dir !== '/' && !dir.slice(1).includes('/') && !seen.has(dir.slice(1))) {
+            entries.push({ name: dir.slice(1), isFile: false, isDirectory: true, isSymbolicLink: false })
+            seen.add(dir.slice(1))
+          }
+        }
+        for (const file of this.sysFiles.keys()) {
+          const top = file.slice(1, file.indexOf('/', 1) === -1 ? undefined : file.indexOf('/', 1))
+          if (top !== '' && !top.includes('/') && !seen.has(top)) {
+            entries.push({ name: top, isFile: true, isDirectory: false, isSymbolicLink: false })
+            seen.add(top)
+          }
+        }
+        entries.sort((a, b) => a.name.localeCompare(b.name))
+      }
+      return entries
     }
     if (z.zone === 'devnull') throw new Error(`ENOTDIR: not a directory '${path}'`)
     if (!this.sysDirs.has(z.spath)) throw new Error(`ENOTDIR: not a directory '${path}'`)

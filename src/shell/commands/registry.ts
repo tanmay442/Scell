@@ -87,5 +87,5 @@ export async function fetchTarballEntries(version: RegistryVersion, name: string
     }
     tarballCache.set(url, tgz)
   }
-  return untar(gunzipSync(tgz))
+  return untar(gunzipSync(tgz), { stripFirstSegment: true })
 }

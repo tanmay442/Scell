@@ -199,6 +199,58 @@ function expandBareCssImports(resolver: Resolver, css: string, fromDir: string):
   })
 }
 
+interface TsPaths {
+  [alias: string]: string[]
+}
+
+/** tsconfig.json `paths` aliases (the vite-style `@/*` convention) */
+function loadTsPaths(vfs: Vfs, projectDir: string): TsPaths {
+  const read = (path: string): Record<string, unknown> | null => {
+    const bytes = vfs.readBytes(path)
+    if (bytes === null) return null
+    try {
+      // strip comments — tsconfigs are JSONC in the wild
+      const text = new TextDecoder().decode(bytes).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+      return JSON.parse(text) as Record<string, unknown>
+    } catch {
+      return null
+    }
+  }
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const parsed = read(`${projectDir}/${name}`)
+    if (parsed === null) continue
+    const compilerOptions = (parsed.compilerOptions ?? {}) as { paths?: TsPaths; baseUrl?: string }
+    if (compilerOptions.paths !== undefined) {
+      // resolve relative mappings against baseUrl (default: the tsconfig dir)
+      const base = compilerOptions.baseUrl !== undefined ? `${projectDir}/${compilerOptions.baseUrl}`.replace(/\/{2,}/g, '/') : projectDir
+      const mapped: TsPaths = {}
+      for (const [alias, targets] of Object.entries(compilerOptions.paths)) {
+        mapped[alias] = targets.map((target) => `${base}/${target}`.replace(/\/{2,}/g, '/'))
+      }
+      return mapped
+    }
+    // solution-style: follow the first referenced project
+    const references = parsed.references as { path: string }[] | undefined
+    if (references !== undefined && references.length > 0) {
+      const refPath = `${projectDir}/${references[0].path}`.replace(/\/{2,}/g, '/')
+      const refParsed = read(refPath)
+      const refOptions = (refParsed?.compilerOptions ?? {}) as { paths?: TsPaths; baseUrl?: string }
+      if (refOptions.paths !== undefined) return refOptions.paths
+    }
+  }
+  return {}
+}
+
+/** resolve a mapped alias target through the resolver (file or dir entry) */
+function tryCandidatesPath(resolver: Resolver, target: string): string | null {
+  const dir = target.slice(0, target.lastIndexOf('/')) || '/'
+  const base = target.slice(target.lastIndexOf('/') + 1)
+  // reuse the resolver's bare-resolution against the target's own directory
+  const direct = resolver.resolve(dir === '' ? '/' : dir, base)
+  if (direct !== null) return direct
+  return resolver.resolve(dir, `./${base}`)
+}
+
 export async function bundleEntry(
   vfs: Vfs,
   projectDir: string,
@@ -206,6 +258,7 @@ export async function bundleEntry(
 ): Promise<BundleResult | { error: string }> {
   await ensureEsbuild()
   const resolver = makeResolver(vfs)
+  const tsPaths = loadTsPaths(vfs, projectDir)
   const cssFiles: string[] = []
   const loaderFor = (path: string): esbuild.Loader => {
     const ext = `.${vfsPath.ext(path)}`
@@ -230,12 +283,40 @@ export async function bundleEntry(
           }
           return { errors: [{ text: `preview: cannot resolve css '${args.path}'` }] }
         }
+        // tsconfig paths aliases (@/* → src/*)
+        for (const [alias, targets] of Object.entries(tsPaths)) {
+          const star = alias.indexOf('/*')
+          if (star === -1) {
+            if (args.path === alias) {
+              for (const target of targets) {
+                const found = tryCandidatesPath(resolver, target)
+                if (found !== null) return { path: found, namespace: 'cell-fs' }
+              }
+            }
+            continue
+          }
+          const prefix = alias.slice(0, star)
+          const suffix = alias.slice(star + 1)
+          if (args.path.startsWith(prefix) && args.path.endsWith(suffix)) {
+            const rest = args.path.slice(prefix.length, args.path.length - suffix.length)
+            for (const target of targets) {
+              const substituted = target.includes('*') ? target.replace('*', rest) : `${target}/${rest}`
+              const found = tryCandidatesPath(resolver, substituted)
+              if (found !== null) return { path: found, namespace: 'cell-fs' }
+            }
+          }
+        }
         const resolved = resolver.resolve(fromDir, args.path)
         if (resolved === null) {
           const isBare = !args.path.startsWith('.') && !args.path.startsWith('/')
           const pkgName = isBare ? args.path.split('/').slice(0, args.path.startsWith('@') ? 2 : 1).join('/') : null
-          const missingDeps = pkgName !== null && !vfs.isDir(`${projectDir}/node_modules/${pkgName}`)
-          const hint = missingDeps ? ` — dependencies are not installed: run npm install in ${projectDir}` : ''
+          const looksAlias = /^@[^/]+\/|^~\//.test(args.path) && Object.keys(tsPaths).some((alias) => args.path.startsWith(alias.split('/*')[0]))
+          const missingDeps = !looksAlias && pkgName !== null && !vfs.isDir(`${projectDir}/node_modules/${pkgName}`)
+          const hint = missingDeps
+            ? ` — dependencies are not installed: run npm install in ${projectDir}`
+            : looksAlias
+              ? ` — tsconfig paths alias did not resolve (check the paths mapping)`
+              : ''
           return { errors: [{ text: `preview: cannot resolve '${args.path}' from ${fromDir}${hint}` }] }
         }
         return { path: resolved, namespace: 'cell-fs' }

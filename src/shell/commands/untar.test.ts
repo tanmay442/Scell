@@ -12,7 +12,7 @@ describe('untar', () => {
       { path: 'assets/logo.bin', data: fileB },
       { path: 'empty' },
     ])
-    const entries = untar(tar)
+    const entries = untar(tar, { stripFirstSegment: true })
     const byPath = new Map(entries.map((e) => [e.path, e]))
     expect(byPath.get('index.js')?.type).toBe('file')
     expect(new TextDecoder().decode(byPath.get('index.js')!.data)).toBe('console.log("a")\n')
@@ -24,7 +24,7 @@ describe('untar', () => {
   it('parses npm-style tarballs after gunzip', () => {
     const tar = tarForTest([{ path: 'package.json', data: new TextEncoder().encode('{"name":"x"}') }])
     const tgz = gzipSync(tar)
-    const entries = untar(gunzipSync(tgz))
+    const entries = untar(gunzipSync(tgz), { stripFirstSegment: true })
     expect(entries).toHaveLength(1)
     expect(entries[0].path).toBe('package.json')
   })

@@ -23,7 +23,7 @@ function hideInternal(paths: string[]): string[] {
 
 export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: string; env?: Map<string, string>; stdin?: string }): Promise<CommandResult> {
   if (args[0] === '--version' || args[0] === '-V') {
-    return { stdout: 'Python 3.12.7 (Pyodide — CPython 3.12 compiled to WebAssembly)\n', stderr: '', exitCode: 0 }
+    return { stdout: 'Python 3.12.7\n', stderr: '', exitCode: 0 }
   }
 
   let code: string
@@ -41,7 +41,7 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
     const stdinText = opts.stdin ?? ''
     if (stdinText.trim() === '') {
       return {
-        stdout: 'Python 3.12.7 (Pyodide) on cell\nType "help", "copyright", "credits" or "license" for more information.\n',
+        stdout: 'Python 3.12.7 (main, Oct  1 2024, 00:00:00) [Wasm SIMD] on linux\nType "help", "copyright", "credits" or "license" for more information.\n',
         stderr: '',
         exitCode: 0,
       }

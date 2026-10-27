@@ -27,6 +27,7 @@ export function PreviewPanel() {
   const [logs, setLogs] = useState<{ text: string; tone: 'info' | 'error' }[]>([])
   const [status, setStatus] = useState('idle')
   const buildRef = useRef<PreviewBuild | null>(null)
+  const buildGen = useRef(0)
   const restoredDir = useRef<string | null>(null)
   buildRef.current = build
   const pushLog = useCallback((text: string, tone: 'info' | 'error' = 'info') => {
@@ -35,17 +36,24 @@ export function PreviewPanel() {
 
   const rebuild = useCallback(
     (target: string) => {
+      const generation = ++buildGen.current
       setStatus('bundling…')
       void (async () => {
-        const previous = buildRef.current
-        if (previous) for (const url of previous.objectUrls) URL.revokeObjectURL(url)
         const result = await buildPreviewDocument(vfs, target)
+        if (generation !== buildGen.current) {
+          // a newer rebuild superseded this one — drop its blobs, keep the
+          // newer build (or the last-good document on error)
+          if (!('error' in result)) for (const url of result.objectUrls) URL.revokeObjectURL(url)
+          return
+        }
         if ('error' in result) {
-          setBuild(null)
+          // keep the last-good preview mounted; surface the error as a strip
           setError(result.error)
           setStatus('idle')
           return
         }
+        const previous = buildRef.current
+        if (previous) for (const url of previous.objectUrls) URL.revokeObjectURL(url)
         setError(null)
         setBuild(result)
         // router apps need a real pathname (/) — about:srcdoc matches no
@@ -124,12 +132,17 @@ export function PreviewPanel() {
   // /api/* calls from the iframe → node sandbox → back
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
-      const msg = event.data as PendingApi & { __cellApi?: boolean }
+      if (event.origin !== location.origin) return
+      const msg = event.data as PendingApi & { __cellApi?: boolean; __cellRuntimeError?: boolean; text?: string }
       if (!msg || msg.__cellApi !== true || typeof msg.id !== 'number') return
       const target = dir
       if (target === null) return
       const started = performance.now()
       pushLog(`→ ${msg.method} ${msg.path.split('?')[0]}`)
+      if (msg.__cellRuntimeError === true) {
+        pushLog(`preview runtime: ${String(msg.text ?? '').slice(0, 240)}`, 'error')
+        return
+      }
       setStatus(`${msg.method} ${msg.path.split('?')[0]}`)
       void runApiFunction(vfs, target, { method: msg.method, path: msg.path, body: msg.body })
         .catch((err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }))
@@ -158,7 +171,7 @@ export function PreviewPanel() {
     if (dir === null) return
     let timer: ReturnType<typeof setTimeout> | null = null
     const off = bus.on('vfs:changed', (event: { path: string }) => {
-      if (event.path.startsWith('/node_modules') || event.path.includes('/.git/')) return
+      if (event.path.includes('/node_modules/') || event.path.includes('/.git/')) return
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => rebuild(dir), 600)
     })

@@ -19,13 +19,15 @@ const API_SHIM = `
 <script>
 (function () {
   window.__cellErrors = [];
-  var ce = console.error; console.error = function () { try { window.__cellErrors.push('console: ' + Array.prototype.map.call(arguments, String).join(' ').slice(0, 300)) } catch (e) {} ce.apply(console, arguments) };
+  var report = function (t) { try { window.__cellErrors.push(t); parent.postMessage({ __cellApi: true, __cellRuntimeError: true, text: String(t).slice(0, 300) }, location.origin) } catch (e) {} };
+  var ce = console.error; console.error = function () { try { report('console: ' + Array.prototype.map.call(arguments, String).join(' ').slice(0, 300)) } catch (e) {} ce.apply(console, arguments) };
+  window.addEventListener('error', function (e) { report(String(e.message || e.type)) });
+  window.addEventListener('unhandledrejection', function (e) { report('reject: ' + String(e.reason && e.reason.message ? e.reason.message : e.reason)) });
   try { window.__cellBoot = 'href=' + location.href + ';'; } catch (e) {}
   // router apps need a real pathname: about:srcdoc matches no route and
   // React would commit an empty tree — rewrite to '/' before app code runs
   try { history.replaceState(null, '', '/'); window.__cellBoot += 'hist=ok;href=' + location.href + ';'; } catch (e) { window.__cellBoot += 'hist=fail:' + (e && e.message ? e.message : 'x') + ';'; }
-  window.addEventListener('error', function (e) { window.__cellErrors.push(String(e.message || e.type)) });
-  window.addEventListener('unhandledrejection', function (e) { window.__cellErrors.push('reject: ' + String(e.reason && e.reason.message ? e.reason.message : e.reason)) });
+
   var pending = new Map();
   var seq = 0;
   window.addEventListener('message', function (e) {
@@ -45,7 +47,7 @@ const API_SHIM = `
       try { if (init && init.body !== undefined) body = typeof init.body === 'string' ? init.body : JSON.stringify(init.body) } catch (e) {}
       return new Promise(function (resolve, reject) {
         pending.set(id, { resolve: resolve, reject: reject });
-        parent.postMessage({ __cellApi: true, id: id, path: url, method: (init && init.method) || 'GET', body: body }, '*');
+        parent.postMessage({ __cellApi: true, id: id, path: url, method: (init && init.method) || 'GET', body: body }, location.origin);
         setTimeout(function () {
           if (pending.has(id)) { pending.delete(id); reject(new Error('api call timed out')) }
         }, 90000);
@@ -91,6 +93,7 @@ export function collectPublicAssets(vfs: Vfs, dir: string, limit = 300): PublicA
       return
     }
     for (const name of names) {
+      if (out.length >= limit) return
       const fsPath = `${fsDir}/${name}`
       const urlPath = urlDir === '' ? `/${name}` : `${urlDir}/${name}`
       if (vfs.isDir(fsPath)) walk(fsPath, urlPath)

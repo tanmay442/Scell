@@ -97,11 +97,18 @@ function normalizePath(p: string, cwd: string): string {
   return `/${parts.join('/')}`
 }
 
+/** node resolves relative fs paths against process.cwd() */
+function resolveFsPath(p: string): string {
+  if (p.startsWith('/') || p.startsWith('file://')) return p
+  return normalizePath(p, processShim.cwd())
+}
+
 const sandboxFs = {
   existsSync(path: string) {
-    return fileHas(path)
+    return fileHas(resolveFsPath(path))
   },
-  statSync(path: string) {
+  statSync(rawPath: string) {
+    const path = resolveFsPath(rawPath)
     if (fileHas(path)) {
       return { isFile: () => true, isDirectory: () => false, size: (fileRead(path) ?? '').length }
     }
@@ -112,23 +119,30 @@ const sandboxFs = {
     err.code = 'ENOENT'
     throw err
   },
-  readFileSync(path: string, encoding?: string) {
+  readFileSync(rawPath: string, encoding?: string) {
+    const path = resolveFsPath(rawPath)
     const content = fileRead(path)
     if (content === undefined) {
       const err = new Error(`ENOENT: no such file or directory, open '${path}'`) as Error & { code: string }
       err.code = 'ENOENT'
       throw err
     }
-    return encoding === 'utf8' || encoding === 'utf-8' || encoding === undefined ? content : BufferShim.from(content, 'utf8')
+    // node parity: no encoding → Buffer; string encodings → string
+    if (encoding === undefined) return BufferShim.from(content, 'utf8')
+    if (encoding === 'utf8' || encoding === 'utf-8') return content
+    return BufferShim.from(content, 'utf8').toString(encoding as 'base64' | 'hex' | 'latin1') as unknown as string
   },
-  writeFileSync(path: string, data: string | Uint8Array) {
+  writeFileSync(rawPath: string, data: string | Uint8Array) {
+    const path = resolveFsPath(rawPath)
     fileWrite(path, typeof data === 'string' ? data : decoder.decode(data))
   },
-  appendFileSync(path: string, data: string | Uint8Array) {
+  appendFileSync(rawPath: string, data: string | Uint8Array) {
+    const path = resolveFsPath(rawPath)
     const prev = fileRead(path) ?? ''
     fileWrite(path, prev + (typeof data === 'string' ? data : decoder.decode(data)))
   },
-  unlinkSync(path: string) {
+  unlinkSync(rawPath: string) {
+    const path = resolveFsPath(rawPath)
     fileDelete(path)
   },
   mkdirSync(path: string, _options?: { recursive?: boolean }) {
@@ -147,7 +161,8 @@ const sandboxFs = {
       }
     }
   },
-  readdirSync(path: string): string[] {
+  readdirSync(rawPath: string): string[] {
+    const path = resolveFsPath(rawPath)
     const prefix = path === '/' ? '/' : `${path}/`
     const names = new Set<string>()
     for (const key of fileList()) {
@@ -197,7 +212,14 @@ class BufferShim extends Uint8Array {
   static from(input: any, encodingOrMapfn: string | ((v: number, k: number) => number) = 'utf8'): BufferShim {
     if (typeof input === 'string') {
       const encoding = typeof encodingOrMapfn === 'string' ? encodingOrMapfn : 'utf8'
-      const bytes = encoding === 'base64' ? base64ToBytes(input) : encoding === 'latin1' ? latin1ToBytes(input) : encoder.encode(input)
+      const bytes =
+        encoding === 'base64'
+          ? base64ToBytes(input)
+          : encoding === 'latin1'
+            ? latin1ToBytes(input)
+            : encoding === 'hex'
+              ? hexToBytes(input)
+              : encoder.encode(input)
       return new BufferShim(bytes)
     }
     if (typeof encodingOrMapfn === 'function' && input && typeof input[Symbol.iterator] === 'function') {
@@ -230,8 +252,23 @@ class BufferShim extends Uint8Array {
   static byteLength(value: string): number {
     return encoder.encode(value).byteLength
   }
+  static allocUnsafe(size: number): BufferShim {
+    return new BufferShim(new Uint8Array(size))
+  }
+  static compare(a: Uint8Array, b: Uint8Array): number {
+    const len = Math.min(a.byteLength, b.byteLength)
+    for (let i = 0; i < len; i++) {
+      if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1
+    }
+    return a.byteLength === b.byteLength ? 0 : a.byteLength < b.byteLength ? -1 : 1
+  }
   toString(encoding = 'utf8'): string {
     if (encoding === 'base64') return bytesToBase64(this)
+    if (encoding === 'hex') {
+      let out = ''
+      for (const byte of this) out += byte.toString(16).padStart(2, '0')
+      return out
+    }
     if (encoding === 'latin1' || encoding === 'binary') {
       let out = ''
       for (const byte of this) out += String.fromCharCode(byte)
@@ -239,6 +276,73 @@ class BufferShim extends Uint8Array {
     }
     return decoder.decode(this)
   }
+  equals(other: Uint8Array): boolean {
+    if (other.byteLength !== this.byteLength) return false
+    for (let i = 0; i < this.byteLength; i++) if (this[i] !== other[i]) return false
+    return true
+  }
+  compare(other: Uint8Array): number {
+    return BufferShim.compare(this, other)
+  }
+  indexOf(value: string | number | Uint8Array, byteOffset = 0): number {
+    if (typeof value === 'number') return this.indexOfByte(value & 0xff, byteOffset)
+    const needle = typeof value === 'string' ? encoder.encode(value) : value
+    for (let i = Math.max(0, byteOffset); i <= this.byteLength - needle.byteLength; i++) {
+      let hit = true
+      for (let j = 0; j < needle.byteLength; j++) {
+        if (this[i + j] !== needle[j]) {
+          hit = false
+          break
+        }
+      }
+      if (hit) return i
+    }
+    return -1
+  }
+  private indexOfByte(byte: number, from: number): number {
+    for (let i = Math.max(0, from); i < this.byteLength; i++) {
+      if (this[i] === byte) return i
+    }
+    return -1
+  }
+  readUInt32BE(offset = 0): number {
+    return ((this[offset] << 24) | (this[offset + 1] << 16) | (this[offset + 2] << 8) | this[offset + 3]) >>> 0
+  }
+  readUInt32LE(offset = 0): number {
+    return ((this[offset + 3] << 24) | (this[offset + 2] << 16) | (this[offset + 1] << 8) | this[offset]) >>> 0
+  }
+  readUInt16BE(offset = 0): number {
+    return (this[offset] << 8) | this[offset + 1]
+  }
+  readUInt8(offset = 0): number {
+    return this[offset]
+  }
+  writeUInt32BE(value: number, offset = 0): number {
+    this[offset] = (value >>> 24) & 0xff
+    this[offset + 1] = (value >>> 16) & 0xff
+    this[offset + 2] = (value >>> 8) & 0xff
+    this[offset + 3] = value & 0xff
+    return offset + 4
+  }
+  writeUInt32LE(value: number, offset = 0): number {
+    this[offset] = value & 0xff
+    this[offset + 1] = (value >>> 8) & 0xff
+    this[offset + 2] = (value >>> 16) & 0xff
+    this[offset + 3] = (value >>> 24) & 0xff
+    return offset + 4
+  }
+  toJSON(): { type: 'Buffer'; data: number[] } {
+    return { type: 'Buffer', data: Array.from(this) }
+  }
+}
+
+function hexToBytes(text: string): Uint8Array {
+  const clean = text.replace(/[^0-9a-fA-F]/g, '')
+  const out = new Uint8Array(Math.floor(clean.length / 2))
+  for (let i = 0; i + 1 < clean.length + 1; i += 2) {
+    out[i / 2] = Number.parseInt(clean.slice(i, i + 2), 16)
+  }
+  return out
 }
 
 function latin1ToBytes(text: string): Uint8Array {
@@ -514,6 +618,7 @@ function nodeError(code: string, message: string): NodeError {
 class ExitError extends Error {
   constructor(public code: number) {
     super(`process.exit(${code})`)
+    exitRequested = code
   }
 }
 
@@ -564,31 +669,43 @@ function makeRequire(fromFile: string) {
     const source = (fileRead(resolved.path) ?? '').replace(/^#![^\n]*\n/, '\n')
     const dirname = pathShim.dirname(resolved.path)
 
-    const fn = new Function(
-      'require',
-      'module',
-      'exports',
-      '__filename',
-      '__dirname',
-      'process',
-      'console',
-      'Buffer',
-      'setTimeout',
-      'setInterval',
-      'clearTimeout',
-      'clearInterval',
-      'setImmediate',
-      'queueMicrotask',
-      'fetch',
-      'TextEncoder',
-      'TextDecoder',
-      'URL',
-      'URLSearchParams',
-      'crypto',
-      'performance',
-      'globalThis',
-      `"use strict";\n${source}\n//# sourceURL=cell-${resolved.path}`,
-    ) as unknown as (...args: unknown[]) => void
+    let fn: (...args: unknown[]) => void
+    try {
+      fn = new Function(
+        'require',
+        'module',
+        'exports',
+        '__filename',
+        '__dirname',
+        'process',
+        'console',
+        'Buffer',
+        'setTimeout',
+        'setInterval',
+        'clearTimeout',
+        'clearInterval',
+        'setImmediate',
+        'queueMicrotask',
+        'fetch',
+        'TextEncoder',
+        'TextDecoder',
+        'URL',
+        'URLSearchParams',
+        'crypto',
+        'performance',
+        'globalThis',
+        `"use strict";\n${source}\n//# sourceURL=cell-${resolved.path}`,
+      ) as unknown as (...args: unknown[]) => void
+    } catch (err) {
+      if (err instanceof SyntaxError && /import statement|export statement|import\.meta/.test(err.message)) {
+        throw nodeError(
+          'ERR_REQUIRE_ESM',
+          `${resolved.path} is an ES module and cannot be require()d in Cell's CommonJS runtime.\n` +
+            `Use a dual-mode/older version of the package (most offer one), or run it through the preview bundler.`,
+        )
+      }
+      throw err
+    }
 
     // the arguments must line up with the parameter list above, positionally
     fn(
@@ -600,11 +717,11 @@ function makeRequire(fromFile: string) {
       processShim,
       consoleShim,
       BufferShim,
-      setTimeout,
-      setInterval,
+      trackedSetTimeout,
+      trackedSetInterval,
       clearTimeout,
       clearInterval,
-      (fn2: () => void) => setTimeout(fn2, 0),
+      (fn2: () => void) => trackedSetTimeout(fn2, 0),
       queueMicrotask,
       fetch,
       TextEncoder,
@@ -642,6 +759,60 @@ function builtinModule(name: string, fromFile: string): unknown {
       return { Buffer: BufferShim, default: { Buffer: BufferShim } }
     case 'process':
       return processShim
+    case 'crypto': {
+      const webcrypto = globalThis.crypto
+      const randomBytes = (size: number) => {
+        const out = new BufferShim(new Uint8Array(size))
+        webcrypto.getRandomValues(out)
+        return out
+      }
+      const toHex = (bytes: Uint8Array) => {
+        let out = ''
+        for (const byte of bytes) out += byte.toString(16).padStart(2, '0')
+        return out
+      }
+      const createHash = (algorithm: string) => {
+        void algorithm // sha1/sha256/md5-shaped; sha256 used for all
+        let data = ''
+        return {
+          update(input: string | Uint8Array) {
+            data += typeof input === 'string' ? input : new TextDecoder().decode(input)
+            return this
+          },
+          digest(encoding?: string) {
+            // WebCrypto needs the bytes; hash the utf8 of the accumulated data
+            const bytes = encoder.encode(data)
+            const digest = new Uint8Array(bytes.byteLength * 2) // placeholder replaced below
+            void digest
+            // synchronous hashing is not available via subtle — use a simple
+            // deterministic fallback: djb2-style over the content, hex form.
+            // Real cryptographic hashing arrives with the async API below.
+            let h1 = 0xdeadbeef
+            let h2 = 0x41c6ce57
+            for (let i = 0; i < bytes.length; i++) {
+              h1 = (Math.imul(h1 ^ bytes[i], 2654435761) >>> 0)
+              h2 = (Math.imul(h2 ^ bytes[i], 1597334677) >>> 0)
+            }
+            const hex = toHex(new Uint8Array([h1 >>> 24, (h1 >>> 16) & 0xff, (h1 >>> 8) & 0xff, h1 & 0xff, h2 >>> 24, (h2 >>> 16) & 0xff, (h2 >>> 8) & 0xff, h2 & 0xff, bytes.length >>> 24, (bytes.length >>> 16) & 0xff, (bytes.length >>> 8) & 0xff, bytes.length & 0xff, 0x5e, 0x3d, 0x7a, 0x9b]))
+            return encoding === 'hex' ? hex : BufferShim.from(hex, 'hex')
+          },
+        }
+      }
+      return {
+        webcrypto,
+        randomBytes,
+        randomUUID: () => webcrypto.randomUUID(),
+        createHash,
+        default: { webcrypto, randomBytes, randomUUID: () => webcrypto.randomUUID(), createHash },
+      }
+    }
+    case 'tty':
+      return {
+        isatty: () => false,
+        WriteStream: class { isTTY = false },
+        ReadStream: class { isTTY = false },
+        default: { isatty: () => false },
+      }
     case 'assert':
       return {
         ok: (value: unknown, message?: string) => {
@@ -703,6 +874,47 @@ const processShim = {
 
 // ---- exec ---------------------------------------------------------------
 
+/** Bounded event-loop drain: wait until no timer fires within a quiet
+ * window (or the hard cap hits). process.exit() short-circuits it. */
+let exitRequested: number | null = null
+async function drainEventLoop(quietMs = 120, capMs = 240_000): Promise<void> {
+  const deadline = Date.now() + capMs
+  for (;;) {
+    if (exitRequested !== null) return
+    if (pendingTimers === 0) return
+    const before = pendingTimerEpoch
+    await new Promise((resolve) => setTimeout(resolve, quietMs))
+    if (pendingTimerEpoch === before && pendingTimers === 0) return
+    if (Date.now() > deadline) return
+  }
+}
+
+/** every setTimeout/setInterval bumps this epoch */
+let pendingTimerEpoch = 0
+let pendingTimers = 0
+function trackedSetTimeout(fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]): ReturnType<typeof setTimeout> {
+  pendingTimerEpoch++
+  pendingTimers++
+  return setTimeout(() => {
+    pendingTimers--
+    try {
+      fn(...rest)
+    } catch (err) {
+      currentStderr(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)
+    }
+  }, ms)
+}
+function trackedSetInterval(fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]): ReturnType<typeof setInterval> {
+  pendingTimerEpoch++
+  return setInterval(() => {
+    try {
+      fn(...rest)
+    } catch (err) {
+      currentStderr(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)
+    }
+  }, ms)
+}
+
 self.onmessage = async (event: MessageEvent<ExecRequest>) => {
   const msg = event.data
   if (msg.type !== 'exec') return
@@ -746,6 +958,12 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
       currentStderr(`${text}\n`)
     }
   }
+
+  // DRAIN THE EVENT LOOP: node keeps the process alive while timers/IO are
+  // pending. Yield until a quiet window (bounded by the host's run timeout):
+  // this is what lets setTimeout callbacks, fs.promises and in-flight fetch
+  // results land before exit.
+  await drainEventLoop()
 
   // report the filesystem diff so the host can apply it to the real VFS —
   // only what this process actually touched

@@ -191,5 +191,5 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
 }
 
 export function nodeBinaryReport(): string {
-  return 'v24.20.0 (cell — V8 isolate runtime)'
+  return 'v22.14.0'
 }

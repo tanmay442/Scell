@@ -49,14 +49,16 @@ function inSkip(path: string): boolean {
 
 /** A python error surfaces as PythonError with the full traceback text. */
 function describeError(err: unknown): { text: string; exitCode: number } {
-  const message = String((err as { message?: string })?.message ?? err)
+  const raw = String((err as { message?: string })?.message ?? err)
   // SystemExit arrives inside the traceback, not as a typed error
-  const match = /SystemExit:\s*(\d+)?/.exec(message)
+  const match = /SystemExit:\s*(\d+)?/.exec(raw)
   if (match !== null) {
     const code = match[1] !== undefined ? Number.parseInt(match[1], 10) : 0
     return { text: '', exitCode: Number.isFinite(code) ? code : 0 }
   }
-  return { text: message, exitCode: 1 }
+  // drop the pyodide-internal frames — agent-readable stderr
+  const lines = raw.split('\n').filter((line) => !line.includes('/lib/python312.zip/_pyodide/'))
+  return { text: lines.join('\n'), exitCode: 1 }
 }
 
 export async function runPython(pyodide: any, options: PythonRunOptions): Promise<PythonRunResult> {
@@ -100,10 +102,10 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   pyodide.setStdout({ batched: (text: string) => options.onOut('stdout', `${text}\n`) })
   pyodide.setStderr({ batched: (text: string) => options.onOut('stderr', `${text}\n`) })
 
-  // ---- argv ----
+  // ---- argv + __file__ + script dir on sys.path (CPython semantics) ----
   const argv = [options.entry, ...options.argv]
   await pyodide.runPythonAsync(
-    `import sys as _sys\n_sys.argv = ${JSON.stringify(argv)}\nimport os as _os\n_os.chdir(${JSON.stringify(cwd)})\nif ${JSON.stringify(cwd)} not in _sys.path: _sys.path.insert(0, ${JSON.stringify(cwd)})\ndel _sys, _os`,
+    `import sys as _sys\n_sys.argv = ${JSON.stringify(argv)}\nimport os as _os\n_os.chdir(${JSON.stringify(cwd)})\nif ${JSON.stringify(cwd)} not in _sys.path: _sys.path.insert(0, ${JSON.stringify(cwd)})\nif ${JSON.stringify(options.entry !== '-' ? options.entry : cwd)} not in _sys.path: _sys.path.insert(0, ${JSON.stringify(options.entry !== '-' ? options.entry.slice(0, options.entry.lastIndexOf('/')) || '/' : cwd)})\ndel _sys, _os`,
   )
 
   // ---- packages: whatever the script imports that pyodide can provide ----
@@ -123,9 +125,20 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   // pyodide ships only its curated set — anything else the script imports
   // that is pure-python gets installed from PyPI via micropip (best effort)
   try {
+    // local files of the payload are importable (cwd + script dir are on
+    // sys.path) — the scan checks the FS before declaring a module missing
+    const localModules = new Set<string>()
+    for (const [path] of payload.index) {
+      if (path.endsWith('.py')) {
+        localModules.add(path.slice(path.lastIndexOf('/') + 1, -3))
+        const dir = path.slice(0, path.lastIndexOf('/'))
+        if (dir.endsWith('/__init__'.replace('/', ''))) void dir
+      }
+      if (path.endsWith('/__init__.py')) localModules.add(path.slice(path.lastIndexOf('/', path.lastIndexOf('/') - 1) + 1, path.lastIndexOf('/__init__.py')))
+    }
     const missing = JSON.parse(
       (await pyodide.runPythonAsync(
-        `import ast, importlib.util, json as _json\n_missing = []\n_tree = ast.parse(${JSON.stringify(options.code)})\nfor _node in ast.walk(_tree):\n    if isinstance(_node, ast.Import):\n        for _a in _node.names:\n            _name = _a.name.split('.')[0]\n            if importlib.util.find_spec(_name) is None and _name not in _missing:\n                _missing.append(_name)\n    elif isinstance(_node, ast.ImportFrom) and _node.module:\n        _name = _node.module.split('.')[0]\n        if _node.level == 0 and importlib.util.find_spec(_name) is None and _name not in _missing:\n            _missing.append(_name)\n_json.dumps(_missing)`,
+        `import ast, importlib.util, json as _json, os as _os\n_missing = []\n_tree = ast.parse(${JSON.stringify(options.code)})\n_local = set(${JSON.stringify([...localModules])})\nfor _node in ast.walk(_tree):\n    if isinstance(_node, ast.Import):\n        for _a in _node.names:\n            _name = _a.name.split('.')[0]\n            if _name in _local or _name.startswith('.'):\n                continue\n            if importlib.util.find_spec(_name) is None and _name not in _missing:\n                _missing.append(_name)\n    elif isinstance(_node, ast.ImportFrom) and _node.module:\n        _name = _node.module.split('.')[0]\n        if _node.level == 0 and _name not in _local:\n            if importlib.util.find_spec(_name) is None and _name not in _missing:\n                _missing.append(_name)\n_json.dumps(_missing)`,
       )) as string,
     ) as string[]
     for (const name of missing) {
@@ -145,7 +158,8 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   // ---- execute ----
   let exitCode = 0
   try {
-    await pyodide.runPythonAsync(options.code)
+    // filename: tracebacks point at the real script path
+    await pyodide.runPythonAsync(options.code, { filename: options.entry !== '-' ? options.entry : '<stdin>' })
   } catch (err) {
     const described = describeError(err)
     if (described.text) options.onOut('stderr', `${described.text}\n`)

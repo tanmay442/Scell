@@ -26,7 +26,7 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   const { cwd, scriptShell, flavor } = opts
   const [sub = 'help', ...rest] = args
 
-    if (sub === '--version' || sub === '-v') return ok(`${flavor === 'npm' ? '10.9.5' : '10.5.2'} (cell)\n`)
+    if (sub === '--version' || sub === '-v') return ok(`${flavor === 'npm' ? '10.9.5' : '10.5.2'}\n`)
 
   if (sub === 'init' || sub === 'create') {
     return npmInit(vfs, rest, { cwd, flavor })

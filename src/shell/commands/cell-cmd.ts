@@ -74,7 +74,7 @@ function workspaceTar(vfs: Vfs): Uint8Array {
 }
 
 function restoreTar(vfs: Vfs, bytes: Uint8Array): { files: number; bytes: number } {
-  const entries = untar(bytes)
+  const entries = untar(bytes, { stripFirstSegment: false })
   const files: VfsFileMap = {}
   for (const entry of entries) {
     if (entry.type && entry.type !== 'file') continue

@@ -781,7 +781,7 @@ function describeError(err: unknown): string {
 function usage(): CommandResult {
   return {
     stdout:
-      'usage: git <command> [<args>]\n\nCell runs the real libgit2 (1.9.4, WebAssembly) through lg2.\nCommon: init, clone, add, rm, status, commit, log, checkout, diff, remote, fetch, pull, push, tag, stash\nNetwork needs CORS-enabled servers; others go through the relay in ~/.gitconfig [cell] corsproxy.\n',
+      'usage: git <command> [<args>]\n\nCommon: init, clone, add, rm, status, commit, log, checkout, diff, remote, fetch, pull, push, tag, stash\n',
     stderr: '',
     exitCode: 1,
   }

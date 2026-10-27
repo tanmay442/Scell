@@ -1036,3 +1036,4 @@ kbd {
   cursor: pointer;
 }
 .view-download:hover { background: #0068b8; }
+.preview-error { white-space: pre-wrap; text-align: left; justify-content: flex-start; align-items: flex-start; overflow: auto; font-family: var(--mono); font-size: 11.5px; }

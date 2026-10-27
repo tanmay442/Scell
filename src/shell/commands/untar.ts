@@ -40,7 +40,7 @@ function readOctal(block: Uint8Array, offset: number, length: number): number {
   return parseInt(text, 8)
 }
 
-export function untar(buffer: Uint8Array): TarEntry[] {
+export function untar(buffer: Uint8Array, options?: { stripFirstSegment?: boolean }): TarEntry[] {
   const entries: TarEntry[] = []
   let offset = 0
   let paxPath: string | null = null
@@ -75,8 +75,11 @@ export function untar(buffer: Uint8Array): TarEntry[] {
       paxPath = null
     }
 
-    // npm tarballs root everything under package/
-    const clean = path.replace(/^\.\//, '').replace(/^package\//, '')
+    // npm strips the tarball's first segment (package/, or the @types name);
+    // workspace snapshots carry absolute paths and must keep them
+    const clean = options?.stripFirstSegment === true
+      ? path.replace(/^\.\//, '').split('/').slice(1).join('/')
+      : path.replace(/^\.\//, '')
 
     if (typeFlag === '0' || typeFlag === '7' || typeFlag === '\0') {
       const data = buffer.subarray(offset, offset + size)

@@ -100,6 +100,7 @@ export default function TerminalPanel() {
     // delimiter, then runs the whole thing as one script — like a real
     // terminal, where each interactive line is parsed in order
     let heredoc: { delim: string; matched: string; head: string; lines: string[] } | null = null
+    let previousCwd: string | null = null
 
     const runLine = async (cmd: string, fromHeredoc = false) => {
       if (heredoc !== null) {
@@ -131,9 +132,25 @@ export default function TerminalPanel() {
       }
 
       const tokens = trimmed.split(/\s+/)
-      if (tokens[0] === 'cd') {
+      // only a BARE cd is intercepted — `cd x && build` must run in the shell
+      if (tokens[0] === 'cd' && !/(&|\|\|)/.test(trimmed)) {
+        if (tokens[1] === '-') {
+          const previous = previousCwd
+          if (previous === null) {
+            writeErr('bash: cd: OLDPWD not set\n')
+            printPrompt()
+            return
+          }
+          previousCwd = cwd
+          cwd = previous
+          bus.emit('terminal:cwd', { cwd })
+          term.write(`\r\n${cwdLabel(cwd)}\r\n`)
+          printPrompt()
+          return
+        }
         const target = resolveCd(tokens[1] ?? '~')
         if (vfs.isDir(target)) {
+          previousCwd = cwd
           cwd = target
           bus.emit('terminal:cwd', { cwd })
           term.write('\r\n')
@@ -152,9 +169,11 @@ export default function TerminalPanel() {
 
       // a heredoc-assembled script contains its own <<DELIM — only fresh
       // interactive lines may open a new one
+      // strip quoted segments first — `echo "use <<EOF here"` must not wedge
+      // the terminal in heredoc mode
       const heredocMatch = fromHeredoc
         ? null
-        : /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(trimmed)
+        : /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(trimmed.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, (m) => ' '.repeat(m.length)))
       if (heredocMatch !== null && !heredocMatch[0].includes('<<<')) {
         heredoc = { delim: heredocMatch[2], matched: heredocMatch[0], head: cmd, lines: [] }
         term.write('\r\n')

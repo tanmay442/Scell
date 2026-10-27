@@ -9,6 +9,7 @@ import { gitCommand } from './commands/git'
 import { tscCommand } from './commands/tsc-cmd'
 import { cellCommand } from './commands/cell-cmd'
 import { curlCommand } from './commands/curl'
+import { vfsPath } from '../vfs/types'
 import { pythonCommand } from './commands/python-cmd'
 
 export interface ShellResult {
@@ -59,6 +60,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     TERM: 'xterm-256color',
     LANG: 'en_US.UTF-8',
     HOSTNAME: 'cell',
+    SHLVL: '1',
   }
   const bash = new Bash({ fs, cwd: HOME_DIR, env: baseEnv })
 
@@ -75,9 +77,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
       // then dump. The dump line is stripped from stdout.
       const sourceLine = bashrcPrefix()
       const wrapped =
-        sourceLine !== ''
-          ? `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
-          : `{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
+        `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
       const result = await bash.exec(wrapped, options)
       // the dump may CONCATENATE onto the command's own output (no trailing
       // newline) — find the marker anywhere and cut to its end of line
@@ -91,7 +91,10 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
         try {
           const parsed = JSON.parse(dumpText.slice(marker.length)) as Record<string, unknown>
           for (const [key, value] of Object.entries(parsed)) {
-            if (typeof value === 'string' && !ENV_BLOCKLIST.has(key)) sessionEnv[key] = value
+            if (typeof value !== 'string' || ENV_BLOCKLIST.has(key)) continue
+            if (key.startsWith('BASH_ALIAS_') || key.startsWith('__cell_') || key === '?') continue
+            // the .bashrc re-sourcing prepends PATH every exec — dedupe
+            sessionEnv[key] = key === 'PATH' ? [...new Set(value.split(':'))].filter(Boolean).join(':') : value
           }
         } catch {
           // env capture is best-effort
@@ -290,6 +293,96 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     return { stdout: '', stderr: `No manual entry for ${page ?? ''}\n`, exitCode: 1 }
   })
 
+  register('kill', (args) => {
+    const pids = args.filter((a) => !a.startsWith('-'))
+    if (pids.length === 0) return { stdout: '', stderr: 'kill: usage: kill [-sig] pid …\n', exitCode: 1 }
+    for (const pid of pids) {
+      const n = Number.parseInt(pid, 10)
+      if (Number.isFinite(n) && n > 1) continue
+      return { stdout: '', stderr: `kill: (${pid}): No such process\n`, exitCode: 1 }
+    }
+    return { stdout: '', stderr: '', exitCode: 0 }
+  })
+
+  register('tty', () => ({ stdout: '/dev/pts/0\n', stderr: '', exitCode: 0 }))
+
+  register('nproc', () => ({ stdout: '4\n', stderr: '', exitCode: 0 }))
+
+  register('umask', (args) => {
+    if (args.length === 0) return { stdout: '0022\n', stderr: '', exitCode: 0 }
+    return { stdout: '', stderr: '', exitCode: 0 }
+  })
+
+  register('chown', (args) => {
+    const files = args.slice(1).filter((a) => !a.startsWith('-') && !/^[0-9]+:[0-9]+$/.test(a) && !/^[a-z_]+:[a-z_]+$/.test(a))
+    for (const file of files) {
+      if (!await_check(file)) return { stdout: '', stderr: `chown: cannot access '${file}': No such file or directory\n`, exitCode: 1 }
+    }
+    return { stdout: '', stderr: '', exitCode: 0 }
+  })
+
+  register('realpath', (args, { cwd }) => {
+    const out: string[] = []
+    for (const target of args.filter((a) => !a.startsWith('-'))) {
+      const resolved = vfsPath.normalize(target.startsWith('/') ? target : `${cwd}/${target}`)
+      if (v.exists(resolved) || v.exists(vfsPath.dirname(resolved))) out.push(resolved)
+      else return { stdout: '', stderr: `realpath: No such file or directory '${target}'\n`, exitCode: 1 }
+    }
+    return { stdout: `${out.join('\n')}\n`, stderr: '', exitCode: 0 }
+  })
+
+  // xargs: just-bash's builtin lacks -n/-I/-L — this shim reads stdin and
+  // re-invokes each batch through the shell
+  bash.registerCommand(
+    defineCommand('xargs', async (args, ctx) => {
+      const stdinText = typeof ctx.stdin === 'string' ? ctx.stdin : ''
+      const items = stdinText.split('\n').map((l) => l.trim()).filter(Boolean)
+      if (items.length === 0) return { stdout: '', stderr: '', exitCode: 0 }
+      let repl: string | null = null
+      let maxArgs = 1
+      let limit: number | null = null
+      const rest: string[] = []
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i]
+        if (arg === '-I' || arg.startsWith('-I')) {
+          repl = arg === '-I' ? (args[++i] ?? '{}') : arg.slice(2)
+        } else if (arg === '-n' || arg.startsWith('-n')) {
+          maxArgs = Number.parseInt(arg === '-n' ? (args[++i] ?? '1') : arg.slice(2), 10) || 1
+        } else if (arg === '-L' || arg.startsWith('-L')) {
+          limit = Number.parseInt(arg === '-L' ? (args[++i] ?? '1') : arg.slice(2), 10) || 1
+          maxArgs = limit
+        } else if (arg === '-0' || arg === '--null' || arg === '-r' || arg === '--no-run-if-empty') {
+          // handled by the stdin split / empty behavior
+        } else {
+          rest.push(arg)
+        }
+      }
+      const base = rest.join(' ')
+      const batches: string[][] = []
+      for (let i = 0; i < items.length; i += Math.max(1, maxArgs)) {
+        batches.push(items.slice(i, i + Math.max(1, maxArgs)))
+      }
+      let stdout = ''
+      let stderr = ''
+      let exit = 0
+      for (const batch of batches) {
+        const line = repl !== null
+          ? base.split(repl).map((part) => part).join(' ') && base.replaceAll(repl, batch.join(' '))
+          : `${base} ${batch.join(' ')}`.trim()
+        const result = await bash.exec(line, { cwd: ctx.cwd, env: sessionEnv })
+        stdout += result.stdout
+        stderr += result.stderr
+        if (result.exitCode !== 0) exit = result.exitCode
+      }
+      return { stdout, stderr, exitCode: exit }
+    }),
+  )
+
+  function await_check(file: string): boolean {
+    const resolved = vfsPath.normalize(file.startsWith('/') ? file : `${HOME_DIR}/${file}`)
+    return v.exists(resolved) || v.isFile(resolved) || v.isDir(resolved)
+  }
+
   register('less', async (args, { cwd }) => {
     // non-interactive pager: behaves like cat
     const targets = args.filter((a) => !a.startsWith('-'))
@@ -329,7 +422,18 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
   const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown }) =>
     pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined })
   register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))
+
   register('python', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined }))
+  register('pip', (args, ctx) => pipRegister(args, ctx))
+  register('pip3', (args, ctx) => pipRegister(args, ctx))
+  const pipRegister = async (args: string[], ctx: { cwd: string }): Promise<CommandResult> =>
+    pythonCommand(v, ['-c',
+      args[0] === 'install' && args.length > 1
+        ? `import micropip\nawait micropip.install(${JSON.stringify(args.slice(1))})\nprint('installed: ' + ' '.join(${JSON.stringify(args.slice(1))}))`
+        : args[0] === 'list'
+          ? "import pyodide; [print(f'{k}=={v}') for k, v in pyodide.loadedPackages.items()]"
+          : `import sys\nprint('usage: pip install <package> | pip list', file=sys.stderr); sys.exit(1)`,
+    ], { cwd: ctx.cwd })
   register('python3', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined }))
 
   // global package bins (~/.local/lib/node_modules) are real PATH commands:
