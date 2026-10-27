@@ -27,6 +27,8 @@ your summary instead of editing it.
 export function createVfs(initial?: Record<string, string>): Vfs
 export function createIdbPersistence(dbName?: string): VfsPersistence
 export function seedStarterProject(vfs: Vfs): void
+/** Flush vfs.snapshot() to persistence, debounced. Returns stop(). */
+export function startAutoSave(vfs: Vfs, persistence: VfsPersistence, delayMs?: number): () => void
 ```
 
 **Agent A exports from `src/terminal/TerminalPanel.tsx`:**
