@@ -31,10 +31,12 @@ export function createIdbPersistence(dbName = 'cell-workspace-v2'): VfsPersisten
         const database = await conn
         const keys = await database.getAllKeys(STORE)
         if (keys.length === 0) return null
-        const files: Record<string, string> = {}
+        const files: Record<string, string | Uint8Array> = {}
         for (const key of keys) {
           const value = await database.get(STORE, key)
-          if (typeof key === 'string' && typeof value === 'string') files[key] = value
+          if (typeof key === 'string' && (typeof value === 'string' || value instanceof Uint8Array)) {
+            files[key] = value
+          }
         }
         return Object.keys(files).length ? files : null
       } catch {

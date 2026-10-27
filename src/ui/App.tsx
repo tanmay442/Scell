@@ -9,8 +9,11 @@ import { EditorArea } from './EditorArea'
 import { BottomPanel } from './BottomPanel'
 import { StatusBar } from './StatusBar'
 
+export type SidebarView = 'explorer' | 'git'
+
 export function App() {
   const [panelVisible, setPanelVisible] = useState(true)
+  const [sidebarView, setSidebarView] = useState<SidebarView>('explorer')
 
   useEffect(() => {
     const { bus } = platform()
@@ -30,8 +33,8 @@ export function App() {
     <div className="app-shell">
       <TitleBar />
       <div className="app-body">
-        <ActivityBar />
-        <Sidebar />
+        <ActivityBar active={sidebarView} onSelect={(view) => setSidebarView(view)} />
+        <Sidebar view={sidebarView} />
         <div className="app-main">
           <EditorArea />
           {panelVisible && <BottomPanel onToggle={() => setPanelVisible(false)} />}

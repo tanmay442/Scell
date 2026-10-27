@@ -4,6 +4,14 @@ import { CircleAlert, TriangleAlert, TerminalSquare } from 'lucide-react'
 import { platform } from '../platform'
 import { diagnosticsStore } from '../diagnostics-store'
 
+const HOME = '/home/user'
+
+function cwdLabel(cwd: string): string {
+  if (cwd === HOME) return '~'
+  if (cwd.startsWith(`${HOME}/`)) return `~${cwd.slice(HOME.length)}`
+  return cwd
+}
+
 export function StatusBar({
   onTogglePanel,
   panelVisible,
@@ -13,7 +21,7 @@ export function StatusBar({
 }) {
   const { vfs, bus } = platform()
   const { items } = useSyncExternalStore(diagnosticsStore.subscribe, diagnosticsStore.get)
-  const [cwd, setCwd] = useState('/')
+  const [cwd, setCwd] = useState(HOME)
   const [fileCount, setFileCount] = useState(() => vfs.listAllFiles().length)
   const [saving, setSaving] = useState(false)
 
@@ -41,7 +49,7 @@ export function StatusBar({
       <div className="status-left">
         <button className="status-chip" onClick={onTogglePanel} title="Toggle panel (Ctrl+`)">
           <TerminalSquare size={13} />
-          {panelVisible ? `~${cwd === '/' ? '' : cwd}` : 'terminal'}
+          {panelVisible ? cwdLabel(cwd) : 'terminal'}
         </button>
         <span className="status-plain">
           {fileCount} file{fileCount === 1 ? '' : 's'}

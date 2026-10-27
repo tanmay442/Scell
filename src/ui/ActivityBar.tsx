@@ -1,26 +1,39 @@
 import { Files, Search, GitBranch, Blocks, Settings } from 'lucide-react'
+import type { SidebarView } from './App'
 
-const ITEMS = [
-  { id: 'explorer', label: 'Explorer', icon: Files, enabled: true, hint: '' },
-  { id: 'search', label: 'Search', icon: Search, enabled: false, hint: 'Search — Phase 5' },
-  { id: 'git', label: 'Source Control', icon: GitBranch, enabled: false, hint: 'Git — Phase 3' },
-  { id: 'extensions', label: 'Packages', icon: Blocks, enabled: false, hint: 'npm install — Phase 2' },
-  { id: 'settings', label: 'Settings', icon: Settings, enabled: false, hint: 'Settings — later' },
+const ITEMS: {
+  id: SidebarView | string
+  label: string
+  icon: typeof Files
+  view?: SidebarView
+  hint?: string
+}[] = [
+  { id: 'explorer', label: 'Explorer', icon: Files, view: 'explorer' },
+  { id: 'git', label: 'Source Control', icon: GitBranch, view: 'git' },
+  { id: 'search', label: 'Search', icon: Search, hint: 'Search — Phase 5' },
+  { id: 'packages', label: 'Packages', icon: Blocks, hint: 'npm install — you can already run it in the terminal' },
+  { id: 'settings', label: 'Settings', icon: Settings, hint: 'Settings — later' },
 ]
 
-export function ActivityBar() {
+export function ActivityBar({ active, onSelect }: { active: SidebarView; onSelect(view: SidebarView): void }) {
   return (
     <nav className="activity-bar">
-      {ITEMS.map(({ id, label, icon: Icon, enabled, hint }) => (
-        <button
-          key={id}
-          className={`activity-item ${enabled ? 'enabled active' : 'disabled'}`}
-          title={hint || label}
-          disabled={!enabled}
-        >
-          <Icon size={22} strokeWidth={1.6} />
-        </button>
-      ))}
+      {ITEMS.map(({ id, label, icon: Icon, view, hint }) => {
+        const enabled = view !== undefined
+        const isActive = enabled && view === active
+        return (
+          <button
+            key={id}
+            className={`activity-item ${enabled ? 'enabled' : 'disabled'} ${isActive ? 'active' : ''}`}
+            title={hint || label}
+            disabled={!enabled}
+            onClick={() => view && onSelect(view)}
+          >
+            <Icon size={22} strokeWidth={1.6} />
+            {id === 'git' ? <span className="activity-badge" /> : null}
+          </button>
+        )
+      })}
     </nav>
   )
 }

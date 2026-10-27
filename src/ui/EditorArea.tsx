@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Hexagon, X } from 'lucide-react'
+import { Binary, Hexagon, X } from 'lucide-react'
 import { platform } from '../platform'
 import { workspaceActions, useWorkspace } from './workspace-store'
 import { FileIcon } from './file-icon'
@@ -81,6 +81,11 @@ export function EditorArea() {
           <Welcome />
         ) : (
           ws.openPaths.map((path) => {
+            // binary files (packfiles, indexes, images…) get a placeholder,
+            // not a lossy text editor
+            if (vfs.isFile(path) && !vfs.isText(path)) {
+              return <BinaryView key={path} path={path} active={path === ws.activePath} />
+            }
             const draft = workspaceActions.draft(path)
             const value = draft !== undefined ? draft : (vfs.read(path) ?? '')
             const reveal = ws.reveal !== null && ws.reveal.path === path ? ws.reveal.line : undefined
@@ -102,11 +107,26 @@ export function EditorArea() {
   )
 }
 
+const PROJECT = '/home/user/project'
+
+function BinaryView({ path, active }: { path: string; active: boolean }) {
+  const { vfs } = platform()
+  const stat = vfs.stat(path)
+  const size = stat ? (stat.size >= 1024 ? `${(stat.size / 1024).toFixed(1)} KB` : `${stat.size} B`) : ''
+  return (
+    <div className={`binary-view ${active ? '' : 'hidden'}`}>
+      <Binary size={28} />
+      <span className="binary-name">{path.split('/').pop()}</span>
+      <span className="binary-size">{size} — binary file, not editable</span>
+    </div>
+  )
+}
+
 function Welcome() {
   const quick: { label: string; path?: string }[] = [
-    { label: 'Open README.md', path: '/README.md' },
-    { label: 'Open src/index.ts', path: '/src/index.ts' },
-    { label: 'Open src/broken.ts (see live type errors)', path: '/src/broken.ts' },
+    { label: 'Open README.md', path: `${PROJECT}/README.md` },
+    { label: 'Open src/index.ts', path: `${PROJECT}/src/index.ts` },
+    { label: 'Open src/broken.ts (see live type errors)', path: `${PROJECT}/src/broken.ts` },
   ]
   return (
     <div className="welcome">
@@ -124,7 +144,7 @@ function Welcome() {
             </button>
           ))}
           <h2>Workspace</h2>
-          <span className="welcome-hint">starter · TypeScript strict · no server</span>
+          <span className="welcome-hint">~/project · TypeScript strict · full home directory · no server</span>
         </div>
         <div>
           <h2>Keyboard</h2>

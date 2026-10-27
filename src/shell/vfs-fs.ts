@@ -19,9 +19,14 @@ interface WriteFileOptions {
   encoding?: BufferEncoding
 }
 
-const WORKSPACE = '/workspace'
 const FILE_MODE = 0o644
 const DIR_MODE = 0o755
+
+/**
+ * Paths that live in the volatile system zone instead of the VFS: temp
+ * files and device nodes have no business surviving a reload.
+ */
+const SYS_PREFIXES = ['/tmp', '/dev', '/proc', '/etc', '/var', '/usr', '/bin', '/lib', '/opt', '/srv', '/mnt', '/media', '/run', '/sys', '/root']
 
 interface Dirent {
   name: string
@@ -56,13 +61,13 @@ function toByteString(text: string): string {
 type Zone = { zone: 'vfs'; vpath: string } | { zone: 'sys'; spath: string } | { zone: 'devnull' }
 
 /**
- * just-bash IFileSystem over the Cell Vfs. The workspace mounts at
- * /workspace; a small volatile system area (backed by plain maps) serves
- * /tmp and friends; /dev/null is special-cased. Symlinks and mode bits live
- * in sidecar maps — the Vfs itself stays text-only by design.
+ * just-bash IFileSystem over the Cell Vfs with identity mapping: bash paths
+ * ARE VFS paths (a real user machine — /home/user is HOME and lives in the
+ * VFS; /tmp & friends are volatile sidecar state). Symlinks and mode bits
+ * live in sidecar maps — the Vfs itself stays content-only.
  */
 export class VfsBackedFs implements IFileSystem {
-  private sysDirs = new Set<string>(['/', '/tmp', '/dev', '/home', '/home/user'])
+  private sysDirs = new Set<string>(['/', '/tmp', '/dev', '/dev/null', '/proc', '/etc', '/home'])
   private sysFiles = new Map<string, string>()
   private symlinks = new Map<string, string>()
   private modes = new Map<string, number>()
@@ -73,10 +78,10 @@ export class VfsBackedFs implements IFileSystem {
   private locate(rawPath: string): Zone {
     const p = normalize(rawPath)
     if (p === '/dev/null') return { zone: 'devnull' }
-    if (p === WORKSPACE || p.startsWith(`${WORKSPACE}/`)) {
-      return { zone: 'vfs', vpath: p === WORKSPACE ? '/' : p.slice(WORKSPACE.length) }
+    if (SYS_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}/`))) {
+      return { zone: 'sys', spath: p }
     }
-    return { zone: 'sys', spath: p }
+    return { zone: 'vfs', vpath: p }
   }
 
   private followSymlink(p: string, depth = 0): string {
@@ -152,9 +157,10 @@ export class VfsBackedFs implements IFileSystem {
     const z = this.locate(this.followSymlink(path))
     if (z.zone === 'devnull') return ''
     if (z.zone === 'vfs') {
-      const content = this.vfs.read(z.vpath)
-      if (content === null) throw new Error(`ENOENT: no such file '${path}'`)
-      return content
+      const bytes = this.vfs.readBytes(z.vpath)
+      if (bytes === null) throw new Error(`ENOENT: no such file '${path}'`)
+      // `cat` on a binary prints something; lossy utf8 is the honest terminal behavior
+      return new TextDecoder('utf-8', { fatal: false }).decode(bytes)
     }
     const entry = this.sysGet(z.spath)
     if (!entry) throw new Error(`ENOENT: no such file '${path}'`)
@@ -163,22 +169,33 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async readFileBytes(path: string): Promise<ByteString> {
-    return toByteString(await this.readFile(path)) as unknown as ByteString
+    return toByteString(new TextDecoder('latin1').decode(await this.readFileBuffer(path))) as unknown as ByteString
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    return new TextEncoder().encode(await this.readFile(path))
+    const z = this.locate(this.followSymlink(path))
+    if (z.zone === 'devnull') return new Uint8Array(0)
+    if (z.zone === 'vfs') {
+      const bytes = this.vfs.readBytes(z.vpath)
+      if (bytes === null) throw new Error(`ENOENT: no such file '${path}'`)
+      return bytes
+    }
+    const entry = this.sysGet(z.spath)
+    if (!entry) throw new Error(`ENOENT: no such file '${path}'`)
+    if (entry.type === 'dir') throw new Error(`EISDIR: read of directory '${path}'`)
+    return new TextEncoder().encode(entry.content)
   }
 
   async writeFile(path: string, content: FileContent, _options?: WriteFileOptions | BufferEncoding): Promise<void> {
     const z = this.locate(path)
     if (z.zone === 'devnull') return
-    const text = decode(content)
     if (z.zone === 'vfs') {
-      this.vfs.write(z.vpath, text)
+      // bytes go in as bytes — package tarballs must round-trip exactly
+      if (typeof content === 'string') this.vfs.write(z.vpath, content)
+      else this.vfs.writeBytes(z.vpath, content)
     } else {
       this.sysEnsureParents(z.spath)
-      this.sysFiles.set(z.spath, text)
+      this.sysFiles.set(z.spath, typeof content === 'string' ? content : new TextDecoder('utf-8', { fatal: false }).decode(content))
       this.sysDirs.delete(z.spath)
     }
   }
@@ -276,7 +293,7 @@ export class VfsBackedFs implements IFileSystem {
         name,
         isFile: this.vfs.isFile(`${z.vpath === '/' ? '' : z.vpath}/${name}`),
         isDirectory: this.vfs.isDir(`${z.vpath === '/' ? '' : z.vpath}/${name}`),
-        isSymbolicLink: this.symlinks.has(`${WORKSPACE}${z.vpath === '/' ? '' : z.vpath}/${name}`),
+        isSymbolicLink: this.symlinks.has(`${z.vpath === '/' ? '' : z.vpath}/${name}`),
       }))
     }
     if (z.zone === 'devnull') throw new Error(`ENOTDIR: not a directory '${path}'`)
@@ -343,7 +360,7 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   getAllPaths(): string[] {
-    const paths = this.vfs.listAllFiles().map((p) => `${WORKSPACE}${p === '/' ? '' : p}`)
+    const paths = this.vfs.listAllFiles()
     paths.push(...this.sysFiles.keys())
     paths.push(...this.symlinks.keys())
     return paths

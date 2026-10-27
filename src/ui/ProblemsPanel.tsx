@@ -11,7 +11,7 @@ export function ProblemsPanel() {
     return (
       <div className="panel-fallback">
         No problems found. The ts-rust typechecker (TypeScript 7 in WASM) reports here after you save — try editing
-        <button className="linkish" onClick={() => workspaceActions.openFile('/src/broken.ts')}>
+        <button className="linkish" onClick={() => workspaceActions.openFile('/home/user/project/src/broken.ts')}>
           src/broken.ts
         </button>
         .

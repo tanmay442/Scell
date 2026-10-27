@@ -5,6 +5,7 @@ import { vfsPath } from '../vfs/types'
 import { workspaceActions } from './workspace-store'
 import { FileIcon } from './file-icon'
 import { ContextMenu, type ContextMenuItem, type ContextMenuState } from './ContextMenu'
+import { GitPanel } from './GitPanel'
 
 type TreeFile = { name: string; path: string; dir: false }
 type TreeDir = { name: string; path: string; dir: true; children: TreeEntry[] }
@@ -43,10 +44,24 @@ type Editing =
   | { mode: 'rename'; path: string; dir: boolean }
   | null
 
-export function Sidebar() {
+export function Sidebar({ view }: { view: 'explorer' | 'git' }) {
+  if (view === 'git') {
+    return (
+      <aside className="sidebar">
+        <GitPanel />
+      </aside>
+    )
+  }
+  return <Explorer />
+}
+
+const HOME = '/home/user'
+const PROJECT = `${HOME}/project`
+
+function Explorer() {
   const { vfs, bus } = platform()
   const [vfsVersion, setVfsVersion] = useState(0)
-  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(['/src']))
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(['/home', HOME, PROJECT]))
   const [editing, setEditing] = useState<Editing>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [menu, setMenu] = useState<ContextMenuState | null>(null)
@@ -192,8 +207,8 @@ export function Sidebar() {
             x: e.clientX,
             y: e.clientY,
             items: [
-              { label: 'New File', onClick: () => beginCreate('/', 'file') },
-              { label: 'New Folder', onClick: () => beginCreate('/', 'dir') },
+              { label: 'New File', onClick: () => beginCreate(PROJECT, 'file') },
+              { label: 'New Folder', onClick: () => beginCreate(PROJECT, 'dir') },
             ],
           })
         }
@@ -202,10 +217,10 @@ export function Sidebar() {
       <div className="sidebar-header">
         <span>EXPLORER</span>
         <span className="sidebar-actions">
-          <button title="New File" onClick={() => beginCreate('/', 'file')}>
+          <button title="New File" onClick={() => beginCreate(PROJECT, 'file')}>
             <FilePlus size={14} />
           </button>
-          <button title="New Folder" onClick={() => beginCreate('/', 'dir')}>
+          <button title="New Folder" onClick={() => beginCreate(PROJECT, 'dir')}>
             <FolderPlus size={14} />
           </button>
           <button title="Collapse All" onClick={() => setExpanded(new Set())}>
@@ -220,14 +235,14 @@ export function Sidebar() {
         {tree.children.length === 0 && editing === null ? (
           <div className="sidebar-empty">
             Empty workspace — create a file
-            <button className="linkish" onClick={() => beginCreate('/', 'file')}>
+            <button className="linkish" onClick={() => beginCreate(PROJECT, 'file')}>
               here
             </button>
             , or right-click for more.
           </div>
         ) : null}
         {tree.children.map((child) => renderEntry(child, 0))}
-        {editing !== null && (editing.mode === 'create-file' || editing.mode === 'create-dir') && editing.dir === '/' ? (
+        {editing !== null && (editing.mode === 'create-file' || editing.mode === 'create-dir') && editing.dir === PROJECT ? (
           <NameInput
             depth={0}
             defaultValue=""

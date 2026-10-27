@@ -1,7 +1,7 @@
 import { createRoot } from 'react-dom/client'
 import { EventBus } from './events'
 import { initPlatform } from './platform'
-import { createVfs, createIdbPersistence, seedStarterProject, startAutoSave } from './vfs'
+import { createVfs, createIdbPersistence, seedStarterProject, migrateStarter, startAutoSave } from './vfs'
 import { startLanguageService } from './lang/service'
 import { App } from './ui/App'
 import './styles/global.css'
@@ -14,7 +14,20 @@ async function boot() {
   const persistence = createIdbPersistence()
   const saved = await persistence.load().catch(() => null)
   const vfs = createVfs(saved ?? undefined)
-  seedStarterProject(vfs)
+  // Seed only a truly fresh workspace — migrateStarter writes dotfiles into
+  // old workspaces, and running it first on a fresh VFS made the workspace
+  // non-empty, silently suppressing the starter project.
+  if (saved) migrateStarter(vfs)
+  else seedStarterProject(vfs)
+  // Earlier builds kept repo state in a separate IndexedDB store; .git is a
+  // real VFS directory now, so that database is dead weight — remove it once.
+  if (typeof indexedDB !== 'undefined') {
+    try {
+      void indexedDB.deleteDatabase('cell-git-state-v2')
+    } catch {
+      // private mode — persistence is best-effort anyway
+    }
+  }
 
   const bus = new EventBus()
   initPlatform({ vfs, bus })

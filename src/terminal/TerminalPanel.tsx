@@ -8,7 +8,14 @@ import { createShell, type Shell } from '../shell/shell'
 import { vfsPath } from '../vfs/types'
 
 const MAX_HISTORY = 200
-const BASH_ROOT = '/workspace'
+const HOME = '/home/user'
+
+/** Prompt label: '~' for home, relative path below it, absolute otherwise. */
+function cwdLabel(cwd: string): string {
+  if (cwd === HOME) return '~'
+  if (cwd.startsWith(`${HOME}/`)) return `~${cwd.slice(HOME.length)}`
+  return cwd
+}
 
 /**
  * Line-oriented shell front-end: prompt, editing keys, history, and cd
@@ -61,18 +68,31 @@ export default function TerminalPanel() {
     term.open(host)
     fit.fit()
 
-    let cwd = '/'
+    let cwd = HOME
     let line = ''
     let history: string[] = []
     let histIdx = -1
     let running = false
 
-    const promptText = () => `\x1b[36m~${cwd === '/' ? '' : cwd}\x1b[0m $ `
+    const promptText = () => `\x1b[36m${cwdLabel(cwd)}\x1b[0m $ `
     const printPrompt = () => term.write(promptText())
+    /**
+     * xterm is a raw terminal: a bare LF moves down but keeps the column,
+     * which staircases the output. A PTY would translate (ONLCR); we are the
+     * PTY, so normalize every newline-bearing write to CRLF.
+     */
+    const writeOut = (s: string) => {
+      if (!s) return
+      const norm = s.replace(/\r?\n/g, '\r\n')
+      term.write(norm)
+      if (!norm.endsWith('\r\n')) term.write('\r\n')
+    }
+    const writeErr = (s: string) => writeOut(`\x1b[31m${s.replace(/\r?\n/g, '\r\n')}\x1b[0m`)
 
     const resolveCd = (target: string): string => {
-      if (target === '' || target === '~') return '/'
-      const base = target.startsWith('/') ? target : `${cwd === '/' ? '' : cwd}/${target}`
+      if (target === '' || target === '~') return HOME
+      if (target === '/') return '/'
+      const base = target.startsWith('/') ? target : target.startsWith('~/') ? `${HOME}/${target.slice(2)}` : `${cwd}/${target}`
       return vfsPath.normalize(base)
     }
 
@@ -98,7 +118,7 @@ export default function TerminalPanel() {
           bus.emit('terminal:cwd', { cwd })
           term.write('\r\n')
         } else {
-          term.write(`\r\n\x1b[31mbash: cd: ${tokens[1]}: No such file or directory\x1b[0m\r\n`)
+          writeErr(`bash: cd: ${tokens[1]}: No such file or directory\n`)
         }
         printPrompt()
         return
@@ -112,21 +132,14 @@ export default function TerminalPanel() {
 
       running = true
       try {
-        const bashCwd = `${BASH_ROOT}${cwd === '/' ? '' : cwd}`
-        const result = await shell.exec(trimmed, bashCwd)
-        if (result.stdout) {
-          term.write(result.stdout)
-          if (!result.stdout.endsWith('\n')) term.write('\r\n')
-        }
-        if (result.stderr) {
-          term.write(`\x1b[31m${result.stderr}\x1b[0m`)
-          if (!result.stderr.endsWith('\n')) term.write('\r\n')
-        }
+        const result = await shell.exec(trimmed, cwd)
+        if (result.stdout) writeOut(result.stdout)
+        if (result.stderr) writeErr(result.stderr)
         if (!result.stdout && !result.stderr && result.exitCode !== 0) {
           term.write(`\x1b[90m(exit ${result.exitCode})\x1b[0m\r\n`)
         }
       } catch (err) {
-        term.write(`\x1b[31mshell error: ${err instanceof Error ? err.message : String(err)}\x1b[0m\r\n`)
+        writeErr(`shell error: ${err instanceof Error ? err.message : String(err)}\n`)
       } finally {
         running = false
         printPrompt()
@@ -206,7 +219,7 @@ export default function TerminalPanel() {
     })
 
     term.write(
-      '\x1b[90mCell shell — just-bash on the Cell VFS. Try: ls, cat src/index.ts, echo hi > note.txt\x1b[0m\r\n\r\n',
+      '\x1b[90mCell shell — just-bash on the Cell VFS. You are in ~ (a full home directory).\x1b[0m\r\n\x1b[90mTry: ls, cd project, node src/index.ts, git init, npm install ms\x1b[0m\r\n\r\n',
     )
     printPrompt()
     bus.emit('terminal:cwd', { cwd })
