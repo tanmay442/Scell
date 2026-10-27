@@ -15,7 +15,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const failures = []
 function record(name, ok) {
-  if (!ok) failures.push(name)
+  if (!ok) {
+    failures.push(name)
+    termRows().then((rows) => console.log(`  tail: ${JSON.stringify(rows.slice(-10))}`)).catch(() => {})
+  }
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}`)
 }
 
@@ -292,7 +295,7 @@ try {
 
   // --- npm inside the cloned project (the subdir install flow) -------------
   await run('npm install', 120000)
-  record('npm install works inside a cloned project', (await termText()).includes('added 1 package'))
+  record('npm install works inside a cloned project', (await termText()).includes('ms@2.'))
   await run('ls')
   record('install creates node_modules in the project', (await termRows()).includes('node_modules'))
   await typeLine("node -e \"console.log(require('ms')('2 days'))\"")
@@ -304,6 +307,10 @@ try {
   await run('')
   await run('npm run hi')
   record('npm run executes project scripts', (await termText()).includes('from testrepo'))
+  await run('npm dev')
+  record('npm dev shorthand runs the dev script', (await termText()).includes('from testrepo'))
+  await run('npm run moo', 120000)
+  record('project bins run inside npm scripts (cowsay)', (await termText()).includes('< e2e-moo >'))
 
   // --- global install: bins become real PATH commands -----------------------
   await run('cd ~')
@@ -311,7 +318,7 @@ try {
   record('npm install -g adds to the global root', (await termText()).includes('added 1 package globally'))
   await typeLine('semver 1.2.3')
   record('global bins run as shell commands', await waitUntil(
-    async () => (await termText()).includes('1.2.3'),
+    async () => (await termRows()).includes('1.2.3'),
     20000,
     'semver output',
   ))

@@ -12,7 +12,8 @@ import { resolveId, NODE_BUILTINS, type ResolverFs } from './resolve'
 interface ExecRequest {
   type: 'exec'
   id: number
-  files: Record<string, string>
+  /** zero-copy workspace snapshot: one byte buffer + [path, offset, length] */
+  payload: { buffer: Uint8Array; index: [string, number, number][] }
   entry: string
   argv: string[]
   cwd: string
@@ -481,8 +482,11 @@ const resolverFs: ResolverFs = {
   },
 }
 
+// ONE cache per process, like node's require.cache — a per-closure cache
+// made circular imports (semver, yargs, …) recurse until stack overflow
+const moduleCache = new Map<string, { exports: unknown }>()
+
 function makeRequire(fromFile: string) {
-  const cache = new Map<string, { exports: unknown }>()
   return require
 
   function require(id: string): unknown {
@@ -496,7 +500,7 @@ function makeRequire(fromFile: string) {
         `Cannot find module '${id}'. Required from '${fromFile}'`,
       )
     }
-    if (cache.has(resolved.path)) return cache.get(resolved.path)!.exports
+    if (moduleCache.has(resolved.path)) return moduleCache.get(resolved.path)!.exports
     if (resolved.path.endsWith('.json')) {
       const text = files.get(resolved.path)!
       let parsed: unknown
@@ -505,12 +509,15 @@ function makeRequire(fromFile: string) {
       } catch (err) {
         throw new Error(`SyntaxError: ${resolved.path}: ${(err as Error).message}`)
       }
-      cache.set(resolved.path, { exports: parsed })
+      moduleCache.set(resolved.path, { exports: parsed })
       return parsed
     }
     const module = { exports: {} as unknown }
-    cache.set(resolved.path, module)
-    const source = files.get(resolved.path)!
+    moduleCache.set(resolved.path, module)
+    // node strips a leading hashbang before parsing; a bare "#!" is a
+    // SyntaxError anywhere else in the file. Keep the newline so stack
+    // traces keep their line numbers.
+    const source = files.get(resolved.path)!.replace(/^#![^\n]*\n/, '\n')
     const dirname = pathShim.dirname(resolved.path)
 
     const fn = new Function(
@@ -656,9 +663,16 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
   const msg = event.data
   if (msg.type !== 'exec') return
   currentId = msg.id
-  files = new Map(Object.entries(msg.files))
+  moduleCache.clear()
+  // the sandbox speaks strings; binaries decode lossily on load — same
+  // semantics as always, just off the main thread now
+  const snapshot = new Map<string, string>()
+  for (const [path, offset, length] of msg.payload.index) {
+    snapshot.set(path, decoder.decode(msg.payload.buffer.subarray(offset, offset + length)))
+  }
+  files = snapshot
   initial.clear()
-  for (const [path, content] of Object.entries(msg.files)) initial.set(path, content)
+  for (const [path, content] of snapshot) initial.set(path, content)
 
   processShim.argv = [argv0, msg.entry, ...msg.argv]
   processShim.cwd = () => msg.cwd

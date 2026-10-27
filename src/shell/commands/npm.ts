@@ -22,8 +22,8 @@ export interface ShellLike {
  * npm (and pnpm, which routes here): init with templates, install from the
  * real registry, run scripts through a fresh shell, and npx for bins.
  */
-export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell: ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void }): Promise<CommandResult> {
-  const { cwd, shell, flavor } = opts
+export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void }): Promise<CommandResult> {
+  const { cwd, scriptShell, flavor } = opts
   const [sub = 'help', ...rest] = args
 
     if (sub === '--version' || sub === '-v') return ok(`${flavor === 'npm' ? '10.9.5' : '10.5.2'} (cell)\n`)
@@ -43,12 +43,12 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   if (sub === 'run' || sub === 'run-script') {
     const script = rest[0]
     if (!script) return listScripts(vfs, cwd)
-    return runScript(vfs, script, rest.slice(1), { cwd, shell })
+    return runScript(vfs, script, rest.slice(1), { cwd, scriptShell })
   }
 
-  if (sub === 'test') return runScript(vfs, 'test', rest, { cwd, shell })
-  if (sub === 'start') return runScript(vfs, 'start', rest, { cwd, shell })
-  if (sub === 'stop') return runScript(vfs, 'stop', rest, { cwd, shell })
+  if (sub === 'test') return runScript(vfs, 'test', rest, { cwd, scriptShell })
+  if (sub === 'start') return runScript(vfs, 'start', rest, { cwd, scriptShell })
+  if (sub === 'stop') return runScript(vfs, 'stop', rest, { cwd, scriptShell })
 
   if (sub === 'ls' || sub === 'list') return npmLs(vfs, cwd)
 
@@ -59,7 +59,7 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   // npm itself has worked this way since v7; runScript's missing-script
   // error lists what does exist
   if (!['help', 'uninstall', 'remove', 'rm', 'update', 'link', 'unlink', 'pack', 'publish', 'audit', 'outdated', 'ci'].includes(sub)) {
-    return runScript(vfs, sub, rest, { cwd, shell })
+    return runScript(vfs, sub, rest, { cwd, scriptShell })
   }
 
   return fail(`${flavor}: '${sub}' is not implemented in Cell yet. Supported: init, install (-g), uninstall, run, test, start, ls, exec/npx, info.\n`)
@@ -279,8 +279,9 @@ function listScripts(vfs: Vfs, cwd: string): CommandResult {
   return ok(`Scripts available:\n${names.map((n) => `  ${n}\n    ${scripts[n]}`).join('\n')}\n`)
 }
 
-async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; shell: ShellLike }): Promise<CommandResult> {
-  const { cwd, shell } = opts
+async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike }): Promise<CommandResult> {
+  const { cwd } = opts
+  const shell = opts.scriptShell(cwd)
   const manifest = readManifest(vfs, `${projectRoot(vfs, cwd) ?? cwd}/package.json`)
   if (!manifest) return fail(`npm ERR! no package.json in ${cwd}\n`)
   const scripts = (manifest.scripts as Record<string, string> | undefined) ?? {}
@@ -342,7 +343,7 @@ function vfsPathBasename(cwd: string): string {
   return n === '' ? 'workspace' : n.slice(n.lastIndexOf('/') + 1)
 }
 
-export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; shell: ShellLike; registerLive?: (name: string) => void }) =>
+export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; registerLive?: (name: string) => void }) =>
   args[0] === 'dlx'
     ? npx(vfs, args.slice(1), { cwd: opts.cwd })
     : npmCommand(vfs, args, { ...opts, flavor: 'pnpm' })

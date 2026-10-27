@@ -4,7 +4,7 @@ import type { Vfs } from '../vfs/types'
 import { VfsBackedFs } from './vfs-fs'
 import { nodeCommand } from './commands/node-cmd'
 import { npmCommand, npx, pnpmCommand, runNodeEntry, type CommandResult } from './commands/npm'
-import { collectBins, GLOBAL_ROOT } from './commands/install'
+import { collectBins, projectRoot, GLOBAL_ROOT } from './commands/install'
 import { gitCommand } from './commands/git'
 import { tscCommand } from './commands/tsc-cmd'
 import { cellCommand } from './commands/cell-cmd'
@@ -32,7 +32,7 @@ export const HOME_DIR = '/home/user'
  * HOME=/home/user), plus the platform commands: node (V8 isolate),
  * npm/pnpm/npx (real registry), tsc (ts-rust WASM) and git (libgit2 WASM).
  */
-export function createShell(vfs?: Vfs): Shell {
+export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> }): Shell {
   const fs = new VfsBackedFs(vfs ?? platform().vfs)
   const bash = new Bash({
     fs,
@@ -75,10 +75,16 @@ export function createShell(vfs?: Vfs): Shell {
   register('node', (args, { cwd }) => nodeCommand(vfs ?? platform().vfs, args, { cwd }))
   register('tsc', (args, { cwd }) => tscCommand(vfs ?? platform().vfs, args, { cwd }))
   register('git', (args, { cwd }) => gitCommand(vfs ?? platform().vfs, args, { cwd }))
+  // npm scripts run in their own shell WITH the project's node_modules/.bin
+  // on PATH — that is what makes `npm dev` → `vercel dev` work for real
+  const scriptShell = (cwd: string): Shell => {
+    const v = vfs ?? platform().vfs
+    return createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd) })
+  }
   register('npm', (args, { cwd }) =>
-    npmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell(), flavor: 'npm', registerLive }),
+    npmCommand(vfs ?? platform().vfs, args, { cwd, scriptShell, flavor: 'npm', registerLive }),
   )
-  register('pnpm', (args, { cwd }) => pnpmCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell(), registerLive }))
+  register('pnpm', (args, { cwd }) => pnpmCommand(vfs ?? platform().vfs, args, { cwd, scriptShell, registerLive }))
   register('npx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
   register('pnpx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
   register('cell', (args, { cwd }) => cellCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell() }))
@@ -88,17 +94,21 @@ export function createShell(vfs?: Vfs): Shell {
   // registered at shell creation for bins installed in earlier sessions, and
   // re-registered live when `npm install -g` adds new ones
   const registeredBins = new Set<string>()
-  const registerGlobalBin = (binName: string, entry: string) => {
-    if (registeredBins.has(binName)) return
-    registeredBins.add(binName)
+  const registerBin = (binName: string, entry: string) => {
+    const key = `${binName}::${entry}`
+    if (registeredBins.has(key)) return
+    registeredBins.add(key)
     register(binName, (args, { cwd }) => runNodeEntry(vfs ?? platform().vfs, entry, args, cwd, binName))
   }
   for (const [binName, entry] of collectBins(vfs ?? platform().vfs, GLOBAL_ROOT)) {
-    registerGlobalBin(binName, entry)
+    registerBin(binName, entry)
+  }
+  for (const [binName, entry] of opts?.extraBins ?? []) {
+    registerBin(binName, entry)
   }
   const registerLive = (binName: string) => {
     const entry = collectBins(vfs ?? platform().vfs, GLOBAL_ROOT).get(binName)
-    if (entry !== undefined) registerGlobalBin(binName, entry)
+    if (entry !== undefined) registerBin(binName, entry)
   }
 
   return shell

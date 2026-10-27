@@ -19,6 +19,51 @@ export interface NodeRunResult {
 }
 
 /**
+ * The workspace snapshot for a node run: one buffer holding every file's
+ * bytes plus an offset index. The buffer TRANSFERS to the worker (zero-copy)
+ * — structured-cloning a giant string map froze the tab whenever a real CLI
+ * (13MB+ of JavaScript) was installed.
+ */
+export interface RunPayload {
+  buffer: Uint8Array
+  index: [path: string, offset: number, length: number][]
+}
+
+export function buildRunPayload(
+  vfs: Vfs,
+  hidePaths: string[] = [],
+  filesOverride: Record<string, string> = {},
+): RunPayload {
+  const encoder = new TextEncoder()
+  const parts: Uint8Array[] = []
+  const index: RunPayload['index'] = []
+  let offset = 0
+  const add = (path: string, bytes: Uint8Array) => {
+    parts.push(bytes)
+    index.push([path, offset, bytes.byteLength])
+    offset += bytes.byteLength
+  }
+  const hidden = new Set(hidePaths)
+  for (const path of vfs.listAllFiles()) {
+    if (hidden.has(path)) continue
+    const text = vfs.read(path)
+    if (text !== null) add(path, encoder.encode(text))
+    else {
+      const bytes = vfs.readBytes(path)
+      if (bytes !== null) add(path, bytes)
+    }
+  }
+  for (const [path, content] of Object.entries(filesOverride)) add(path, encoder.encode(content))
+  const buffer = new Uint8Array(offset)
+  let position = 0
+  for (const part of parts) {
+    buffer.set(part, position)
+    position += part.byteLength
+  }
+  return { buffer, index }
+}
+
+/**
  * Run one "node process": a fresh V8 worker over a snapshot of the VFS.
  * Worker writes are applied back to the VFS when the process exits, so
  * scaffolders (create-* templates) that write files land in the tree.
@@ -27,22 +72,7 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
   const { entry, argv = [], cwd = '/', timeoutMs = 300_000 } = options
 
   return new Promise<NodeRunResult>((resolve) => {
-    const files: Record<string, string> = {}
-    const hidden = new Set(options.hidePaths ?? [])
-    const decoder = new TextDecoder('utf-8', { fatal: false })
-    for (const path of vfs.listAllFiles()) {
-      if (hidden.has(path)) continue
-      // the sandbox speaks strings: text nodes as-is, binary nodes decoded
-      // lossily (scripts must run; a stray .png just becomes mojibake)
-      const text = vfs.read(path)
-      if (text !== null) {
-        files[path] = text
-      } else {
-        const bytes = vfs.readBytes(path)
-        if (bytes !== null) files[path] = decoder.decode(bytes)
-      }
-    }
-    Object.assign(files, options.filesOverride)
+    const payload = buildRunPayload(vfs, options.hidePaths ?? [], options.filesOverride ?? {})
 
     let worker: Worker
     try {
@@ -101,7 +131,7 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
       finish({ exitCode: 1, timedOut: false })
     }
 
-    worker.postMessage({ type: 'exec', id: 1, files, entry, argv, cwd })
+    worker.postMessage({ type: 'exec', id: 1, payload, entry, argv, cwd }, [payload.buffer.buffer as ArrayBuffer])
   })
 }
 
