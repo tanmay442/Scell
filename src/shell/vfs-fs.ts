@@ -269,13 +269,34 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async appendFile(path: string, content: FileContent, options?: WriteFileOptions | BufferEncoding): Promise<void> {
-    let existing = ''
+    // buffer-level append (P1-4): the old read-as-text + string-concat
+    // corrupted binaries through lossy UTF-8. Bytes append to bytes; text
+    // appends to text so read() keeps working on text files.
+    const z = this.locate(this.followSymlink(path))
+    if (z.zone === 'vfs') {
+      const existing = this.vfs.readBytes(z.vpath)
+      if (existing === null) {
+        await this.writeFile(path, content, options)
+        return
+      }
+      if (typeof content === 'string' && this.vfs.isText(z.vpath)) {
+        await this.writeFile(path, new TextDecoder().decode(existing) + content, options)
+        return
+      }
+      const add = typeof content === 'string' ? new TextEncoder().encode(content) : (content as Uint8Array)
+      const merged = new Uint8Array(existing.length + add.length)
+      merged.set(existing, 0)
+      merged.set(add, existing.length)
+      await this.writeFile(path, merged, options)
+      return
+    }
+    let prev = ''
     try {
-      existing = await this.readFile(path)
+      prev = await this.readFile(path)
     } catch {
       // appending creates the file
     }
-    await this.writeFile(path, existing + decode(content), options)
+    await this.writeFile(path, prev + decode(content), options)
   }
 
   async exists(path: string): Promise<boolean> {

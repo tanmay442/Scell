@@ -23,6 +23,21 @@ function sizeOf(content: string | Uint8Array): number {
   return typeof content === 'string' ? content.length : content.byteLength
 }
 
+/** byte-exact compare: reference equality lies for Uint8Array (P1-3) */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
+function sameContent(a: string | Uint8Array, b: string | Uint8Array): boolean {
+  if (typeof a === 'string' && typeof b === 'string') return a === b
+  if (a instanceof Uint8Array && b instanceof Uint8Array) return bytesEqual(a, b)
+  return false
+}
+
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: false })
 
@@ -142,7 +157,7 @@ export function createVfs(initial?: VfsFileMap): Vfs {
       if (p === '/') throw new Error(`EISDIR: cannot write '/'`)
       const existing = nodeAt(p)
       if (existing && existing.type === 'dir') throw new Error(`EISDIR: cannot write directory '${p}'`)
-      if (existing && existing.type === 'file' && existing.content === content) return
+      if (existing && existing.type === 'file' && sameContent(existing.content, content)) return
       const parent = ensureDir(vfsPath.dirname(p))
       parent.children.set(vfsPath.basename(p), { type: 'file', content, mtime: Date.now() })
       emit({ kind: 'write', path: p })
@@ -152,7 +167,7 @@ export function createVfs(initial?: VfsFileMap): Vfs {
       if (p === '/') throw new Error(`EISDIR: cannot write '/'`)
       const existing = nodeAt(p)
       if (existing && existing.type === 'dir') throw new Error(`EISDIR: cannot write directory '${p}'`)
-      if (existing && existing.type === 'file' && existing.content === content) return
+      if (existing && existing.type === 'file' && sameContent(existing.content, content)) return
       const parent = ensureDir(vfsPath.dirname(p))
       parent.children.set(vfsPath.basename(p), { type: 'file', content, mtime: Date.now() })
       emit({ kind: 'write', path: p })

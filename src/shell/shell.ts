@@ -341,6 +341,9 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
     return { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 }
   })
 
+  // deterministic PIDs (P1-12): the agent's own ps line used Math.random,
+  // so identical shells gave different output and transcripts never matched
+  let nextPid = 100
   register('ps', (args) => {
     const aux = args.some((a) => a.includes('a'))
     const rows = aux
@@ -348,7 +351,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
           'USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND',
           'user         1  0.0  0.1  16756  9832 ?        Ss   09:12   0:01 /bin/bash',
           'user        42  0.2  0.4 881244 52140 ?        Sl   09:13   0:02 node cell-runtime',
-          `user       ${Math.floor(Math.random() * 900) + 100}  0.0  0.0   5828  3980 ?        R+   ${new Date().toTimeString().slice(0, 5)}   0:00 ps aux`,
+          `user       ${nextPid++}  0.0  0.0   5828  3980 ?        R+   ${new Date().toTimeString().slice(0, 5)}   0:00 ps aux`,
         ]
       : [
           '    PID TTY          TIME CMD',

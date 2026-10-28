@@ -50,12 +50,12 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   if (sub === 'run' || sub === 'run-script') {
     const script = rest[0]
     if (!script) return listScripts(vfs, cwd)
-    return runScript(vfs, script, rest.slice(1), { cwd, scriptShell, env })
+    return runScript(vfs, script, rest.slice(1), { cwd, scriptShell, env, progress: opts.progress })
   }
 
-  if (sub === 'test') return runScript(vfs, 'test', rest, { cwd, scriptShell, env })
-  if (sub === 'start') return runScript(vfs, 'start', rest, { cwd, scriptShell, env })
-  if (sub === 'stop') return runScript(vfs, 'stop', rest, { cwd, scriptShell, env })
+  if (sub === 'test') return runScript(vfs, 'test', rest, { cwd, scriptShell, env, progress: opts.progress })
+  if (sub === 'start') return runScript(vfs, 'start', rest, { cwd, scriptShell, env, progress: opts.progress })
+  if (sub === 'stop') return runScript(vfs, 'stop', rest, { cwd, scriptShell, env, progress: opts.progress })
 
   if (sub === 'ls' || sub === 'list') return npmLs(vfs, cwd)
 
@@ -66,7 +66,7 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   // npm itself has worked this way since v7; runScript's missing-script
   // error lists what does exist
   if (!['help', 'uninstall', 'remove', 'rm', 'update', 'link', 'unlink', 'pack', 'publish', 'audit', 'outdated', 'ci'].includes(sub)) {
-    return runScript(vfs, sub, rest, { cwd, scriptShell, env })
+    return runScript(vfs, sub, rest, { cwd, scriptShell, env, progress: opts.progress })
   }
 
   return fail(`${flavor}: '${sub}' is not implemented in Cell yet. Supported: init, install (-g), uninstall, run, test, start, ls, exec/npx, info.\n`)
@@ -311,7 +311,7 @@ function listScripts(vfs: Vfs, cwd: string): CommandResult {
   return ok(`Scripts available:\n${names.map((n) => `  ${n}\n    ${scripts[n]}`).join('\n')}\n`)
 }
 
-async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; scriptShell: (cwd: string, env?: ScriptEnv) => ShellLike; env?: ScriptEnv }): Promise<CommandResult> {
+async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; scriptShell: (cwd: string, env?: ScriptEnv) => ShellLike; env?: ScriptEnv; progress?: (line: string) => void }): Promise<CommandResult> {
   const { cwd } = opts
   const shell = opts.scriptShell(cwd, opts.env)
   const manifest = readManifest(vfs, `${projectRoot(vfs, cwd) ?? cwd}/package.json`)
@@ -331,7 +331,7 @@ async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { 
   const full = `${parts.join(' && ')}${extraArgs.length ? ` ${extraArgs.join(' ')}` : ''}`
 
   // scripts run through a fresh shell so nested node/npm/npx/tsc calls work
-  const result = await shell.exec(full, cwd)
+  const result = await shell.exec(full, cwd, opts.progress)
   return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
 }
 

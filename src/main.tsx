@@ -1,7 +1,7 @@
 import { createRoot } from 'react-dom/client'
 import { EventBus } from './events'
 import { initPlatform } from './platform'
-import { createVfs, createIdbPersistence, seedStarterProject, migrateStarter, ensureStarterProject, startAutoSave } from './vfs'
+import { createVfs, createIdbPersistence, loadSeedFlag, saveSeedFlag, seedStarterProject, migrateStarter, ensureStarterProject, startAutoSave } from './vfs'
 import { startLanguageService } from './lang/service'
 import { App } from './ui/App'
 import './styles/global.css'
@@ -12,17 +12,23 @@ import './styles/global.css'
 // platform makes the second mount genuinely wrong, not a bug indicator.
 async function boot() {
   const persistence = createIdbPersistence()
-  const saved = await persistence.load().catch(() => null)
+  const [saved, seededBefore] = await Promise.all([
+    persistence.load().catch(() => null),
+    loadSeedFlag().catch(() => false),
+  ])
   const vfs = createVfs(saved ?? undefined)
   // Seed only a truly fresh workspace — migrateStarter writes dotfiles into
   // old workspaces, and running it first on a fresh VFS made the workspace
-  // non-empty, silently suppressing the starter project.
+  // non-empty, silently suppressing the starter project. A null image with
+  // the tombstone set is a deliberate full wipe: leave it empty instead of
+  // resurrecting the starter (P0-9).
   if (saved) {
     migrateStarter(vfs)
     ensureStarterProject(vfs)
-  } else {
+  } else if (!seededBefore) {
     seedStarterProject(vfs)
   }
+  void saveSeedFlag().catch(() => {})
   // installed dependencies live in IndexedDB now — ask Chrome not to evict
   // them under storage pressure (granted silently in most cases)
   void navigator.storage?.persist?.().catch(() => {})
@@ -44,7 +50,9 @@ async function boot() {
 
   const bus = new EventBus()
   initPlatform({ vfs, bus })
-  startAutoSave(vfs, persistence)
+  startAutoSave(vfs, persistence, 400, {
+    onError: (message) => bus.emit('app:status', { message, tone: 'error' }),
+  })
   // every VFS mutation is mirrored onto the bus — the tree, status bar and
   // tab bookkeeping all listen there, not to the VFS directly. Events
   // coalesce into one per quiet window: an npm install writes thousands of

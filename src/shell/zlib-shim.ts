@@ -13,9 +13,17 @@ export const constants = {
 
 export function gzipSync(data: Uint8Array, opts: { level?: number; maxOutputLength?: number } = {}): Uint8Array {
   const level = opts.level !== undefined && opts.level >= 0 && opts.level <= 9 ? (Math.round(opts.level) as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) : undefined
-  return fflateGzip(data, level !== undefined ? { level } : {})
+  const out = fflateGzip(data, level !== undefined ? { level } : {})
+  if (opts.maxOutputLength !== undefined && out.length > opts.maxOutputLength) {
+    throw new Error(`zlib: gzip output ${out.length} exceeds maxOutputLength ${opts.maxOutputLength}`)
+  }
+  return out
 }
 
 export function gunzipSync(data: Uint8Array, opts: { maxOutputLength?: number } = {}): Uint8Array {
-  return fflateGunzip(data)
+  const out = fflateGunzip(data)
+  if (opts.maxOutputLength !== undefined && out.length > opts.maxOutputLength) {
+    throw new Error(`zlib: gunzip output ${out.length} exceeds maxOutputLength ${opts.maxOutputLength}`)
+  }
+  return out
 }

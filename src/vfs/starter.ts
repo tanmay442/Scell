@@ -134,12 +134,27 @@ PS1='\\u@\\h:\\w\\$ '
 `,
 }
 
-/** Seed the starter home, but only into a completely empty workspace. */
+/**
+ * Tombstone marking a workspace the starter has seeded (P0-9). An empty
+ * workspace is ambiguous — fresh browser or deliberate `rm -rf` — and the
+ * old empty-check reseeded both, resurrecting the starter after a wipe.
+ * The marker survives partial wipes (it lives in .cell); full wipes are
+ * covered by the out-of-band IDB flag in persistence.ts.
+ */
+export const SEED_MARKER = `${HOME}/.cell/seeded`
+
+/** Seed the starter home, but only into a workspace never seeded before. */
 export function seedStarterProject(vfs: Vfs): void {
-  if (vfs.listAllFiles().length > 0) return
+  if (vfs.exists(SEED_MARKER)) return
+  if (vfs.listAllFiles().length > 0) {
+    // legacy workspace from before the marker: adopt, do not clobber
+    vfs.write(SEED_MARKER, `seeded ${new Date().toISOString()}\n`)
+    return
+  }
   for (const [path, content] of Object.entries(FILES)) {
     vfs.write(path, content)
   }
+  vfs.write(SEED_MARKER, `seeded ${new Date().toISOString()}\n`)
 }
 
 /**
@@ -149,12 +164,20 @@ export function seedStarterProject(vfs: Vfs): void {
  * so a deliberate `rm -rf ~/project` next to real work is respected.
  */
 export function ensureStarterProject(vfs: Vfs): void {
+  // a seeded workspace stays as the user left it: a deliberate `rm -rf
+  // ~/project` must not resurrect the starter (P0-9)
+  if (vfs.exists(SEED_MARKER)) return
   if (vfs.exists(`${PROJECT}/README.md`)) return
   const hasRealContent = vfs.listAllFiles().some((path) => !path.slice(path.lastIndexOf('/') + 1).startsWith('.'))
-  if (hasRealContent) return
+  if (hasRealContent) {
+    // legacy workspace with real user content: adopt, do not reseed
+    if (!vfs.exists(SEED_MARKER)) vfs.write(SEED_MARKER, `seeded ${new Date().toISOString()}\n`)
+    return
+  }
   for (const [path, content] of Object.entries(FILES)) {
     if (path.startsWith(`${PROJECT}/`) && vfs.read(path) === null) vfs.write(path, content)
   }
+  if (!vfs.exists(SEED_MARKER)) vfs.write(SEED_MARKER, `seeded ${new Date().toISOString()}\n`)
 }
 
 const LEGACY_STARTER_PACKAGE_JSON = `{
@@ -191,5 +214,9 @@ export function migrateStarter(vfs: Vfs): void {
   const pkg = vfs.read(`${PROJECT}/package.json`)
   if (pkg === LEGACY_STARTER_PACKAGE_JSON) {
     vfs.write(`${PROJECT}/package.json`, FILES[`${PROJECT}/package.json`])
+  }
+  // adopt pre-marker workspaces so ensure() never heals them again
+  if (!vfs.exists(SEED_MARKER)) {
+    vfs.write(SEED_MARKER, `seeded ${new Date().toISOString()}\n`)
   }
 }

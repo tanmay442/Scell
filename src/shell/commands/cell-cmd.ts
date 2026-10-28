@@ -64,13 +64,22 @@ function snapshotName(): string {
   return `workspace-${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}.tar.gz`
 }
 
-function workspaceTar(vfs: Vfs): Uint8Array {
+function workspaceTar(vfs: Vfs): { bytes: Uint8Array; skipped: number; skippedBytes: number } {
+  // P1-6: reinstallable heavies never ship — node_modules and .git bloat
+  // snapshots unbounded and restore slower without helping the agent
   const files: { path: string; data: Uint8Array }[] = []
+  let skipped = 0
+  let skippedBytes = 0
   for (const path of vfs.listAllFiles()) {
+    if (path.includes('/node_modules/') || path.includes('/.git/')) {
+      skipped++
+      skippedBytes += vfs.stat(path)?.size ?? 0
+      continue
+    }
     const data = vfs.readBytes(path)
     if (data !== null) files.push({ path, data })
   }
-  return gzipSync(tarFiles(files))
+  return { bytes: gzipSync(tarFiles(files)), skipped, skippedBytes }
 }
 
 function restoreTar(vfs: Vfs, bytes: Uint8Array): { files: number; bytes: number } {
@@ -153,7 +162,7 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
     const configured = readConfig(vfs)
     if ('error' in configured) return { stdout: '', stderr: configured.error, exitCode: 1 }
     const name = snapshotName()
-    const body = workspaceTar(vfs)
+    const { bytes: body, skipped } = workspaceTar(vfs)
     const response = await s3Fetch(configured.config, 'PUT', name, {
       body,
       contentType: 'application/gzip',
@@ -165,7 +174,8 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
         exitCode: 1,
       }
     }
-    return { stdout: `saved ${name} (${(body.byteLength / 1024).toFixed(1)} KB) to ${configured.config.bucket}\n`, stderr: '', exitCode: 0 }
+    const skippedNote = skipped > 0 ? ` (excluded ${skipped} node_modules/.git files — reinstall with npm install)` : ''
+    return { stdout: `saved ${name} (${(body.byteLength / 1024).toFixed(1)} KB) to ${configured.config.bucket}${skippedNote}\n`, stderr: '', exitCode: 0 }
   }
 
   if (sub === 'list' || sub === 'ls') {

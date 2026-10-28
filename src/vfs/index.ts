@@ -1,5 +1,5 @@
 export { createVfs } from './vfs'
-export { createIdbPersistence } from './persistence'
+export { createIdbPersistence, loadSeedFlag, saveSeedFlag } from './persistence'
 export { startAutoSave } from './auto-save'
 export { seedStarterProject, migrateStarter, ensureStarterProject } from './starter'
 export { vfsPath } from './types'
