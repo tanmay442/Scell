@@ -117,3 +117,14 @@ max_tokens 8192 + truncation hack (:283-297) + single 120s abort, no retry;
 - P1-12 FIXED (214c44a) — no random PIDs / env-sourced telemetry left in
   shell paths; values report sandbox limits.
 - P1-13 FIXED (214c44a) — parent progress sink threaded to nested shells.
+
+### Note (2026-10-28, harness round-3 verification)
+- `src/python/python.test.ts` "python stdin (P0-7)" cases wedge the vitest
+  worker in this environment (no output, default timeouts never fire —
+  event loop looks blocked) while every other test in the file passes in
+  seconds standalone. Standalone repro shows `runPython` resolving but
+  stdin bytes arriving empty (`got:` with no content), so the P0-7 plumbing
+  shape (`setStdin({read})`, correct per pyodide 0.27.7 types) misbehaves
+  under node 26 here. Untouched by round-3 (zero shared files) — needs a
+  substrate follow-up, not a harness fix. Full suite otherwise green with
+  this one file excluded.
