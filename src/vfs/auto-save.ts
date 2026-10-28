@@ -11,17 +11,41 @@ import type { Vfs, VfsFileMap, VfsPersistence } from './types'
  * its descendants, and a wholesale `restore()` (which emits `write '/'`)
  * reconciles the whole image. Flush never throws: a wedged save must not
  * wedge all future saves.
+ *
+ * Saves are awaited with bounded retry (P0-8): the dirty sets are snapshotted
+ * before the await so edits landing mid-save are not lost, and a failed save
+ * re-queues its paths and reports through `onError` (wired to the status bus
+ * in main.tsx) instead of vanishing silently.
  */
-export function startAutoSave(vfs: Vfs, persistence: VfsPersistence, delayMs = 400): () => void {
+
+export interface AutoSaveOpts {
+  /** status-bus signal on persistent failure (default: silent, tests) */
+  onError?: (message: string) => void
+  /** attempts per flush before reporting (default 3) */
+  maxAttempts?: number
+}
+
+const RETRY_DELAYS = [200, 800]
+
+export function startAutoSave(
+  vfs: Vfs,
+  persistence: VfsPersistence,
+  delayMs = 400,
+  opts: AutoSaveOpts = {},
+): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null
   let stopped = false
+  let flushing = false
+  let reflush = false
   const dirty = new Set<string>()
   const deleted = new Set<string>()
   const known = new Set<string>(vfs.listAllFiles())
+  const maxAttempts = opts.maxAttempts ?? 3
 
-  const schedule = () => {
+  const schedule = (ms = delayMs) => {
+    if (stopped) return
     if (timer) clearTimeout(timer)
-    timer = setTimeout(flush, delayMs)
+    timer = setTimeout(() => void flushAsync(), ms)
   }
 
   /** a removed subtree: forget every known path under it */
@@ -35,10 +59,20 @@ export function startAutoSave(vfs: Vfs, persistence: VfsPersistence, delayMs = 4
     }
   }
 
-  function flush() {
-    if (stopped) return
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+  async function flushAsync(): Promise<void> {
+    if (stopped || flushing) {
+      // a flush is already awaiting the backend — run again after it so
+      // edits landing mid-save are not left dirty forever
+      if (flushing) reflush = true
+      return
+    }
+    if (persistence.saveChanges && dirty.size === 0 && deleted.size === 0) return
+    flushing = true
     try {
-      if (persistence.saveChanges && (dirty.size > 0 || deleted.size > 0)) {
+      if (persistence.saveChanges) {
+        // snapshot before the await: edits landing mid-save stay dirty
         const upserts: VfsFileMap = {}
         for (const path of dirty) {
           if (path === '/') continue
@@ -51,15 +85,90 @@ export function startAutoSave(vfs: Vfs, persistence: VfsPersistence, delayMs = 4
           if (content !== null) upserts[path] = content
         }
         const removes = [...deleted]
+        const attemptPaths = [...dirty]
+        const attemptDeletes = [...deleted]
         dirty.clear()
         deleted.clear()
-        void persistence.saveChanges(upserts, removes)
+        let lastError: unknown = null
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            await persistence.saveChanges(upserts, removes)
+            lastError = null
+            break
+          } catch (err) {
+            lastError = err
+            if (attempt < maxAttempts) await sleep(RETRY_DELAYS[attempt - 1] ?? 800)
+          }
+        }
+        if (lastError !== null) {
+          // re-queue so the next event (or the delayed retry) picks it up
+          for (const path of attemptPaths) dirty.add(path)
+          for (const path of attemptDeletes) deleted.add(path)
+          opts.onError?.(
+            `autosave failed after ${maxAttempts} attempts — ${attemptPaths.length + attemptDeletes.length} change(s) still dirty (${lastError instanceof Error ? lastError.message : String(lastError)})`,
+          )
+          schedule(2000)
+        }
+      } else {
+        const snapshot = vfs.snapshot()
+        let lastError: unknown = null
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          try {
+            await persistence.save(snapshot)
+            lastError = null
+            break
+          } catch (err) {
+            lastError = err
+            if (attempt < maxAttempts) await sleep(RETRY_DELAYS[attempt - 1] ?? 800)
+          }
+        }
+        if (lastError !== null) {
+          opts.onError?.(
+            `autosave failed after ${maxAttempts} attempts (${lastError instanceof Error ? lastError.message : String(lastError)})`,
+          )
+          schedule(2000)
+        }
+      }
+    } finally {
+      flushing = false
+      if (reflush) {
+        reflush = false
+        schedule()
+      }
+    }
+  }
+
+  // legacy sync entry: page-hide/leave handlers cannot await — one attempt,
+  // best effort, never throws
+  function flush() {
+    if (stopped || flushing) return
+    try {
+      if (persistence.saveChanges && (dirty.size > 0 || deleted.size > 0)) {
+        const upserts: VfsFileMap = {}
+        for (const path of dirty) {
+          if (path === '/') continue
+          let content: string | Uint8Array | null = null
+          try {
+            content = vfs.read(path) ?? vfs.readBytes(path)
+          } catch {
+            continue
+          }
+          if (content !== null) upserts[path] = content
+        }
+        const removes = [...deleted]
+        dirty.clear()
+        deleted.clear()
+        void persistence.saveChanges(upserts, removes).catch((err: unknown) => {
+          for (const path of Object.keys(upserts)) dirty.add(path)
+          for (const path of removes) deleted.add(path)
+          opts.onError?.(
+            `autosave failed (${err instanceof Error ? err.message : String(err)}) — will retry`,
+          )
+        })
         return
       }
-      if (!persistence.saveChanges) void persistence.save(vfs.snapshot())
+      if (!persistence.saveChanges) void persistence.save(vfs.snapshot()).catch(() => {})
     } catch {
-      // a wedged flush must never wedge future saves — the next event
-      // re-arms the timer and retries with whatever is still dirty
       schedule()
     }
   }

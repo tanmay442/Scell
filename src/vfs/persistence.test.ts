@@ -48,8 +48,10 @@ describe('idb persistence', () => {
 })
 
 describe('persistence write-then-swap (P0-8) + seed flag (P0-9)', () => {
+  let serial2 = 1000
+  const fresh2 = () => createIdbPersistence(`cell-test-${Date.now()}-${serial2++}`)
   it('full save removes stale keys without a clear window', async () => {
-    const persistence = fresh()
+    const persistence = fresh2()
     await persistence.save({ '/keep.txt': 'keep', '/old.txt': 'old' })
     await persistence.save({ '/keep.txt': 'keep' })
     const loaded = await persistence.load()
