@@ -87,3 +87,88 @@ loadSession traversal; --resume double-suffix.
 Meta single-hop credible; resume-after-text narrowly credible, not general;
 SSE streaming half-true (buffered/sliced/unredacted); e2e proves transport +
 save only; chain-expiry note honest — long meta chains die with 400 today.
+
+## Fix status (2026-10-28, branch agent-harness)
+
+Substrate commits 01082cd/ec7412c/13274a8/214c44a/c23d44a had already closed
+the truncation/trailer/re-anchor/deny-adjacent groundwork; commit d12eb2f
+closes the items below. Verified: `pnpm typecheck` clean, 23 new
+runAgent-level tests in `src/shell/commands/agent-harness.test.ts` (stubbed
+fetch, offline), all 44 pre-existing agent tests still green.
+
+### P0 — FIXED (d12eb2f unless noted)
+- P0-1 FIXED — duplicate loader deleted from agent.ts; `loadCustomTools` is
+  the single source of truth (shadow/duplicate defs warn, builtins win).
+- P0-2 FIXED — `redactSecrets` wraps both onProgress emissions (tool line in
+  agent.ts, streaming deltas in `readMetaStream`).
+- P0-3 FIXED — `isDeniedPath` blocks agent.json/auth.json/sessions/tools/
+  skills in read/edit/write/ls; tool results are redacted before entering
+  provider state, turns, and chained outputs. (Bash `cat` of the key files
+  is still possible — no shell mediation; noted as residual risk.)
+- P0-4 FIXED (minimum) — `bashDenyReason` ERRORS on `rm -rf`, `rm` on
+  home/root, `cell load/save`, `curl|sh`/`wget|sh`, plus the P0-3 path
+  deny-list; the approval audit line is kept. A real allow/deny gate is
+  DEFERRED (runs are non-interactive by design).
+- P0-5 FIXED — resume seeds `emptyProviderState()`, `rebuildState` replays
+  turns, new prompt pushed once. Tested for anthropic + openai (no
+  duplication) and meta.
+- P0-6 FIXED — `unsentMetaOutputs` collects tool turns recorded after the
+  last chained response; `setMetaResumeFlush` sends them as
+  function_call_output before the new user message in one chained request.
+  Tested (step-limit mid-loop → resume flushes).
+- P0-7 FIXED — `fetchWithRetry`: 3 attempts, jittered backoff, on
+  429/500/502/503/504/529/408/425 + timeouts/aborts; chain-expiry 400
+  re-anchor from 13274a8 reused unchanged. Tested (500 → success).
+
+### P1 — FIXED
+- P1-1 FIXED (scripts/e2e-agent.mjs) — sentinel is model-computed
+  (`november`, absent from the typed command). Live-key gated, not in CI.
+- P1-2 FIXED — `readMetaStream`: incremental chunk reader, spec data:
+  accumulation, CRLF tolerance, per-delta redact, truncation mark;
+  `parseMetaSseEvents` fixed the same way for the fallback path.
+- P1-3 FIXED (ec7412c/13274a8; d12eb2f adds stdout/stderr separator) —
+  head+tail receipt, exit trailer appended post-truncation.
+- P1-4 FIXED — `truncateTurns` cuts on user boundaries + drops trailing
+  orphan calls; `capLiveState` bounds provider logs pair-safely; live
+  turns/transcript trimmed between persists.
+- P1-5 FIXED — resume id strips `.json` before save (no `x.json.json`).
+- P1-6 FIXED — skill warnings surfaced in the transcript.
+- P1-7 FIXED — `isSafeCommandName` whitelist `^[A-Za-z0-9_-]+$`.
+- P1-8 FIXED — `sanitizeResumeId` confines to `SESSIONS_DIR` stems.
+- P1-9 FIXED — non-finite offset/limit fall back, limit clamped 1–5000.
+- P1-10 FIXED — duplicate custom-tool names warn + skip.
+
+### P2 — FIXED / DEFERRED
+- FIXED: redact additions (bare KEY=/SECRET=/TOKEN=/PASSWORD= env lines,
+  `"key"` field, single-quoted fields, lowercase bearer, private-key blocks,
+  `?api_key=` params) + redact-then-truncate ordering; dead
+  `recordProviderTurn` wrapper removed; `startedAt` preserved on resume;
+  skill names validated.
+- DEFERRED: truncated-turn live-vs-saved divergence (no compaction — still
+  plain middle-drop); unknown-slash silence; frontmatter subset (CRLF,
+  YAML-fold); `interpolateArgs` silent `''`/`[object Object]`.
+
+### Missing tests — now covered (agent-harness.test.ts)
+python plot artifact; CSV analysis; preview via agent; edit+tsc; resume
+across fresh VFS; approval present (bash) / absent (ls); custom tool;
+skill override; OpenAI transport; 5xx retry; malformed args JSON; missing
+call_id; traversal resume; double-suffix resume; key-file deny + `rm -rf`
+refuse; secret redaction before model context; meta resume flush; non-meta
+no-duplication; step-budget hint; unknown tool; provider mismatch; corrupt
+session; NaN paging; shadow/duplicate tools. Plus CRLF/multi-data SSE unit.
+Still open: 429-specific retry timing, frontmatter edge cases, binary read
+(covered by "no such file (or binary)" path, untested).
+
+### Capability audit — updates
+3. self secret/config protection: PARTIAL — file-tool layer + context
+   redaction done; raw bash exfiltration (`cat`, `env | curl`) unmediated.
+4. transient/chain-expiry recovery: FIXED (retry + re-anchor).
+Others unchanged (no background servers, no interactive approval, no
+compaction, no binary read, no parallel calls, no stdin/pty, per-tool
+bounds exist for bash timeout only, network still relay-limited).
+
+### Credibility — updates
+Resume now proven for all three providers (incl. fresh-VFS resume);
+SSE streaming true incremental + redacted; e2e sentinel no longer
+echo-spoofable. Chain-expiry 400 now recovers via re-anchor instead of
+dying honestly.

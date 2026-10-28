@@ -72,3 +72,48 @@ max_tokens 8192 + truncation hack (:283-297) + single 120s abort, no retry;
 3. Total env capture + thread `ctx.env` through nested shells.
 4. Await/retry autosave + seed tombstone + exclude heavies from `cell save`.
 5. Streaming + resumable conversation + retrying model client in harness.
+
+## Fix status (2026-10-28, branch agent-harness)
+
+### P0 — FIXED
+- P0-1 FIXED (01082cd) — per-exec `timeoutMs` on `Shell.exec`, `{exitCode:
+  124, timedOut: true}` on expiry. Test: shell.test.ts timeout case.
+- P0-2 FIXED (01082cd) — mutex/queue around `bash.exec`, env cloned per
+  call. Test: serialize case.
+- P0-3 FIXED (01082cd) — trap-style always-run epilogue + missing-marker
+  signal; temp-file command delivery (`/tmp/.cell-exec-<nonce>.sh`) with
+  collision-proof `__cell_<nonce>_` var prefix (also closes P1-2).
+- P0-4 FIXED (01082cd) — `ctx.env` threaded through nested shells.
+  (2 full-suite flakes seen 2026-10-28 in shell.test.ts unclosed-syntax /
+  xargs cases — both pass in isolation; timing flake under parallel load.)
+- P0-5 FIXED (ec7412c + 13274a8) — structured `{timedOut, oomSuspected}`
+  through `CommandResult` + untruncatable exit trailers.
+- P0-6 FIXED (ec7412c + 13274a8) — head+tail `truncateWithReceipt` + exit
+  trailer appended post-truncation in agent/node/python paths.
+- P0-7 FIXED (ec7412c) — piped stdin plumbed to `python script.py`.
+- P0-8 FIXED (214c44a + caa8d5d) — autosave awaits with bounded retry,
+  dirty sets snapshotted before the await, failures re-queue + report via
+  `onError` (status bus); full-save is write-then-swap. Tests:
+  auto-save.test.ts retry/signal cases.
+- P0-9 FIXED (214c44a) — `__seeded` tombstone persists deliberate wipes.
+
+### P1 — status
+- P1-1 DEFERRED — no .bashrc hash/re-source guard; one bad line still
+  bricks later commands (only PATH-prepend dedupe present).
+- P1-2 FIXED (01082cd) — nonce temp-file command delivery (see P0-3).
+- P1-3 FIXED (214c44a) — byte-exact `bytesEqual` (vfs.ts).
+- P1-4 FIXED (214c44a) — buffer-level append in vfs-fs.ts.
+- P1-5 DEFERRED — symlinks/modes live in VfsBackedFs memory only; reload
+  still loses them, `cell save` has no sidecar.
+- P1-6 FIXED (214c44a) — `cell save` excludes node_modules/.git + warns.
+- P1-7 FIXED (caa8d5d) — documented in the agent system prompt
+  (`/tmp` volatile, invisible to python/node; keep work under ~).
+- P1-8 FIXED (ec7412c) — unique node-eval temp names.
+- P1-9 PARTIAL — ceilings documented in the prompt (node/python 5min,
+  bash 120s); background servers still absent (see capability audit).
+- P1-10 DEFERRED — python preamble still uses bare `__cell_*` globals
+  (runner.ts); no UUID prefix, no namespace isolation.
+- P1-11 FIXED (214c44a) — `maxOutputLength` enforced in zlib-shim.
+- P1-12 FIXED (214c44a) — no random PIDs / env-sourced telemetry left in
+  shell paths; values report sandbox limits.
+- P1-13 FIXED (214c44a) — parent progress sink threaded to nested shells.

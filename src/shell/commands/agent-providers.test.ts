@@ -223,4 +223,11 @@ describe('meta chain-expiry re-anchor (builder gap)', () => {
     expect(retry.previous_response_id).toBeUndefined()
     expect(JSON.stringify(retry.input)).toContain('re-anchored')
   })
+
+  it('tolerates CRLF and multi-line data blocks', () => {
+    const raw = 'event: response.output_text.delta\r\ndata: {"delta":"a"}\r\n\r\nevent: response.completed\r\ndata: {"response":{"id":"r"}}\r\ndata: [DONE]\r\n'
+    const { deltas, final } = parseMetaSseEvents(raw)
+    expect(deltas).toEqual(['a'])
+    expect(final).toMatchObject({ id: 'r' })
+  })
 })

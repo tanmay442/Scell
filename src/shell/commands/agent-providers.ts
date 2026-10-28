@@ -164,8 +164,8 @@ export function parseMetaSseEvents(raw: string): { deltas: string[]; final: unkn
       else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
     }
     if (dataLines.length === 0) continue
-    const dataText = dataLines.join('\n').trim()
-    if (dataText === '[DONE]') continue
+    const dataText = dataLines.filter((line) => line !== '[DONE]').join('\n').trim()
+    if (dataText === '' || dataText === '[DONE]') continue
     if (event === 'response.output_text.delta') {
       try {
         const parsed = JSON.parse(dataText) as { delta?: string }
@@ -230,8 +230,8 @@ export async function readMetaStream(
       else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
     }
     if (dataLines.length === 0) return
-    const dataText = dataLines.join('\n').trim()
-    if (dataText === '[DONE]') return
+    const dataText = dataLines.filter((line) => line !== '[DONE]').join('\n').trim()
+    if (dataText === '' || dataText === '[DONE]') return
     if (event === 'response.output_text.delta') {
       try {
         const parsed = JSON.parse(dataText) as { delta?: string }

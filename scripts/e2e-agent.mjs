@@ -6,8 +6,12 @@
  *   CELL_AGENT_LIVE_KEY=LLM_… node scripts/e2e-agent.mjs
  *
  * Flow: boot → write ~/.cell/agent.json (meta provider + live key) →
- * `cell agent "reply with exactly: e2e-agent-ok" --steps 5` → transcript in
- * the terminal contains e2e-agent-ok and a saved session exists.
+ * `cell agent "…" --steps 5` → transcript in the terminal contains the
+ * model-computed answer and a saved session exists.
+ *
+ * The sentinel is model-computed, never echoed: the prompt asks for the NATO
+ * word for N, but the word `november` appears nowhere in the typed command —
+ * so a terminal echo of the command line can never false-positive the check.
  *
  * Needs the dev server on :5199 (`pnpm dev`, override with APP_URL).
  */
@@ -200,11 +204,14 @@ try {
   await run('cat ~/.cell/agent.json')
   record('meta provider configured in ~/.cell/agent.json', (await termText()).includes('"meta"'))
 
-  await typeLine(`cell agent "reply with exactly: e2e-agent-ok" --steps 5`)
+  // Ask for a model-computed value (P1-1): the NATO word for N is `november`,
+  // which appears nowhere in the typed command line — the terminal echo of
+  // the command can never satisfy the check by itself.
+  await typeLine(`cell agent "reply with exactly one lowercase word: the NATO phonetic alphabet word for N" --steps 5`)
   record('trivial question answers through the meta transport', await waitUntil(
-    async () => (await termText()).includes('e2e-agent-ok'),
+    async () => (await termText()).includes('november'),
     300000,
-    'e2e-agent-ok in transcript',
+    'november in transcript',
   ))
   await run('', 30000)
   record('transcript names the meta model', (await termText()).includes('meta/muse-spark-1.3-contributor'))
