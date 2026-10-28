@@ -113,7 +113,7 @@ Chrome over raw CDP.
 ## Testing
 
 ```sh
-pnpm test        # 101 unit tests (vitest)
+pnpm test        # 128 unit tests (vitest)
 pnpm build       # typecheck + production build
 
 # browser e2e (needs the dev server on :5199 — `pnpm dev` — plus internet:
