@@ -20,6 +20,11 @@ import type { ToolCall, ToolInfo } from './agent-tools'
  *   follow-up: { model, previous_response_id: "<last resp id>",
  *     input: [{ type: "function_call_output", call_id, output }],
  *     tools, max_output_tokens }
+ *   Long multi-step runs can fail a follow-up with 400 "referenced response
+ *   not found or expired" (observed live 2026-10-28: the workspace changes
+ *   were real and kept, only the summary hop died). The harness surfaces
+ *   that honestly; re-anchoring by replaying compressed history as a fresh
+ *   first turn is follow-up work (same bucket as compaction).
  *   stream:true gives SSE: `event: response.output_text.delta` /
  *   `data: {"delta":"…"}` chunks, then `event: response.completed` with the
  *   full response, then a `[DONE]` terminator line.
