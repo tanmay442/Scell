@@ -177,12 +177,15 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
           let stdout = result.stdout
           const markerAt = stdout.lastIndexOf(marker)
           if (markerAt === -1) {
-            return {
-              stdout,
-              stderr: `${result.stderr}[cell: env capture missed — session env may be stale]\n`,
-              exitCode: result.exitCode,
-              envStale: true,
-            }
+            // The epilogue is `;`-chained after a fixed wrapper that always
+            // parses, so a missing marker means just-bash aborted the exec
+            // itself: a sourced-file parse error (verified: the whole file
+            // is parsed before anything runs — even earlier lines produce
+            // no output). No user code ran, so sessionEnv is still
+            // accurate: return the failure (exit + syntax stderr) as-is.
+            // (trap does not exist in just-bash; timeouts below are the
+            // only genuinely-stale case and keep envStale: true.)
+            return { stdout, stderr: result.stderr, exitCode: result.exitCode }
           }
           const lineEnd = stdout.indexOf('\n', markerAt)
           const dumpText = lineEnd === -1 ? stdout.slice(markerAt) : stdout.slice(markerAt, lineEnd)

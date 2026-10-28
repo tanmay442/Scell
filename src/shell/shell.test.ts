@@ -155,11 +155,14 @@ describe('agent-hardening (P0-1..P0-4)', () => {
     const vfs = createVfs()
     const shell = createShell(vfs)
     await shell.exec('export XQ=stale')
-    // prefix assignment changes the env for this exec only — the xargs
-    // re-invocation must observe 99, which never lands in sessionEnv
-    const result = await shell.exec(`XQ=99 printf 'x\\n' | xargs bash -c 'echo \\$XQ' _`)
-    expect(result.stdout.trim()).toBe('99')
-    expect((await shell.exec('echo $XQ')).stdout.trim()).toBe('stale')
+    // the export lands mid-exec, after sessionEnv was snapshotted — the
+    // xargs re-invocation (a bare `env` dump per line) must observe the
+    // live 99, not the settled stale
+    const result = await shell.exec(`export XQ=99; printf 'XQ\\n' | xargs -I{} env | grep XQ`)
+    expect(result.stdout).toContain('99')
+    expect(result.stdout).not.toContain('stale')
+    // the export persists to the session afterwards, as always
+    expect((await shell.exec('echo $XQ')).stdout.trim()).toBe('99')
   })
 
   it('node -e leaves no temp eval files behind', async () => {
