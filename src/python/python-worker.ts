@@ -9,7 +9,7 @@ import { runPython, type PythonPayload } from './runner'
  * worker and reports a timeout.
  */
 
-const PYODIDE_VERSION = '0.27.7'
+import { version as PYODIDE_VERSION } from 'pyodide/package.json'
 /** wheels ALWAYS load relative to indexURL inside pyodide — so the primary
  * boot is the full CDN distribution (core + all data-science wheels). The
  * vendored copy under /vendor/pyodide/ is the offline fallback: a working
@@ -83,6 +83,9 @@ self.onmessage = async (event: MessageEvent<RunRequest>) => {
       self.postMessage({ type: 'vfs-write', id: msg.id, path: file.path, bytes: file.bytes }, [
         file.bytes.buffer as ArrayBuffer,
       ])
+    }
+    for (const path of result.deleted) {
+      self.postMessage({ type: 'vfs-delete', id: msg.id, path })
     }
     self.postMessage({ type: 'exit', id: msg.id, code: result.exitCode })
   } catch (err) {

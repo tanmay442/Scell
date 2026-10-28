@@ -165,4 +165,11 @@ describe('scripting: the agent workhorse', () => {
     const uniq = await shell.exec('printf "b\\na\\nb\\n" | sort | uniq -c | tr -s " "')
     expect(uniq.stdout).toContain('2 b')
   })
+
+  it('xargs batches GNU-style: all args at once, quoted, -n/-0 supported', async () => {
+    const { shell } = await auditShell()
+    expect((await shell.exec('printf "a\\nb\\n" | xargs echo')).stdout.trim()).toBe('a b')
+    expect((await shell.exec('printf "a b\\n" | xargs echo')).stdout.trim()).toBe('a b')
+    expect((await shell.exec('printf "a\\nb\\nc\\n" | xargs -n 2 echo')).stdout.trim()).toBe('a b\nc')
+  })
 })

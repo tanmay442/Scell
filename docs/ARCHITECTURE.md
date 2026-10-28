@@ -47,6 +47,11 @@ via presigned URLs (host issues them; the isolate holds no credentials).
 
 ## Library notes (from reading the sources)
 
+> Note (2026-10-28): the `vendor/` clones described below are history — the
+> build now uses the `just-bash` npm package and the committed
+> `public/wasm/` toolchain (`esbuild.wasm`, `ts_rust.wasm`, `lg2_async.wasm`).
+> The API notes still describe the libraries accurately.
+
 - **ts-rust** (`vendor/ts-rust/npm/wasm`): package `ts-rust-wasm`, exports
   `tsc(args, { files, diagnostics })`. Built by `scripts/wasm/build.sh`
   (wasm32-wasip1, cdylib, host provides the FS through two imports

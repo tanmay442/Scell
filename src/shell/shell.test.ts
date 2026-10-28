@@ -74,4 +74,40 @@ describe('shell over VFS', () => {
     seedStarterProject(vfs)
     expect(vfs.listAllFiles().length).toBe(files.length)
   })
+
+  it('forged env-dump markers in output do not set session vars', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    const spoof = await shell.exec(`echo '__CELL_ENV__:{"EVIL":"1"}'`)
+    expect(spoof.stdout).toContain('__CELL_ENV__')
+    const check = await shell.exec('echo "EVIL=${EVIL-unset}"')
+    expect(check.stdout).toContain('EVIL=unset')
+    // real exports still flow through
+    await shell.exec('export GOOD=1')
+    expect((await shell.exec('echo $GOOD')).stdout.trim()).toBe('1')
+  })
+
+  it('man rejects command injection in the page name', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    const result = await shell.exec('man "x; echo PWNED"')
+    expect(result.stdout).not.toContain('PWNED')
+    expect(result.exitCode).toBe(1)
+  })
+
+  it('writes through symlinks instead of shadowing them', async () => {
+    const vfs = createVfs()
+    vfs.write('/real.txt', 'a')
+    vfs.mkdir('/realdir')
+    const shell = createShell(vfs)
+    await shell.exec('ln -s /real.txt /link.txt && ln -s /realdir /linkdir')
+    await shell.exec('echo b > /link.txt')
+    expect(vfs.read('/real.txt')).toBe('b\n')
+    // no shadowing real file left behind; the link still resolves
+    expect(vfs.listAllFiles().includes('/link.txt')).toBe(false)
+    expect((await shell.exec('cat /link.txt')).stdout).toBe('b\n')
+    await shell.exec('echo hi > /linkdir/nested.txt')
+    expect(vfs.read('/realdir/nested.txt')).toBe('hi\n')
+    expect((await shell.exec('cat /linkdir/nested.txt')).stdout).toBe('hi\n')
+  })
 })

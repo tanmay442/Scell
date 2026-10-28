@@ -3,6 +3,7 @@ import { describe, expect, it, beforeAll } from 'vitest'
 import { createVfs } from '../vfs'
 import { seedStarterProject } from '../vfs/starter'
 import { runPython, type PythonRunResult } from './runner'
+import { version as PYODIDE_VERSION } from 'pyodide/package.json'
 
 /**
  * Python through the real Pyodide runtime (node build of the same version we
@@ -38,7 +39,7 @@ async function ensureWheels(): Promise<void> {
     const target = join(dir, pkg.file_name)
     if (existsSync(target)) continue
     mkdirSync(dirname(target), { recursive: true })
-    const response = await fetch(`https://cdn.jsdelivr.net/pyodide/v0.27.7/full/${pkg.file_name}`)
+    const response = await fetch(`https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/${pkg.file_name}`)
     if (!response.ok) throw new Error(`wheel fetch failed: ${name} ${response.status}`)
     writeFileSync(target, Buffer.from(await response.arrayBuffer()))
   }
@@ -83,6 +84,9 @@ async function runIn(vfs: ReturnType<typeof createVfs>, code: string, opts?: Par
       vfs.writeBytes(file.path, file.bytes)
     }
   }
+  for (const path of result.deleted) {
+    if (vfs.exists(path)) vfs.delete(path)
+  }
   return {
     result,
     stdout: out.filter((o) => o.stream === 'stdout').map((o) => o.text).join(''),
@@ -124,6 +128,29 @@ describe('python (pyodide) core', () => {
     expect(boom.result.exitCode).toBe(1)
     expect(boom.stderr).toContain('ValueError')
     expect(boom.stderr).toContain('analysis failed')
+  })
+
+  it('same-length edits propagate (byte compare, not length compare)', async () => {
+    const vfs = freshVfs()
+    vfs.write('/home/user/code.txt', 'aaa')
+    const { result, vfs: after } = await runIn(vfs, "open('/home/user/code.txt', 'w').write('bbb')")
+    expect(result.exitCode).toBe(0)
+    expect(after.read('/home/user/code.txt')).toBe('bbb')
+  })
+
+  it('os.remove deletes propagate instead of resurrecting', async () => {
+    const vfs = freshVfs()
+    vfs.write('/home/user/gone.txt', 'bye')
+    const { result, vfs: after } = await runIn(vfs, "import os; os.remove('/home/user/gone.txt')")
+    expect(result.exitCode).toBe(0)
+    expect(after.exists('/home/user/gone.txt')).toBe(false)
+  })
+
+  it('files in brand-new top-level dirs sync back', async () => {
+    const vfs = freshVfs()
+    const { result, vfs: after } = await runIn(vfs, "import os; os.makedirs('/data', exist_ok=True); open('/data/out.txt', 'w').write('made it')")
+    expect(result.exitCode).toBe(0)
+    expect(after.read('/data/out.txt')).toBe('made it')
   })
 
   it('scripts read files from the workspace and write files back', async () => {

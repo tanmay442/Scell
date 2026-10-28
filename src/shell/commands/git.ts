@@ -483,6 +483,27 @@ function relayedUrl(relay: string, url: string): string {
   return `${relay.replace(/\/+$/, '')}/${url}`
 }
 
+/** userinfo must never travel to a third-party relay host: strip
+ * `user:pass@` from the inner URL (the relayed clone then fails with 401
+ * instead of leaking the secret). Returns the relay URL plus whether
+ * anything was cut. */
+function sanitizeForRelay(relay: string, url: string): { relayUrl: string; stripped: boolean } {
+  let clean = url
+  let stripped = false
+  try {
+    const inner = new URL(url)
+    if (inner.username !== '' || inner.password !== '') {
+      inner.username = ''
+      inner.password = ''
+      clean = inner.toString()
+      stripped = true
+    }
+  } catch {
+    // not a parseable URL — pass through; the clone attempt reports it
+  }
+  return { relayUrl: relayedUrl(relay, clean), stripped }
+}
+
 function hostOf(url: string): string {
   try {
     return new URL(url).host
@@ -624,6 +645,15 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string, onProgress
   const target = explicitDir
     ? normalizePath(`${gitCwd}/${explicitDir}`)
     : normalizePath(`${gitCwd}/${repoNameFromUrl(url)}`)
+  // like real git: never clobber existing work
+  if (vfs.exists(target) && !(vfs.isDir(target) && vfs.readDir(target).length === 0)) {
+    const display = explicitDir ?? repoNameFromUrl(url)
+    return {
+      stdout: '',
+      stderr: `fatal: destination path '${display}' already exists and is not an empty directory.\n`,
+      exitCode: 1,
+    }
+  }
   onProgress?.(`Cloning into '${target.slice(target.lastIndexOf('/') + 1)}'...`)
 
   const relays = relaysFor(vfs)
@@ -649,10 +679,13 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string, onProgress
 
   const failures: { label: string; run: LgRun }[] = [{ label: 'direct', run: direct }]
   for (const relay of relays) {
-    const relayUrl = relayedUrl(relay, url)
+    const { relayUrl, stripped } = sanitizeForRelay(relay, url)
     if (await originBlocked(relayUrl)) continue // unreachable from this browser
     const note = `cloning via CORS relay ${relay} — ${hostOf(url)} does not allow direct browser access`
     onProgress?.(note)
+    if (stripped) {
+      onProgress?.('warning: credentials stripped — public relays never receive your secrets')
+    }
     const relayed = await attemptClone(vfs, relayUrl, target, gitCwd, 150_000, onProgress)
     if (relayed.ok && relayed.mod) {
       syncMemfsToVfs(relayed.mod, vfs)
@@ -705,8 +738,12 @@ async function runNetworkCommand(
   }
 
   const useRelay = relay !== null && remoteUrl !== null
-  if (useRelay) {
-    memfsSetRemoteUrl(mod, gitCwd, relayedUrl(relay!, remoteUrl!))
+  const sanitized = useRelay ? sanitizeForRelay(relay!, remoteUrl!) : null
+  if (useRelay && sanitized) {
+    memfsSetRemoteUrl(mod, gitCwd, sanitized.relayUrl)
+    if (sanitized.stripped) {
+      onProgress?.('warning: credentials stripped — public relays never receive your secrets')
+    }
   }
   const note = useRelay
     ? `${lgArgs[0]}ing via CORS relay ${relay} — ${hostOf(remoteUrl!)} does not allow direct browser access`

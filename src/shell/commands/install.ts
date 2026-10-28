@@ -1,6 +1,7 @@
 import type { Vfs } from '../../vfs/types'
 import { vfsPath } from '../../vfs/types'
 import { fetchMetadata, fetchTarballEntries, pickVersion, type RegistryVersion } from './registry'
+import { satisfies } from 'semver'
 
 /**
  * Dependency installer: BFS over the semver graph, flat hoisting with
@@ -76,16 +77,11 @@ export async function installPackages(
     if (existing !== null) {
       try {
         const installedVersion = (existing as { version?: string }).version
-        // already satisfied? then this edge of the graph is done
-        const metadata = await fetchMetadata(realName)
-        try {
-          const resolved = pickVersion(metadata, realRange)
-          if (resolved.version === installedVersion) continue
-        } catch {
-          continue // range unresolvable but the package is present — keep it
-        }
+        // satisfied is done: bare installs keep what's there, ranged ones
+        // keep a version in range (previously any non-latest reinstalled)
+        if (typeof installedVersion === 'string' && satisfies(installedVersion, realRange ?? '*', { includePrerelease: true })) continue
       } catch {
-        // corrupt manifest — reinstall over it
+        // corrupt manifest or unparseable range — reinstall over it
       }
     }
 

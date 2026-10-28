@@ -7,13 +7,25 @@
  */
 import http from 'node:http'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const root = mkdtempSync(join(tmpdir(), 'cell-gitserver-'))
 const bare = join(root, 'testrepo.git')
 const work = join(root, 'seed-work')
+
+// fail fast with install instructions instead of cryptic CGI errors later
+try {
+  const execPath = spawnSync('git', ['--exec-path'], { encoding: 'utf8' })
+  const backend = join((execPath.stdout ?? '').trim(), 'git-http-backend')
+  if (execPath.status !== 0 || !existsSync(backend)) {
+    throw new Error('no http-backend')
+  }
+} catch {
+  console.error('git-http-server: needs git with the http-backend CGI helper (apt: git, brew: git, dnf: git)')
+  process.exit(1)
+}
 
 const git = (cwd, ...args) => {
   const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' })

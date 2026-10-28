@@ -76,8 +76,11 @@ function send(message: unknown) {
 
 // ---- the sandbox filesystem -------------------------------------------
 
+/** explicitly mkdir'd dirs have no files yet — track them so existsSync,
+ * statSync and readdirSync see just-created empty dirs (implied-dir model) */
+const explicitDirs = new Set<string>()
 function listDirs(): Set<string> {
-  const dirs = new Set<string>(['/'])
+  const dirs = new Set<string>(['/', ...explicitDirs])
   for (const path of fileList()) {
     let dir = path
     while ((dir = dir.slice(0, dir.lastIndexOf('/')))) dirs.add(dir)
@@ -105,7 +108,8 @@ function resolveFsPath(p: string): string {
 
 const sandboxFs = {
   existsSync(path: string) {
-    return fileHas(resolveFsPath(path))
+    const resolved = resolveFsPath(path)
+    return fileHas(resolved) || listDirs().has(resolved)
   },
   statSync(rawPath: string) {
     const path = resolveFsPath(rawPath)
@@ -146,7 +150,7 @@ const sandboxFs = {
     fileDelete(path)
   },
   mkdirSync(path: string, _options?: { recursive?: boolean }) {
-    // the in-memory fs is flat; directories are implied
+    explicitDirs.add(resolveFsPath(path))
   },
   rmdirSync(path: string) {
     for (const key of fileList()) {
@@ -352,8 +356,11 @@ function latin1ToBytes(text: string): Uint8Array {
 }
 
 function base64ToBytes(text: string): Uint8Array {
-  const clean = text.replace(/[^A-Za-z0-9+/]/g, '')
-  const out = new Uint8Array(Math.floor((clean.length * 3) / 4))
+  // keep padding: without it short inputs decode to empty output
+  const stripped = text.replace(/[^A-Za-z0-9+/=]/g, '')
+  const clean = stripped + '='.repeat((4 - (stripped.length % 4)) % 4)
+  const pad = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4) - pad)
   let offset = 0
   for (let i = 0; i + 3 < clean.length + 1; i += 4) {
     const n =
@@ -375,6 +382,55 @@ function base64Index(ch: string): number {
   if (ch === '+') return 62
   if (ch === '/') return 63
   return 0
+}
+
+/** Synchronous SHA-256 (FIPS 180-4) for crypto.createHash('sha256').
+ * The sandbox digest() is synchronous, so WebCrypto (async-only) cannot
+ * serve it — this blocking implementation does. */
+function sha256Hex(bytes: Uint8Array): string {
+  const k = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ]
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19
+  const bitLen = bytes.length * 8
+  const paddedLen = (((bytes.length + 8) >> 6) + 1) << 6
+  const padded = new Uint8Array(paddedLen)
+  padded.set(bytes)
+  padded[bytes.length] = 0x80
+  const view = new DataView(padded.buffer)
+  view.setUint32(paddedLen - 4, bitLen >>> 0)
+  view.setUint32(paddedLen - 8, Math.floor(bitLen / 0x100000000))
+  const w = new Array<number>(64)
+  const rotr = (x: number, n: number): number => (x >>> n) | (x << (32 - n))
+  for (let off = 0; off < paddedLen; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4)
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7
+    for (let i = 0; i < 64; i++) {
+      const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+      const ch = (e & f) ^ (~e & g)
+      const t1 = (h + s1 + ch + k[i] + w[i]) | 0
+      const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+      const maj = (a & b) ^ (a & c) ^ (b & c)
+      const t2 = (s0 + maj) | 0
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0
+    h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0
+  }
+  return [h0, h1, h2, h3, h4, h5, h6, h7].map((x) => (x >>> 0).toString(16).padStart(8, '0')).join('')
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -412,9 +468,10 @@ const pathShim = {
     let resolved = ''
     for (const segment of segments) {
       if (segment.startsWith('/')) resolved = segment
+      else if (resolved === '') resolved = `${processShim.cwd()}/${segment}`
       else resolved = `${resolved}/${segment}`
     }
-    return normalize(resolved)
+    return normalize(resolved === '' ? processShim.cwd() : resolved)
   },
   normalize(p: string) {
     return normalize(p)
@@ -719,8 +776,8 @@ function makeRequire(fromFile: string) {
       BufferShim,
       trackedSetTimeout,
       trackedSetInterval,
-      clearTimeout,
-      clearInterval,
+      trackedClearTimeout,
+      trackedClearInterval,
       (fn2: () => void) => trackedSetTimeout(fn2, 0),
       queueMicrotask,
       fetch,
@@ -737,6 +794,20 @@ function makeRequire(fromFile: string) {
 }
 
 function builtinModule(name: string, fromFile: string): unknown {
+  // subpath imports: resolve the root, then take a provided member —
+  // require('fs/promises') is the promises API, not a node_modules lookup
+  const slash = name.indexOf('/')
+  if (slash !== -1) {
+    const rootMod = builtinModule(name.slice(0, slash), fromFile) as Record<string, unknown> | null
+    const rest = name.slice(slash + 1)
+    if (rootMod !== null && typeof rootMod === 'object' && rest in rootMod) {
+      return rootMod[rest]
+    }
+    throw nodeError(
+      'ERR_MODULE_NOT_FOUND',
+      `Cannot find module '${name}' (required from ${fromFile})`,
+    )
+  }
   switch (name) {
     case 'fs':
       return { ...sandboxFs, promises: fsPromises, default: sandboxFs }
@@ -750,8 +821,22 @@ function builtinModule(name: string, fromFile: string): unknown {
       return {
         format,
         inspect: (value: unknown) => inspect(value, 1),
-        promisify: (fn: (...args: unknown[]) => unknown) => fn,
-        callbackify: (fn: (...args: unknown[]) => unknown) => fn,
+        promisify: (fn: (...args: unknown[]) => unknown) => (...args: unknown[]) =>
+          new Promise((resolve, reject) => {
+            ;(fn as (...a: unknown[]) => unknown)(...args, (err: unknown, ...values: unknown[]) => {
+              if (err !== null && err !== undefined) reject(err)
+              else resolve(values[0])
+            })
+          }),
+        callbackify: (fn: (...args: unknown[]) => unknown) => (...args: unknown[]) => {
+          const callback = args.pop() as (err: unknown, value?: unknown) => void
+          Promise.resolve()
+            .then(() => (fn as (...a: unknown[]) => unknown)(...args))
+            .then(
+              (value) => callback(null, value),
+              (err) => callback(err ?? new Error('callbackified function rejected')),
+            )
+        },
         types: { isDate: (v: unknown) => v instanceof Date, isPromise: (v: unknown) => v instanceof Promise },
         default: { format, inspect: (value: unknown) => inspect(value, 1) },
       }
@@ -772,7 +857,16 @@ function builtinModule(name: string, fromFile: string): unknown {
         return out
       }
       const createHash = (algorithm: string) => {
-        void algorithm // sha1/sha256/md5-shaped; sha256 used for all
+        const algo = algorithm.toLowerCase().replace(/-/g, '')
+        // the sandbox has no async boundary for digest(), so only sha256
+        // ships (real, blocking, FIPS 180-4 below). Anything else fails
+        // loudly — a lookalike hex digest would corrupt integrity checks.
+        if (algo !== 'sha256') {
+          throw nodeError(
+            'ERR_CRYPTO_UNKNOWN_DIGEST',
+            `Digest method not supported in the Cell sandbox: ${algorithm} (sha256 is available)`,
+          )
+        }
         let data = ''
         return {
           update(input: string | Uint8Array) {
@@ -780,20 +874,7 @@ function builtinModule(name: string, fromFile: string): unknown {
             return this
           },
           digest(encoding?: string) {
-            // WebCrypto needs the bytes; hash the utf8 of the accumulated data
-            const bytes = encoder.encode(data)
-            const digest = new Uint8Array(bytes.byteLength * 2) // placeholder replaced below
-            void digest
-            // synchronous hashing is not available via subtle — use a simple
-            // deterministic fallback: djb2-style over the content, hex form.
-            // Real cryptographic hashing arrives with the async API below.
-            let h1 = 0xdeadbeef
-            let h2 = 0x41c6ce57
-            for (let i = 0; i < bytes.length; i++) {
-              h1 = (Math.imul(h1 ^ bytes[i], 2654435761) >>> 0)
-              h2 = (Math.imul(h2 ^ bytes[i], 1597334677) >>> 0)
-            }
-            const hex = toHex(new Uint8Array([h1 >>> 24, (h1 >>> 16) & 0xff, (h1 >>> 8) & 0xff, h1 & 0xff, h2 >>> 24, (h2 >>> 16) & 0xff, (h2 >>> 8) & 0xff, h2 & 0xff, bytes.length >>> 24, (bytes.length >>> 16) & 0xff, (bytes.length >>> 8) & 0xff, bytes.length & 0xff, 0x5e, 0x3d, 0x7a, 0x9b]))
+            const hex = sha256Hex(encoder.encode(data))
             return encoding === 'hex' ? hex : BufferShim.from(hex, 'hex')
           },
         }
@@ -835,7 +916,7 @@ function builtinModule(name: string, fromFile: string): unknown {
         default: {},
       }
     case 'timers':
-      return { setTimeout, setInterval, clearTimeout, clearInterval, setImmediate: (fn: () => void) => setTimeout(fn, 0), default: {} }
+      return { setTimeout: trackedSetTimeout, setInterval: trackedSetInterval, clearTimeout: trackedClearTimeout, clearInterval: trackedClearInterval, setImmediate: (fn: () => void) => trackedSetTimeout(fn, 0), default: {} }
     case 'string_decoder':
       return { StringDecoder: class StringDecoder { decode(bytes: Uint8Array) { return decoder.decode(bytes) } }, default: {} }
     default:
@@ -892,27 +973,43 @@ async function drainEventLoop(quietMs = 120, capMs = 240_000): Promise<void> {
 /** every setTimeout/setInterval bumps this epoch */
 let pendingTimerEpoch = 0
 let pendingTimers = 0
+const pendingTimerHandles = new Set<ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>>()
 function trackedSetTimeout(fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]): ReturnType<typeof setTimeout> {
   pendingTimerEpoch++
   pendingTimers++
-  return setTimeout(() => {
+  const handle = setTimeout(() => {
     pendingTimers--
+    pendingTimerHandles.delete(handle)
     try {
       fn(...rest)
     } catch (err) {
       currentStderr(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)
     }
   }, ms)
+  pendingTimerHandles.add(handle)
+  return handle
 }
 function trackedSetInterval(fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]): ReturnType<typeof setInterval> {
   pendingTimerEpoch++
-  return setInterval(() => {
+  const handle = setInterval(() => {
     try {
       fn(...rest)
     } catch (err) {
       currentStderr(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`)
     }
   }, ms)
+  pendingTimerHandles.add(handle)
+  return handle
+}
+/** clears must release the tracked handle — otherwise a cleared timer
+ * makes the event-loop drain spin until the host timeout kills the run */
+function trackedClearTimeout(handle: unknown): void {
+  if (pendingTimerHandles.delete(handle as ReturnType<typeof setTimeout>)) pendingTimers--
+  clearTimeout(handle as ReturnType<typeof setTimeout>)
+}
+function trackedClearInterval(handle: unknown): void {
+  pendingTimerHandles.delete(handle as ReturnType<typeof setInterval>)
+  clearInterval(handle as ReturnType<typeof setInterval>)
 }
 
 self.onmessage = async (event: MessageEvent<ExecRequest>) => {
@@ -920,6 +1017,9 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
   if (msg.type !== 'exec') return
   currentId = msg.id
   moduleCache.clear()
+  pendingTimerHandles.clear()
+  pendingTimers = 0
+  explicitDirs.clear()
   if (msg.env) Object.assign(processShim.env, msg.env)
   // the sandbox speaks strings; binaries decode lossily on load — same
   // semantics as always, just off the main thread now

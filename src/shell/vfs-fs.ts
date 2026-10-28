@@ -138,11 +138,24 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   private followSymlink(p: string, depth = 0): string {
+    void depth
     let cur = normalize(p)
     for (let i = 0; i < 10; i++) {
       const target = this.symlinks.get(cur)
-      if (target === undefined) return cur
-      cur = target.startsWith('/') ? normalize(target) : normalize(`${normalize(cur)}/../${target}`)
+      if (target !== undefined) {
+        cur = target.startsWith('/') ? normalize(target) : normalize(`${normalize(cur)}/../${target}`)
+        continue
+      }
+      // resolve through a parent link: /link/sub/file sees /link -> target
+      const slash = cur.lastIndexOf('/')
+      if (slash <= 0) return cur
+      const parent = cur.slice(0, slash)
+      const parentTarget = this.symlinks.get(parent)
+      if (parentTarget === undefined) return cur
+      const rest = cur.slice(slash)
+      cur = parentTarget.startsWith('/')
+        ? normalize(parentTarget + rest)
+        : normalize(`${parent}/../${parentTarget}${rest}`)
     }
     return cur
   }
@@ -240,7 +253,9 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async writeFile(path: string, content: FileContent, _options?: WriteFileOptions | BufferEncoding): Promise<void> {
-    const z = this.locate(path)
+    // writes follow links (like real fs): otherwise a write through a link
+    // creates a shadowing real file while reads keep hitting the target
+    const z = this.locate(this.followSymlink(path))
     if (z.zone === 'devnull') return
     if (z.zone === 'vfs') {
       // bytes go in as bytes — package tarballs must round-trip exactly
@@ -300,7 +315,7 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async mkdir(path: string, options?: MkdirOptions): Promise<void> {
-    const z = this.locate(path)
+    const z = this.locate(this.followSymlink(path))
     if (z.zone === 'vfs') {
       if (!options?.recursive && !this.vfs.isDir(this.parentOf(z.vpath))) {
         throw new Error(`ENOENT: no such directory '${path}'`)

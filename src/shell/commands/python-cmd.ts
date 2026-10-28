@@ -21,7 +21,7 @@ function hideInternal(paths: string[]): string[] {
   return paths.filter((p) => p.includes('/node_modules/') || p.includes('/.git/'))
 }
 
-export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: string; env?: Map<string, string>; stdin?: string }): Promise<CommandResult> {
+export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: string; env?: Map<string, string>; stdin?: string; progress?: (line: string) => void }): Promise<CommandResult> {
   if (args[0] === '--version' || args[0] === '-V') {
     return { stdout: 'Python 3.12.7\n', stderr: '', exitCode: 0 }
   }
@@ -80,7 +80,6 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
   return new Promise<CommandResult>((resolve) => {
     let stdout = ''
     let stderr = ''
-    let status = ''
     let settled = false
     const MAX_OUTPUT = 4 * 1024 * 1024
     const append = (stream: 'stdout' | 'stderr', text: string) => {
@@ -96,8 +95,7 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
       settled = true
       clearTimeout(timer)
       worker.terminate()
-      const note = status !== '' ? `\n${status}` : ''
-      resolve({ stdout, stderr: stderr + note, exitCode: result.exitCode })
+      resolve({ stdout, stderr, exitCode: result.exitCode })
     }
 
     // pyodide has no interruption API without SharedArrayBuffer — a wedged
@@ -112,19 +110,26 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
         | { type: 'out'; stream: 'stdout' | 'stderr'; text: string }
         | { type: 'status'; text: string }
         | { type: 'vfs-write'; path: string; bytes: Uint8Array }
+        | { type: 'vfs-delete'; path: string }
         | { type: 'exit'; code: number }
       switch (msg.type) {
         case 'out':
           append(msg.stream, msg.text)
           break
         case 'status':
-          status = `${status}${status === '' ? '' : '\n'}${msg.text}`
+          // loader chatter rides the live progress line, never stderr —
+          // 2> captures and agent transcripts must see program output only
+          opts.progress?.(msg.text)
           break
         case 'vfs-write': {
           if (!msg.path.startsWith('/')) break
           const copy = new Uint8Array(msg.bytes)
           if (looksLikeText(copy)) vfs.write(msg.path, new TextDecoder().decode(copy))
           else vfs.writeBytes(msg.path, copy)
+          break
+        }
+        case 'vfs-delete': {
+          if (msg.path.startsWith('/') && vfs.exists(msg.path)) vfs.delete(msg.path)
           break
         }
         case 'exit':

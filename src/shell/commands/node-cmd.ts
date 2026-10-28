@@ -36,13 +36,40 @@ export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string;
     }
   }
 
-  const entry = vfsPath.normalize(entryArg.startsWith('/') ? entryArg : `${cwd === '/' ? '' : cwd}/${entryArg}`)
+  let entry = vfsPath.normalize(entryArg.startsWith('/') ? entryArg : `${cwd === '/' ? '' : cwd}/${entryArg}`)
   if (!vfs.exists(entry)) {
     return {
       stdout: '',
       stderr: `node: cannot find module '${entryArg}' (looked in ${cwd})\n`,
       exitCode: 1,
     }
+  }
+  // directories load like real node: package.json main, else index.js
+  if (vfs.isDir(entry)) {
+    const manifestRaw = vfs.read(`${entry}/package.json`)
+    let main: string | null = null
+    if (manifestRaw !== null) {
+      try {
+        const manifest = JSON.parse(manifestRaw) as { main?: unknown }
+        if (typeof manifest.main === 'string') main = manifest.main
+      } catch {
+        // ignore a broken manifest, fall through to index.js
+      }
+    }
+    const candidates = [
+      ...(main !== null ? [`${entry}/${main}`] : []),
+      `${entry}/index.js`,
+      `${entry}/index.json`,
+    ]
+    const resolved = candidates.find((candidate) => vfs.isFile(candidate))
+    if (resolved === undefined) {
+      return {
+        stdout: '',
+        stderr: `node: cannot find module '${entryArg}' (directory has no index.js)\n`,
+        exitCode: 1,
+      }
+    }
+    entry = vfsPath.normalize(resolved)
   }
 
   if (isTypeScript(entry)) {

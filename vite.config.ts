@@ -12,6 +12,9 @@ export default defineConfig({
     },
   },
   server: {
+    // README, all e2e scripts and the preview probes agree on :5199 —
+    // pin it so plain `pnpm dev` lands there instead of vite's :5173
+    port: 5199,
     fs: { allow: ['..'] },
   },
   worker: { format: 'es' },

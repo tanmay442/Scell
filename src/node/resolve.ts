@@ -74,9 +74,61 @@ function packageEntry(fs: ResolverFs, pkgDir: string): string | null {
   return fs.isFile(index) ? index : null
 }
 
+function readManifest(fs: ResolverFs, pkgDir: string): Record<string, unknown> | null {
+  const text = fs.readText(join(pkgDir, 'package.json'))
+  if (text === null) return null
+  try {
+    return JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+/** pick a string target from an exports-map node, CJS conditions first */
+function exportsTargetFs(node: unknown, depth = 0): string | null {
+  if (depth > 6 || node === undefined) return null
+  if (typeof node === 'string') return node
+  if (node !== null && typeof node === 'object' && !Array.isArray(node)) {
+    const map = node as Record<string, unknown>
+    for (const key of ['node', 'require', 'default', 'browser', 'import', 'module']) {
+      const picked = exportsTargetFs(map[key], depth + 1)
+      if (picked !== null) return picked
+    }
+  }
+  return null
+}
+
+/** resolve a `pkg/subpath` through the package exports map (exact + `*`). */
+function exportsSubpath(fs: ResolverFs, pkgDir: string, subpath: string): string | null {
+  const manifest = readManifest(fs, pkgDir)
+  const exportsField = manifest?.exports as Record<string, unknown> | undefined
+  if (exportsField === undefined || typeof exportsField === 'string') return null
+  const resolveTarget = (node: unknown, rest = ''): string | null => {
+    const target = exportsTargetFs(node)
+    if (target === null) return null
+    const substituted = rest !== '' && target.includes('*') ? target.replace('*', rest) : target
+    return tryCandidates(fs, join(pkgDir, substituted.replace(/^\.\//, '')))
+  }
+  const wanted = `./${subpath}`
+  if (wanted in exportsField) {
+    const found = resolveTarget(exportsField[wanted])
+    if (found !== null) return found
+  }
+  for (const [pattern, node] of Object.entries(exportsField)) {
+    const star = pattern.indexOf('*')
+    if (star === -1) continue
+    const prefix = pattern.slice(0, star)
+    const suffix = pattern.slice(star + 1)
+    if (wanted.startsWith(prefix) && wanted.endsWith(suffix) && wanted.length >= prefix.length + suffix.length) {
+      const found = resolveTarget(node, wanted.slice(prefix.length, wanted.length - suffix.length))
+      if (found !== null) return found
+    }
+  }
+  return null
+}
+
 /** Minimal exports-field support: '.', string or condition objects. */
-function pickExports(exportsField: unknown, depth = 0): string | null {
-  if (depth > 6) return null
+function pickExports(exportsField: unknown, depth = 0): string | null {  if (depth > 6) return null
   if (typeof exportsField === 'string') return exportsField
   if (exportsField && typeof exportsField === 'object' && !Array.isArray(exportsField)) {
     const obj = exportsField as Record<string, unknown>
@@ -109,19 +161,36 @@ function tryCandidates(fs: ResolverFs, base: string): string | null {
 }
 
 export function resolveId(fs: ResolverFs, fromFile: string, id: string): Resolved {
-  if (NODE_BUILTINS.has(id) || id.startsWith('node:')) {
-    return { kind: 'builtin', name: id.replace(/^node:/, '') }
+  // builtins match the root segment: require('fs/promises') and
+  // require('node:path/posix') must not fall through to node_modules
+  const bare = id.startsWith('node:') ? id.slice('node:'.length) : id
+  if (NODE_BUILTINS.has(bare.split('/')[0])) {
+    return { kind: 'builtin', name: bare }
   }
   if (id.startsWith('./') || id.startsWith('../') || id.startsWith('/')) {
     const base = id.startsWith('/') ? normalize(id) : join(dirname(fromFile), id)
     const found = tryCandidates(fs, base)
     return found !== null ? { kind: 'file', path: found } : { kind: 'not-found', id, from: fromFile }
   }
-  // bare specifier: walk node_modules upward
+  // bare specifier: split off any subpath (scoped names carry one slash of
+  // their own), then walk node_modules upward
+  const parts = id.split('/')
+  const pkgName = parts[0].startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]
+  const subpath = parts.slice(pkgName.split('/').length).join('/')
   let dir = dirname(fromFile)
   for (;;) {
-    const found = tryCandidates(fs, join(dir, `node_modules/${id}`))
-    if (found !== null) return { kind: 'file', path: found }
+    const pkgDir = join(dir, `node_modules/${pkgName}`)
+    if (subpath !== '') {
+      // exports map first (condition + `*` patterns), then the legacy
+      // direct-file layout
+      const viaExports = exportsSubpath(fs, pkgDir, subpath)
+      if (viaExports !== null) return { kind: 'file', path: viaExports }
+      const found = tryCandidates(fs, join(pkgDir, subpath))
+      if (found !== null) return { kind: 'file', path: found }
+    } else {
+      const found = tryCandidates(fs, pkgDir)
+      if (found !== null) return { kind: 'file', path: found }
+    }
     if (dir === '/') break
     dir = dirname(dir)
   }

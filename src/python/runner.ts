@@ -47,6 +47,15 @@ function inSkip(path: string): boolean {
   return false
 }
 
+/** byte-exact compare — length alone silently drops same-length edits */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
 /** A python error surfaces as PythonError with the full traceback text. */
 function describeError(err: unknown): { text: string; exitCode: number } {
   const raw = String((err as { message?: string })?.message ?? err)
@@ -207,16 +216,17 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
     }
   }
 
-  // ---- filesystem out: diff against what came in. Walk ONLY the payload's
-  // top-level prefixes — wheels unpack package data into the pyodide root
-  // (/share, /lib, …) which must never sync back to the workspace.
-  const input = new Map<string, number>()
-  const roots = new Set<string>()
-  for (const [path, , length] of payload.index) {
-    input.set(path, length)
-    roots.add('/' + (path.slice(1).split('/')[0] ?? ''))
+  // ---- filesystem out: diff against what came in. Walk the whole MEMFS
+  // root and rely on the skip-list (runtime dirs + volatile /tmp): payload-
+  // derived roots missed files created in brand-new top-level dirs, while
+  // node_modules/.git never enter the payload and must never sync back.
+  const input = new Map<string, { offset: number; length: number }>()
+  for (const [path, offset, length] of payload.index) {
+    input.set(path, { offset, length })
   }
   const written: PythonWrittenFile[] = []
+  const seen = new Set<string>()
+  const shadowed = (path: string): boolean => path.includes('/node_modules/') || path.includes('/.git/')
   const walk = (dir: string) => {
     let names: string[]
     try {
@@ -227,7 +237,7 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
     for (const name of names) {
       if (name === '.' || name === '..') continue
       const full = dir === '/' ? `/${name}` : `${dir}/${name}`
-      if (inSkip(full)) continue
+      if (inSkip(full) || shadowed(full)) continue
       let stat: any
       try {
         stat = FS.stat(full)
@@ -237,15 +247,16 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
       if (FS.isDir(stat.mode)) {
         walk(full)
       } else {
+        seen.add(full)
         const bytes: Uint8Array = FS.readFile(full)
-        if (input.get(full) !== bytes.length) {
+        const prev = input.get(full)
+        if (prev === undefined || !bytesEqual(payload.buffer.subarray(prev.offset, prev.offset + prev.length), bytes)) {
           written.push({ path: full, bytes: new Uint8Array(bytes) })
         }
       }
     }
   }
-  for (const root of roots) {
-    if (root !== '/' && root !== '') walk(root)
-  }
-  return { exitCode, written, deleted: [] }
+  walk('/')
+  const deleted = [...input.keys()].filter((path) => !seen.has(path) && !shadowed(path))
+  return { exitCode, written, deleted }
 }

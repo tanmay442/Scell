@@ -18,12 +18,15 @@ export interface ShellLike {
   exec(cmd: string, cwd?: string): Promise<{ stdout: string; stderr: string; exitCode: number }>
 }
 
+/** session env carried into npm script shells (a real child inherits them) */
+export type ScriptEnv = Map<string, string> | undefined
+
 /**
  * npm (and pnpm, which routes here): init with templates, install from the
  * real registry, run scripts through a fresh shell, and npx for bins.
  */
-export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void; progress?: (line: string) => void }): Promise<CommandResult> {
-  const { cwd, scriptShell, flavor } = opts
+export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string, env?: ScriptEnv) => ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void; progress?: (line: string) => void; env?: ScriptEnv }): Promise<CommandResult> {
+  const { cwd, scriptShell, flavor, env } = opts
   const [sub = 'help', ...rest] = args
 
     if (sub === '--version' || sub === '-v') return ok(`${flavor === 'npm' ? '10.9.5' : '10.5.2'}\n`)
@@ -43,12 +46,12 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   if (sub === 'run' || sub === 'run-script') {
     const script = rest[0]
     if (!script) return listScripts(vfs, cwd)
-    return runScript(vfs, script, rest.slice(1), { cwd, scriptShell })
+    return runScript(vfs, script, rest.slice(1), { cwd, scriptShell, env })
   }
 
-  if (sub === 'test') return runScript(vfs, 'test', rest, { cwd, scriptShell })
-  if (sub === 'start') return runScript(vfs, 'start', rest, { cwd, scriptShell })
-  if (sub === 'stop') return runScript(vfs, 'stop', rest, { cwd, scriptShell })
+  if (sub === 'test') return runScript(vfs, 'test', rest, { cwd, scriptShell, env })
+  if (sub === 'start') return runScript(vfs, 'start', rest, { cwd, scriptShell, env })
+  if (sub === 'stop') return runScript(vfs, 'stop', rest, { cwd, scriptShell, env })
 
   if (sub === 'ls' || sub === 'list') return npmLs(vfs, cwd)
 
@@ -59,16 +62,17 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   // npm itself has worked this way since v7; runScript's missing-script
   // error lists what does exist
   if (!['help', 'uninstall', 'remove', 'rm', 'update', 'link', 'unlink', 'pack', 'publish', 'audit', 'outdated', 'ci'].includes(sub)) {
-    return runScript(vfs, sub, rest, { cwd, scriptShell })
+    return runScript(vfs, sub, rest, { cwd, scriptShell, env })
   }
 
   return fail(`${flavor}: '${sub}' is not implemented in Cell yet. Supported: init, install (-g), uninstall, run, test, start, ls, exec/npx, info.\n`)
 }
 
 export async function npx(vfs: Vfs, args: string[], opts: { cwd: string; progress?: (line: string) => void }): Promise<CommandResult> {
-  const name = args.find((a) => !a.startsWith('-'))
+  const nameIndex = args.findIndex((a) => !a.startsWith('-'))
+  const name = nameIndex === -1 ? undefined : args[nameIndex]
   if (!name) return fail('npx: specify a package binary to run, e.g. npx cowsay hi\n')
-  const binArgs = args.slice(1)
+  const binArgs = args.slice(nameIndex + 1)
 
   // 1. an installed bin — project-local first (walk up), then global
   const direct = findBins(vfs, opts.cwd).get(name)
@@ -130,8 +134,13 @@ function looksLikeEsm(source: string): boolean {
 function looksLikeJs(vfs: Vfs, entry: string): boolean {
   const bytes = vfs.readBytes(entry)
   if (bytes === null) return false
+  // null bytes mean a real binary — never execute the bytes as text
+  for (let i = 0; i < Math.min(bytes.length, 512); i++) {
+    if (bytes[i] === 0) return false
+  }
   const head = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, 512))
-  return /^\s*(#!.*\n)?\s*(\/\/|\/\*|"use strict"|import |const |let |var |require\(|async |function )/m.test(head)
+  if (/^#!.*\bnode\b/.test(head)) return true
+  return /^\s*(#!.*\n)?\s*(\/\/|\/\*|"use strict"|import |export |const |let |var |require\(|async |function |!function\(|\(\s*function)/m.test(head)
 }
 
 async function npmInit(vfs: Vfs, args: string[], opts: { cwd: string; flavor: 'npm' | 'pnpm' }): Promise<CommandResult> {
@@ -298,9 +307,9 @@ function listScripts(vfs: Vfs, cwd: string): CommandResult {
   return ok(`Scripts available:\n${names.map((n) => `  ${n}\n    ${scripts[n]}`).join('\n')}\n`)
 }
 
-async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike }): Promise<CommandResult> {
+async function runScript(vfs: Vfs, script: string, extraArgs: string[], opts: { cwd: string; scriptShell: (cwd: string, env?: ScriptEnv) => ShellLike; env?: ScriptEnv }): Promise<CommandResult> {
   const { cwd } = opts
-  const shell = opts.scriptShell(cwd)
+  const shell = opts.scriptShell(cwd, opts.env)
   const manifest = readManifest(vfs, `${projectRoot(vfs, cwd) ?? cwd}/package.json`)
   if (!manifest) return fail(`npm ERR! no package.json in ${cwd}\n`)
   const scripts = (manifest.scripts as Record<string, string> | undefined) ?? {}
@@ -362,7 +371,7 @@ function vfsPathBasename(cwd: string): string {
   return n === '' ? 'workspace' : n.slice(n.lastIndexOf('/') + 1)
 }
 
-export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; registerLive?: (name: string) => void; progress?: (line: string) => void }) =>
+export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string, env?: ScriptEnv) => ShellLike; registerLive?: (name: string) => void; progress?: (line: string) => void; env?: ScriptEnv }) =>
   args[0] === 'dlx'
     ? npx(vfs, args.slice(1), { cwd: opts.cwd })
     : npmCommand(vfs, args, { ...opts, flavor: 'pnpm' })

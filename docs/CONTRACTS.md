@@ -72,6 +72,7 @@ CodeMirror lint wiring; it must not change contracts and must keep
 4. Do not `git commit` — the lead commits.
 5. Another agent is working in sibling directories concurrently. Never touch
    `pnpm-lock.yaml`, `package.json`, or anything outside your map.
-6. Study the vendored sources before coding:
+6. Study the library sources before coding (historical paths — the `vendor/`
+   clones predate the npm/web builds; see the note in ARCHITECTURE.md):
    - `vendor/just-bash/packages/just-bash/src/fs/interface.ts` (Fs adapter)
    - `vendor/ts-rust/npm/wasm/` (README, core.js, core.d.ts, browser.js)

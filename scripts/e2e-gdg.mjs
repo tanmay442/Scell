@@ -5,12 +5,29 @@
  * bundle & mount the React app in the preview iframe. Same proven
  * harness as scripts/e2e-scribe.mjs.
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const APP = 'http://localhost:5199/'
+const APP = process.env.APP_URL ?? 'http://localhost:5199/'
+const CHROME = process.env.CHROME_BIN ?? 'google-chrome-stable'
+
+// fail fast with a usable message instead of a DevTools-timeout mystery
+try {
+  const probe = await fetch(APP)
+  await probe.arrayBuffer().catch(() => {})
+} catch {
+  console.error(`e2e: dev server not reachable at ${APP} — run \`pnpm dev\` first (override with APP_URL)`)
+  process.exit(1)
+}
+{
+  const check = spawnSync(CHROME, ['--version'], { encoding: 'utf8' })
+  if (check.status !== 0) {
+    console.error(`e2e: chrome not runnable as '${CHROME}' — install google-chrome-stable (override with CHROME_BIN)`)
+    process.exit(1)
+  }
+}
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function connect(wsUrl) {
@@ -47,7 +64,7 @@ function connect(wsUrl) {
 }
 
 const profile = mkdtempSync(join(tmpdir(), 'cell-gdg-'))
-const chrome = spawn('google-chrome-stable', [
+const chrome = spawn(CHROME, [
   '--headless=new',
   '--disable-gpu',
   '--no-sandbox',

@@ -3,7 +3,7 @@ import { platform } from '../platform'
 import type { Vfs } from '../vfs/types'
 import { VfsBackedFs } from './vfs-fs'
 import { nodeCommand } from './commands/node-cmd'
-import { npmCommand, npx, pnpmCommand, runNodeEntry, type CommandResult } from './commands/npm'
+import { npmCommand, npx, pnpmCommand, runNodeEntry, type CommandResult, type ShellLike } from './commands/npm'
 import { collectBins, projectRoot, GLOBAL_ROOT } from './commands/install'
 import { gitCommand } from './commands/git'
 import { tscCommand } from './commands/tsc-cmd'
@@ -48,7 +48,7 @@ const ENV_BLOCKLIST = new Set([
  * .bashrc variables and aliases apply everywhere, and child processes
  * (node) inherit what the session exported.
  */
-export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> }): Shell {
+export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>; seedEnv?: Record<string, string> }): Shell {
   const v = vfs ?? platform().vfs
   const fs = new VfsBackedFs(v)
   const baseEnv: Record<string, string> = {
@@ -65,7 +65,9 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
   const bash = new Bash({ fs, cwd: HOME_DIR, env: baseEnv })
 
   /** environment carried across commands: session exports + last .bashrc state */
-  const sessionEnv: Record<string, string> = {}
+  // script shells start from the caller's session env (like a real child
+  // process), then accumulate their own exports from there
+  const sessionEnv: Record<string, string> = { ...(opts?.seedEnv ?? {}) }
   const hasBashrc = () => v.isFile(BASHRC)
   const bashrcPrefix = () => (hasBashrc() ? `. ${BASHRC} >/dev/null 2>&1; ` : '')
 
@@ -74,11 +76,20 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
   // through it while their buffered stdout/stderr still arrive at the end.
   // Save/restore keeps nested shells and sequential execs from clobbering.
   let liveProgress: ((line: string) => void) | undefined
+  // per-exec nonce for the env-dump marker: the dump rides in-band in
+  // stdout, so a fixed marker lets command output forge session env vars —
+  // a random nonce per exec makes that unguessable
+  let liveNonce = ''
+  const randomHex = (): string =>
+    [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('')
 
   const shell: Shell = {
     async exec(cmd, cwd, onProgress) {
       const prev = liveProgress
       liveProgress = onProgress
+      const nonce = randomHex()
+      const prevNonce = liveNonce
+      liveNonce = nonce
       try {
       const options = { cwd: cwd ?? HOME_DIR, env: sessionEnv }
       // the environment capture runs IN-BAND (a separate exec would already
@@ -86,11 +97,11 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
       // then dump. The dump line is stripped from stdout.
       const sourceLine = bashrcPrefix()
       const wrapped =
-        `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
+        `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump ${nonce} $__cell_rc`
       const result = await bash.exec(wrapped, options)
       // the dump may CONCATENATE onto the command's own output (no trailing
       // newline) — find the marker anywhere and cut to its end of line
-      const marker = '__CELL_ENV__:'
+      const marker = `__CELL_ENV__:${nonce}:`
       let stdout = result.stdout
       const markerAt = stdout.lastIndexOf(marker)
       if (markerAt !== -1) {
@@ -112,6 +123,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
       return { stdout, stderr: result.stderr, exitCode: result.exitCode }
       } finally {
         liveProgress = prev
+        liveNonce = prevNonce
       }
     },
   }
@@ -145,9 +157,12 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     defineCommand('__cell_env_dump', async (args, ctx) => {
       const entries: Record<string, string> = {}
       for (const [key, value] of ctx.env ?? new Map<string, string>()) entries[key] = value
-      const rc = Number.parseInt(args[0] ?? '0', 10)
+      // args: <nonce> <rc> — the nonce binds this dump to its exec so
+      // forged markers in command output are never honored
+      const nonce = args[0] ?? ''
+      const rc = Number.parseInt(args[1] ?? '0', 10)
       return {
-        stdout: `__CELL_ENV__:${JSON.stringify(entries)}\n`,
+        stdout: `__CELL_ENV__:${nonce}:${JSON.stringify(entries)}\n`,
         stderr: '',
         exitCode: Number.isFinite(rc) ? rc : 0,
       }
@@ -296,7 +311,9 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
 
   register('man', async (args) => {
     const page = args.find((a) => !a.startsWith('-'))
-    if (page !== undefined) {
+    // the name is interpolated into a shell line — reject anything that is
+    // not a plain command name so `man "x; evil"` cannot execute
+    if (page !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(page)) {
       const result = await bash.exec(`${page} --help 2>&1`, { cwd: HOME_DIR, env: sessionEnv })
       if (result.exitCode === 0 && result.stdout.trim() !== '') {
         return { stdout: result.stdout, stderr: '', exitCode: 0 }
@@ -343,16 +360,20 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     return { stdout: `${out.join('\n')}\n`, stderr: '', exitCode: 0 }
   })
 
-  // xargs: just-bash's builtin lacks -n/-I/-L — this shim reads stdin and
-  // re-invokes each batch through the shell
+  // xargs: just-bash's builtin lacks -n/-I/-L/-0 — this shim reads stdin
+  // and re-invokes each batch through the shell (GNU default: all args at
+  // once, one invocation)
   bash.registerCommand(
     defineCommand('xargs', async (args, ctx) => {
       const stdinText = typeof ctx.stdin === 'string' ? ctx.stdin : ''
-      const items = stdinText.split('\n').map((l) => l.trim()).filter(Boolean)
+      const useNull = args.includes('-0') || args.includes('--null')
+      const items = (useNull ? stdinText.split('\0') : stdinText.split('\n'))
+        .map((line) => (useNull ? line : line.trim()))
+        .filter((line) => line !== '')
       if (items.length === 0) return { stdout: '', stderr: '', exitCode: 0 }
       let repl: string | null = null
-      let maxArgs = 1
-      let limit: number | null = null
+      // null = GNU default: everything in a single invocation
+      let maxArgs: number | null = null
       const rest: string[] = []
       for (let i = 0; i < args.length; i++) {
         const arg = args[i]
@@ -361,26 +382,29 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
         } else if (arg === '-n' || arg.startsWith('-n')) {
           maxArgs = Number.parseInt(arg === '-n' ? (args[++i] ?? '1') : arg.slice(2), 10) || 1
         } else if (arg === '-L' || arg.startsWith('-L')) {
-          limit = Number.parseInt(arg === '-L' ? (args[++i] ?? '1') : arg.slice(2), 10) || 1
-          maxArgs = limit
+          maxArgs = Number.parseInt(arg === '-L' ? (args[++i] ?? '1') : arg.slice(2), 10) || 1
         } else if (arg === '-0' || arg === '--null' || arg === '-r' || arg === '--no-run-if-empty') {
           // handled by the stdin split / empty behavior
         } else {
           rest.push(arg)
         }
       }
+      // -I implies one line per invocation; quote appended args so spaces
+      // survive the re-parse
+      const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
       const base = rest.join(' ')
-      const batches: string[][] = []
-      for (let i = 0; i < items.length; i += Math.max(1, maxArgs)) {
-        batches.push(items.slice(i, i + Math.max(1, maxArgs)))
-      }
+      const batches: string[][] = repl !== null
+        ? items.map((item) => [item])
+        : maxArgs === null
+          ? [items]
+          : items.flatMap((_, i, all) => (i % maxArgs! === 0 ? [all.slice(i, i + maxArgs!)] : []))
       let stdout = ''
       let stderr = ''
       let exit = 0
       for (const batch of batches) {
         const line = repl !== null
-          ? base.split(repl).map((part) => part).join(' ') && base.replaceAll(repl, batch.join(' '))
-          : `${base} ${batch.join(' ')}`.trim()
+          ? base.replaceAll(repl, batch.join(' '))
+          : `${base} ${batch.map(quote).join(' ')}`.trim()
         const result = await bash.exec(line, { cwd: ctx.cwd, env: sessionEnv })
         stdout += result.stdout
         stderr += result.stderr
@@ -401,7 +425,8 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     let out = ''
     for (const target of targets) {
       try {
-        out += await fs.readFile(`${cwd}/${target}`.replace('//', '/'))
+        const resolved = target.startsWith('/') ? target : `${cwd}/${target}`
+        out += await fs.readFile(vfsPath.normalize(resolved))
       } catch {
         return { stdout: '', stderr: `less: ${target}: No such file or directory\n`, exitCode: 1 }
       }
@@ -424,18 +449,20 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
   register('tsc', (args, { cwd }) => tscCommand(v, args, { cwd }))
   register('git', (args, { cwd, progress }) => gitCommand(v, args, { cwd, progress }))
   // npm scripts run in their own shell WITH the project's node_modules/.bin
-  // on PATH — that is what makes `npm dev` → `vercel dev` work for real
-  const scriptShell = (cwd: string): Shell => createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd) })
-  register('npm', (args, { cwd, progress }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive, progress }))
-  register('pnpm', (args, { cwd, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress }))
+  // on PATH — that is what makes `npm dev` → `vercel dev` work for real.
+  // The script shell seeds from the caller's session env like a real child.
+  const scriptShell = (cwd: string, seed?: Map<string, string>): ShellLike =>
+    createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : undefined })
+  register('npm', (args, { cwd, env, progress }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive, progress, env }))
+  register('pnpm', (args, { cwd, env, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress, env }))
   register('npx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
   register('pnpx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
   register('cell', (args, { cwd }) => cellCommand(v, args, { cwd, shell: nestedShell() }))
-  const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown }) =>
-    pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined })
+  const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown; progress?: (line: string) => void }) =>
+    pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined, progress: ctx.progress })
   register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))
 
-  register('python', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined }))
+  register('python', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined, progress: ctx.progress }))
   register('pip', (args, ctx) => pipRegister(args, ctx))
   register('pip3', (args, ctx) => pipRegister(args, ctx))
   const pipRegister = async (args: string[], ctx: { cwd: string }): Promise<CommandResult> =>
@@ -446,7 +473,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
           ? "import pyodide; [print(f'{k}=={v}') for k, v in pyodide.loadedPackages.items()]"
           : `import sys\nprint('usage: pip install <package> | pip list', file=sys.stderr); sys.exit(1)`,
     ], { cwd: ctx.cwd })
-  register('python3', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined }))
+  register('python3', (args, ctx) => pythonRegister(args, { ...ctx, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined, progress: ctx.progress }))
 
   // global package bins (~/.local/lib/node_modules) are real PATH commands:
   // registered at shell creation for bins installed in earlier sessions, and
