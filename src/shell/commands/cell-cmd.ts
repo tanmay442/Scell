@@ -122,12 +122,12 @@ async function safeText(response: Response): Promise<string> {
   }
 }
 
-export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike; onProgress?: (line: string) => void }): Promise<CommandResult> {
+export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike; jobShell?: ShellLike; onProgress?: (line: string) => void }): Promise<CommandResult> {
   const sub = args[0] ?? 'help'
 
   if (sub === 'agent') {
     if (!opts.shell) return { stdout: '', stderr: 'cell agent: no shell available in this context\n', exitCode: 1 }
-    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell, onProgress: opts.onProgress })
+    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell, ...(opts.jobShell ? { jobShell: opts.jobShell } : {}), onProgress: opts.onProgress })
   }
 
   if (sub === 'preview') {

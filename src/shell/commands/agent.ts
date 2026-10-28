@@ -2,6 +2,7 @@ import type { Vfs } from '../../vfs/types'
 import type { CommandResult, ShellLike } from './npm'
 import { redactSecrets } from './agent-redact'
 import {
+  JobManager,
   registryEntries,
   runTool,
   loadCustomTools,
@@ -22,6 +23,7 @@ import {
   setMetaOutputs,
   setMetaPendingUser,
   setMetaResumeFlush,
+  isOpenAIShaped,
   type AgentConfig,
   type ProviderKind,
   type ProviderState,
@@ -54,9 +56,10 @@ const DEFAULT_MODELS: Record<ProviderKind, string> = {
   anthropic: 'claude-sonnet-4-5',
   openai: 'gpt-4o',
   meta: 'muse-spark-1.3-contributor',
+  compat: 'gpt-4o',
 }
 
-const KNOWN_PROVIDERS: ProviderKind[] = ['anthropic', 'openai', 'meta']
+const KNOWN_PROVIDERS: ProviderKind[] = ['anthropic', 'openai', 'meta', 'compat']
 
 const BASE_SYSTEM_PROMPT = `You are an autonomous coding agent running INSIDE Cell — a complete development environment in a browser tab. You are not on a normal server; keep this in mind:
 
@@ -123,11 +126,12 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
       provider?: string
       apiKey?: string
       model?: string
+      baseURL?: string
       max_output_tokens?: number
       approval?: string
     }
     if (parsed.provider !== undefined && !(KNOWN_PROVIDERS as readonly string[]).includes(parsed.provider)) {
-      return { error: `cell agent: unknown provider '${parsed.provider}' (use meta, anthropic or openai)\n` }
+      return { error: `cell agent: unknown provider '${parsed.provider}' (use meta, anthropic, openai or compat)\n` }
     }
     const provider = (parsed.provider ?? 'anthropic') as ProviderKind
     let apiKey = parsed.apiKey ?? ''
@@ -146,13 +150,18 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
         }
       }
     }
-    if (!apiKey) return { error: 'cell agent: apiKey missing in ~/.cell/agent.json\n' }
+    if (provider === 'compat') {
+      if (!parsed.baseURL) return { error: 'cell agent: compat provider needs "baseURL" in ~/.cell/agent.json (e.g. https://api.x.ai/v1)\n' }
+      // local servers (ollama etc.) often need no key; send a placeholder
+      if (!apiKey) apiKey = 'cell-local'
+    } else if (!apiKey) return { error: 'cell agent: apiKey missing in ~/.cell/agent.json\n' }
     const maxOutput = typeof parsed.max_output_tokens === 'number' ? parsed.max_output_tokens : undefined
     return {
       config: {
         provider,
         apiKey,
         model: parsed.model ?? DEFAULT_MODELS[provider],
+        ...(parsed.baseURL !== undefined ? { baseURL: parsed.baseURL } : {}),
         ...(maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {}),
       },
     }
@@ -178,6 +187,10 @@ export interface RunAgentOpts {
   cwd: string
   shell: ShellLike
   onProgress?: (line: string) => void
+  /** dedicated shell for background jobs (own env); jobs off when absent */
+  jobShell?: ShellLike
+  /** interactive approval gate (Agent panel): resolve true to run an 'ask' tool */
+  approve?: (call: ToolCall) => Promise<boolean>
 }
 
 /** The agent loop. Returns the full transcript for the terminal. */
@@ -204,7 +217,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
             '  --resume <id>         continue a session in ~/.cell/sessions/',
             '  --steps N             step budget (default 30)',
             '',
-            'config: ~/.cell/agent.json { provider: meta|anthropic|openai, model, apiKey? }',
+            'config: ~/.cell/agent.json { provider: meta|anthropic|openai|compat, model, apiKey?, baseURL? }',
             'tools: bash/read/edit/write/ls/load_skill + ~/.cell/tools/*.json',
             'skills: ~/.cell/skills/<name>/SKILL.md (+ <project>/.cell/skills/ override)',
           ].join('\n') + '\n',
@@ -290,7 +303,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   let turns: SessionTurn[] = resumeId !== null ? [...resumedTurns] : [{ role: 'user', text: prompt }]
   if (resumeId !== null && expanded.prompt !== '') turns.push({ role: 'user', text: expanded.prompt })
 
-  const deps = { vfs, shell: opts.shell, cwd: opts.cwd, skills: skillBodies, customTools }
+  const deps = { vfs, shell: opts.shell, cwd: opts.cwd, skills: skillBodies, customTools, ...(opts.jobShell ? { jobs: new JobManager(opts.jobShell, vfs) } : {}) }
   // strip a .json suffix so --resume x.json does not save x.json.json (P1-5)
   const id = resumeId !== null ? resumeId.replace(/\.json$/, '') : sessionId()
   const startedAt = resumedStartedAt ?? new Date().toISOString()
@@ -303,7 +316,20 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     }
   }
 
+  let lastCompactStep = -10
   for (let step = 1; step <= maxSteps; step++) {
+    // compaction: when the live context passes the threshold, summarize
+    // the turns into one user message and continue from it (instead of
+    // the old middle-drop, which lost decisions silently)
+    if (step > 1 && step - lastCompactStep >= 3 && contextSize(state, turns) > COMPACT_AT_CHARS) {
+      const summary = await summarizeTurns(config, turns, entries)
+      if (summary !== null) {
+        applyCompaction(state, config.provider, summary)
+        turns = [{ role: 'user', text: summary }]
+        transcript.push('agent: context compacted — earlier turns summarized, continuing')
+        lastCompactStep = step
+      }
+    }
     const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns)
     if ('error' in model) {
       transcript.push(`agent ✗ ${redactSecrets(model.error)}`)
@@ -339,7 +365,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
           content: 'Your previous output was truncated by max_tokens. Continue briefly from where you left off.',
         })
         turns.push({ role: 'user', text: 'Your previous output was truncated by max_tokens. Continue briefly from where you left off.' })
-      } else if (config.provider === 'openai') {
+      } else if (isOpenAIShaped(config.provider)) {
         state.openaiMessages.push({ role: 'user', content: 'Your previous output was truncated. Continue briefly from where you left off.' } as never)
         turns.push({ role: 'user', text: 'Your previous output was truncated. Continue briefly from where you left off.' })
       } else {
@@ -374,7 +400,17 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
       // a clear prompt line first (non-interactive shells auto-proceed —
       // the line is the audit trail for what the agent touched)
       const approval = approvalFor(entries, call.name)
-      if (approval === 'ask') {
+      if (approval === 'ask' && opts.approve !== undefined) {
+        // interactive gate (Agent panel): the user decides per call
+        const allowed = await opts.approve(call)
+        transcript.push(redactSecrets(`❓ approval: ${call.name} ${summary} — ${allowed ? 'approved' : 'DENIED by user'}`))
+        if (!allowed) {
+          const denied: ToolResult = { id: call.id, content: 'denied by user — do not retry this exact call; ask or choose another approach', isError: true }
+          toolResults.push(denied)
+          metaOutputs.push({ type: 'function_call_output', call_id: call.id, output: denied.content })
+          continue
+        }
+      } else if (approval === 'ask') {
         transcript.push(redactSecrets(`❓ approval: ${call.name} ${summary} — auto-approved (non-interactive run)`))
       }
       transcript.push(redactSecrets(`⏺ ${call.name} ${summary}`))
@@ -399,7 +435,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
           is_error: result.isError ?? false,
         })),
       })
-    } else if (config.provider === 'openai') {
+    } else if (isOpenAIShaped(config.provider)) {
       for (const result of toolResults) {
         state.openaiMessages.push({ role: 'tool', content: result.content, tool_call_id: result.id } as never)
       }
@@ -418,9 +454,44 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
 }
 
+/** Rough context size in chars (~4 chars/token) across provider state. */
+const COMPACT_AT_CHARS = 200_000
+
+function contextSize(state: ProviderState, turns: SessionTurn[]): number {
+  try {
+    return JSON.stringify(state.anthropicMessages).length + JSON.stringify(state.openaiMessages).length + turns.reduce((sum, turn) => sum + turn.text.length, 0)
+  } catch {
+    return 0
+  }
+}
+
+/** Ask the model (no tools) to compress the conversation so far. */
+async function summarizeTurns(config: AgentConfig, turns: SessionTurn[], _entries: ToolInfo[]): Promise<string | null> {
+  const flat = turns.map((turn) => {
+    const calls = (turn.toolCalls ?? []).map((call) => `${call.name} ${JSON.stringify(call.input).slice(0, 300)}`).join('; ')
+    return `${turn.role}: ${turn.text.slice(0, 3000)}${calls ? ` [calls: ${calls}]` : ''}`
+  }).join('\n').slice(0, 120_000)
+  const prompt = `Summarize this coding-agent session for a fresh agent continuing the work. Preserve: the task, decisions made, files created/changed (paths), commands that mattered, current state, and next steps. Be concise, plain facts only.\n\n${flat}`
+  const fresh = newProviderState(prompt)
+  const result = await callModel(config, fresh, [], 'You summarize agent sessions.', undefined, undefined)
+  if ('error' in result || result.text.trim() === '') return null
+  return `[summary of earlier work]\n${result.text.trim()}`
+}
+
+/** Replace live provider state with the summary as the opening message. */
+function applyCompaction(state: ProviderState, provider: ProviderKind, summary: string): void {
+  state.anthropicMessages = [{ role: 'user', content: summary }]
+  state.openaiMessages = [{ role: 'user', content: summary }]
+  state.metaResponseId = null
+  state.metaPendingUser = null
+  state.metaPendingOutputs = null
+  state.metaFirstInput = { role: 'user', content: [{ type: 'input_text', text: summary }] }
+  void provider
+}
+
 function pushUserTurn(state: ProviderState, provider: ProviderKind, text: string): void {
   if (provider === 'anthropic') state.anthropicMessages.push({ role: 'user', content: text })
-  else if (provider === 'openai') state.openaiMessages.push({ role: 'user', content: text } as never)
+  else if (isOpenAIShaped(provider)) state.openaiMessages.push({ role: 'user', content: text } as never)
   else setMetaPendingUser(state, text)
 }
 
@@ -433,7 +504,7 @@ function recordAssistantMessage(state: ProviderState, provider: ProviderKind, te
         ...calls.map((call) => ({ type: 'tool_use', id: call.id, name: call.name, input: call.input })),
       ],
     })
-  } else if (provider === 'openai') {
+  } else if (isOpenAIShaped(provider)) {
     state.openaiMessages.push({
       role: 'assistant',
       content: text.trim() || null,

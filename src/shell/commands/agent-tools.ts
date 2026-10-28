@@ -156,11 +156,14 @@ export function bashDenyReason(command: string): string | null {
 
 const BUILTIN_DEFS: { name: string; description: string; approval: ApprovalPolicy }[] = [
   { name: 'bash', description: 'Run a shell command in the workspace (bash-compatible). Returns stdout+stderr and the exit code. cd is per-call. Each step times out after 120s (exit 124, overridable with timeoutMs up to 600000); output past 20k chars is head+tail truncated with a receipt.', approval: 'ask' },
-  { name: 'read', description: 'Read a text file from the filesystem. Long files are paged — pass offset/limit.', approval: 'auto' },
+  { name: 'read', description: 'Read a file from the filesystem. Text files are paged (offset/limit); pass base64:true for raw bytes of images/wasm/archives.', approval: 'auto' },
   { name: 'edit', description: 'Replace one exact block of text in a file. The old text must occur exactly once.', approval: 'ask' },
   { name: 'write', description: 'Create or overwrite a text file. Parent directories are created.', approval: 'ask' },
   { name: 'ls', description: 'List a directory.', approval: 'auto' },
   { name: 'load_skill', description: 'Load the full body of a skill by name (progressive disclosure: the system prompt only carries names + one-liners).', approval: 'auto' },
+  { name: 'job_start', description: 'Start a long command in the background (own shell env, 10-min cap). Returns a job id; output streams to ~/.cell/jobs/<id>.log.', approval: 'ask' },
+  { name: 'job_poll', description: 'Check a background job: status, exit code, and latest output tail.', approval: 'auto' },
+  { name: 'job_list', description: 'List background jobs started this run.', approval: 'auto' },
 ]
 
 const PARAM_SCHEMAS: Record<string, Record<string, unknown>> = {
@@ -179,6 +182,7 @@ const PARAM_SCHEMAS: Record<string, Record<string, unknown>> = {
       path: { type: 'string', description: 'absolute path, ~ allowed' },
       offset: { type: 'number', description: 'first line (1-based, default 1)' },
       limit: { type: 'number', description: 'max lines (default 2000)' },
+      base64: { type: 'boolean', description: 'return raw bytes as base64 (images, wasm, archives) instead of text lines' },
     },
     required: ['path'],
   },
@@ -208,6 +212,24 @@ const PARAM_SCHEMAS: Record<string, Record<string, unknown>> = {
     type: 'object',
     properties: { name: { type: 'string', description: 'skill name from the system prompt list' } },
     required: ['name'],
+  },
+  job_start: {
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: 'the command line to run in the background' },
+      cwd: { type: 'string', description: 'working directory (default: home)' },
+    },
+    required: ['command'],
+  },
+  job_poll: {
+    type: 'object',
+    properties: { id: { type: 'string', description: 'job id from job_start' } },
+    required: ['id'],
+  },
+  job_list: {
+    type: 'object',
+    properties: {},
+    required: [],
   },
 }
 
@@ -320,6 +342,65 @@ export function expand(path: string, cwd: string): string {
   return raw.startsWith('/') ? vfsPath.normalize(raw) : vfsPath.join(cwd, raw)
 }
 
+export interface JobRecord {
+  id: string
+  command: string
+  status: 'running' | 'done'
+  exitCode?: number
+  output: string
+}
+
+const JOBS_DIR = '/home/user/.cell/jobs'
+const JOB_MAX_OUTPUT = 40_000
+
+/**
+ * Background jobs: long commands the agent starts and polls instead of
+ * blocking a step. Jobs run on a DEDICATED shell instance (own session
+ * env — exports in the foreground shell do not carry in; say so in the
+ * command if it matters). Output streams to ~/.cell/jobs/<id>.log so a
+ * resumed session can still read what a job produced.
+ */
+export class JobManager {
+  private jobs = new Map<string, JobRecord>()
+  private counter = 0
+
+  constructor(private shell: ShellLike, private vfs: Vfs) {}
+
+  start(command: string, cwd: string): JobRecord {
+    const denied = bashDenyReason(command)
+    if (denied !== null) throw new Error(denied)
+    const id = `job-${++this.counter}`
+    const record: JobRecord = { id, command, status: 'running', output: '' }
+    this.jobs.set(id, record)
+    const logPath = `${JOBS_DIR}/${id}.log`
+    const append = (text: string) => {
+      record.output = truncateWithReceipt(`${record.output}${text}`, JOB_MAX_OUTPUT)
+      try { this.vfs.write(logPath, record.output) } catch { /* log is best-effort */ }
+    }
+    append(`$ ${command}\n`)
+    void this.shell.exec(command, cwd, (line) => append(`${line}\n`), { timeoutMs: 600_000 })
+      .then((result) => {
+        record.status = 'done'
+        record.exitCode = result.exitCode
+        append(`${result.stdout}${result.stderr}${exitTrailer(result, 600_000)}\n`)
+      })
+      .catch((err) => {
+        record.status = 'done'
+        record.exitCode = -1
+        append(`\n[job error: ${err instanceof Error ? err.message : String(err)}]\n`)
+      })
+    return record
+  }
+
+  get(id: string): JobRecord | undefined {
+    return this.jobs.get(id)
+  }
+
+  list(): JobRecord[] {
+    return [...this.jobs.values()]
+  }
+}
+
 export interface RunToolDeps {
   vfs: Vfs
   shell: ShellLike
@@ -328,11 +409,34 @@ export interface RunToolDeps {
   skills?: Map<string, string>
   /** custom tool definitions (re-loaded per run; pass through for tests) */
   customTools?: Map<string, CustomToolDef>
+  /** background job table (job_start/job_poll/job_list); absent = jobs off */
+  jobs?: JobManager
 }
 
 export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolResult> {
   const { vfs, shell } = deps
   try {
+    if (call.name === 'job_start' || call.name === 'job_poll' || call.name === 'job_list') {
+      if (deps.jobs === undefined) return { id: call.id, content: 'background jobs are not enabled in this run', isError: true }
+      if (call.name === 'job_start') {
+        const command = String(call.input.command ?? '')
+        const cwd = call.input.cwd !== undefined ? expand(String(call.input.cwd), deps.cwd) : deps.cwd
+        try {
+          const record = deps.jobs.start(command, cwd)
+          return { id: call.id, content: `started ${record.id}: ${command} (poll with job_poll, log ~/.cell/jobs/${record.id}.log)` }
+        } catch (err) {
+          return { id: call.id, content: err instanceof Error ? err.message : String(err), isError: true }
+        }
+      }
+      if (call.name === 'job_list') {
+        const all = deps.jobs.list()
+        return { id: call.id, content: all.length === 0 ? '(no jobs)' : all.map((job) => `${job.id} ${job.status}${job.exitCode !== undefined ? ` exit ${job.exitCode}` : ''} — ${job.command}`).join('\n') }
+      }
+      const record = deps.jobs.get(String(call.input.id ?? ''))
+      if (record === undefined) return { id: call.id, content: `unknown job '${String(call.input.id ?? '')}'`, isError: true }
+      const tail = record.output.slice(-4000)
+      return { id: call.id, content: `${record.id} ${record.status}${record.exitCode !== undefined ? ` exit ${record.exitCode}` : ''}\n${tail || '(no output yet)'}` }
+    }
     if (call.name === 'load_skill') {
       const name = String(call.input.name ?? '')
       const body = deps.skills?.get(name)
@@ -376,6 +480,16 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     if (call.name === 'read') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
       if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not readable (${path})`, isError: true }
+      if (call.input.base64 === true) {
+        const bytes = vfs.readBytes(path)
+        if (bytes === null) return { id: call.id, content: `no such file: ${path}`, isError: true }
+        const MAX_BINARY = 262_144
+        const slice = bytes.subarray(0, MAX_BINARY)
+        let binary = ''
+        for (let i = 0; i < slice.length; i += 8192) binary += String.fromCharCode(...slice.subarray(i, i + 8192))
+        const receipt = bytes.length > MAX_BINARY ? ` (first ${MAX_BINARY} of ${bytes.length} bytes)` : ` (${bytes.length} bytes)`
+        return { id: call.id, content: `base64${receipt}:\n${btoa(binary)}` }
+      }
       const content = vfs.read(path)
       if (content === null) return { id: call.id, content: `no such file (or binary): ${path}`, isError: true }
       const lines = content.split('\n')

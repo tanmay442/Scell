@@ -35,13 +35,18 @@ import type { ToolCall, ToolInfo } from './agent-tools'
  * function tools) — unchanged from before.
  */
 
-export type ProviderKind = 'anthropic' | 'openai' | 'meta'
+export type ProviderKind = 'anthropic' | 'openai' | 'meta' | 'compat'
+
+/** Providers that speak the OpenAI chat-completions shape. */
+export const isOpenAIShaped = (provider: ProviderKind): boolean => provider === 'openai' || provider === 'compat'
 
 export interface AgentConfig {
   provider: ProviderKind
   apiKey: string
   model: string
   maxOutputTokens?: number
+  /** compat provider only: API root, e.g. https://api.x.ai/v1 */
+  baseURL?: string
 }
 
 export interface ModelTurn {
@@ -296,7 +301,10 @@ export async function callModel(
   try {
     if (config.provider === 'meta') return callMeta(config, state, entries, systemPrompt, onProgress, history)
     if (config.provider === 'anthropic') return callAnthropic(config, state, entries, systemPrompt)
-    return callOpenAI(config, state, entries, systemPrompt)
+    const url = config.provider === 'compat'
+      ? `${(config.baseURL ?? '').replace(/\/+$/, '')}/chat/completions`
+      : 'https://api.openai.com/v1/chat/completions'
+    return callOpenAI(config, state, entries, systemPrompt, url)
   } catch (err) {
     const hint = err instanceof TypeError ? ' (network/CORS — the browser could not reach the API)' : ''
     return { error: `${err instanceof Error ? err.message : String(err)}${hint}` }
@@ -345,8 +353,12 @@ async function callOpenAI(
   state: ProviderState,
   entries: ToolInfo[],
   systemPrompt: string,
+  url = 'https://api.openai.com/v1/chat/completions',
 ): Promise<ModelTurn | { error: string }> {
-  const response = await fetchWithRetry('https://api.openai.com/v1/chat/completions', {
+  if (url.startsWith('/chat/completions') || url === 'chat/completions') {
+    return { error: 'compat provider needs "baseURL" in ~/.cell/agent.json (e.g. https://api.x.ai/v1)' }
+  }
+  const response = await fetchWithRetry(url, {
     method: 'POST',
     signal: AbortSignal.timeout(120_000),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
@@ -357,7 +369,7 @@ async function callOpenAI(
     }),
   })
   if (!response.ok) {
-    return { error: `openai ${response.status}: ${redactSecrets((await response.text()).slice(0, 300))}` }
+    return { error: `${config.provider} ${response.status}: ${redactSecrets((await response.text()).slice(0, 300))}` }
   }
   const data = (await response.json()) as {
     choices: { finish_reason?: string; message: { content?: string | null; tool_calls?: { id: string; function: { name: string; arguments: string } }[] } }[]
