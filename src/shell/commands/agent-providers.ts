@@ -22,9 +22,9 @@ import type { ToolCall, ToolInfo } from './agent-tools'
  *     tools, max_output_tokens }
  *   Long multi-step runs can fail a follow-up with 400 "referenced response
  *   not found or expired" (observed live 2026-10-28: the workspace changes
- *   were real and kept, only the summary hop died). The harness surfaces
- *   that honestly; re-anchoring by replaying compressed history as a fresh
- *   first turn is follow-up work (same bucket as compaction).
+ *   were real and kept, only the summary hop died). The transport re-anchors
+ *   once: it drops the dead chain id and replays the flattened turns as a
+ *   fresh first turn, so the run continues instead of dying.
  *   stream:true gives SSE: `event: response.output_text.delta` /
  *   `data: {"delta":"…"}` chunks, then `event: response.completed` with the
  *   full response, then a `[DONE]` terminator line.
@@ -140,15 +140,24 @@ export function parseMetaSseEvents(raw: string): { deltas: string[]; final: unkn
   return { deltas, final }
 }
 
+export interface MetaHistoryTurn {
+  role: 'user' | 'assistant' | 'tool'
+  text: string
+  toolCalls?: { id: string; name: string; input: Record<string, unknown> }[]
+  toolResults?: { id: string; content: string; isError?: boolean }[]
+}
+
 export async function callModel(
   config: AgentConfig,
   state: ProviderState,
   entries: ToolInfo[],
   systemPrompt: string,
   onProgress?: (line: string) => void,
+  /** full turns for the Meta re-anchor fallback (chained id expiry) */
+  history?: MetaHistoryTurn[],
 ): Promise<ModelTurn | { error: string }> {
   try {
-    if (config.provider === 'meta') return callMeta(config, state, entries, systemPrompt, onProgress)
+    if (config.provider === 'meta') return callMeta(config, state, entries, systemPrompt, onProgress, history)
     if (config.provider === 'anthropic') return callAnthropic(config, state, entries, systemPrompt)
     return callOpenAI(config, state, entries, systemPrompt)
   } catch (err) {
@@ -235,6 +244,7 @@ async function callMeta(
   entries: ToolInfo[],
   systemPrompt: string,
   onProgress?: (line: string) => void,
+  history?: MetaHistoryTurn[],
 ): Promise<ModelTurn | { error: string }> {
   const maxOutput = config.maxOutputTokens ?? 4096
   const tools = toMetaTools(entries)
@@ -242,7 +252,7 @@ async function callMeta(
   // live through onProgress; the final response still comes from the
   // response.completed event. Non-streaming otherwise (simpler for tests).
   if (onProgress !== undefined) {
-    return callMetaStream(config, state, tools, systemPrompt, maxOutput, onProgress)
+    return callMetaStream(config, state, tools, systemPrompt, maxOutput, onProgress, history)
   }
   const requestBody = state.metaResponseId === null
     ? {
@@ -267,6 +277,8 @@ async function callMeta(
     body: JSON.stringify(requestBody),
   })
   if (!response.ok) {
+    const reanchored = await tryMetaReanchor(response, config, state, tools, systemPrompt, maxOutput, history)
+    if (reanchored !== null) return reanchored
     return { error: `meta ${response.status}: ${redactSecrets((await response.text()).slice(0, 300))}` }
   }
   const data = (await response.json()) as Parameters<typeof parseMetaResponse>[0]
@@ -282,6 +294,7 @@ async function callMetaStream(
   systemPrompt: string,
   maxOutput: number,
   onProgress: (line: string) => void,
+  history?: MetaHistoryTurn[],
 ): Promise<ModelTurn | { error: string }> {
   const requestBody =
     state.metaResponseId === null
@@ -309,9 +322,121 @@ async function callMetaStream(
     body: JSON.stringify(requestBody),
   })
   if (!response.ok) {
+    const reanchored = await tryMetaReanchorStream(response, config, state, tools, systemPrompt, maxOutput, history, onProgress)
+    if (reanchored !== null) return reanchored
     return { error: `meta ${response.status}: ${redactSecrets((await response.text()).slice(0, 300))}` }
   }
   const raw = await response.text()
+  const { deltas, final } = parseMetaSseEvents(raw)
+  for (const delta of deltas) {
+    if (delta !== '') onProgress(delta.slice(0, 500))
+  }
+  if (final === null) return { error: 'meta: stream ended without response.completed' }
+  const parsed = parseMetaResponse(final as Parameters<typeof parseMetaResponse>[0])
+  if (parsed.responseId) state.metaResponseId = parsed.responseId
+  return parsed
+}
+
+/**
+ * Long runs can fail a chained follow-up with 400 "referenced response
+ * not found or expired". Re-anchor once: drop the dead chain id and
+ * replay the flattened conversation as a fresh first turn, so the run
+ * continues instead of dying honestly with its work kept but summary lost.
+ */
+function isMetaChainExpiry(status: number, bodyText: string): boolean {
+  return status === 400 && /referenced response|response not found|expired/i.test(bodyText)
+}
+
+function metaReanchorText(history: MetaHistoryTurn[] | undefined, pendingUser: string | null): string {
+  const lines: string[] = [
+    '[re-anchored: the previous chained response expired, replaying the conversation as a fresh turn \u2014 continue the task]',
+  ]
+  for (const turn of (history ?? []).slice(-40)) {
+    if (turn.role === 'user') {
+      lines.push(`user: ${turn.text.slice(0, 8000)}`)
+    } else if (turn.role === 'assistant') {
+      const calls = (turn.toolCalls ?? []).map((c) => `${c.name} ${JSON.stringify(c.input).slice(0, 500)}`).join('; ')
+      lines.push(`assistant: ${turn.text.slice(0, 4000)}${calls ? ` [tool calls: ${calls}]` : ''}`)
+    } else {
+      const results = (turn.toolResults ?? []).map((r) => r.content.slice(0, 4000)).join('\n')
+      lines.push(`tool: ${(results || turn.text).slice(0, 8000)}`)
+    }
+  }
+  if (pendingUser !== null && pendingUser !== '') lines.push(`user: ${pendingUser.slice(0, 8000)}`)
+  return lines.join('\n').slice(0, 60_000)
+}
+
+async function tryMetaReanchor(
+  response: Response,
+  config: AgentConfig,
+  state: ProviderState,
+  tools: ReturnType<typeof toMetaTools>,
+  systemPrompt: string,
+  maxOutput: number,
+  history: MetaHistoryTurn[] | undefined,
+): Promise<ModelTurn | null> {
+  const bodyText = await response.clone().text().catch(() => '')
+  if (!isMetaChainExpiry(response.status, bodyText) || state.metaResponseId === null) return null
+  state.metaResponseId = null
+  state.metaFirstInput = {
+    role: 'user',
+    content: [{ type: 'input_text', text: metaReanchorText(history, state.metaPendingUser) }],
+  }
+  state.metaPendingUser = null
+  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+  const retry = await fetch(META_URL, {
+    method: 'POST',
+    signal: AbortSignal.timeout(180_000),
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
+    body: JSON.stringify({
+      model: config.model,
+      input: metaInput(state, systemPrompt),
+      tools,
+      tool_choice: 'auto',
+      max_output_tokens: maxOutput,
+    }),
+  })
+  if (!retry.ok) return null
+  const data = (await retry.json()) as Parameters<typeof parseMetaResponse>[0]
+  const parsed = parseMetaResponse(data)
+  if (parsed.responseId) state.metaResponseId = parsed.responseId
+  return parsed
+}
+
+async function tryMetaReanchorStream(
+  response: Response,
+  config: AgentConfig,
+  state: ProviderState,
+  tools: ReturnType<typeof toMetaTools>,
+  systemPrompt: string,
+  maxOutput: number,
+  history: MetaHistoryTurn[] | undefined,
+  onProgress: (line: string) => void,
+): Promise<ModelTurn | { error: string } | null> {
+  const bodyText = await response.clone().text().catch(() => '')
+  if (!isMetaChainExpiry(response.status, bodyText) || state.metaResponseId === null) return null
+  state.metaResponseId = null
+  state.metaFirstInput = {
+    role: 'user',
+    content: [{ type: 'input_text', text: metaReanchorText(history, state.metaPendingUser) }],
+  }
+  state.metaPendingUser = null
+  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+  const retry = await fetch(META_URL, {
+    method: 'POST',
+    signal: AbortSignal.timeout(180_000),
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}`, accept: 'text/event-stream' },
+    body: JSON.stringify({
+      model: config.model,
+      stream: true,
+      input: metaInput(state, systemPrompt),
+      tools,
+      tool_choice: 'auto',
+      max_output_tokens: maxOutput,
+    }),
+  })
+  if (!retry.ok) return null
+  const raw = await retry.text()
   const { deltas, final } = parseMetaSseEvents(raw)
   for (const delta of deltas) {
     if (delta !== '') onProgress(delta.slice(0, 500))

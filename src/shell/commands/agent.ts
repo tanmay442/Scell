@@ -59,7 +59,8 @@ const BASE_SYSTEM_PROMPT = `You are an autonomous coding agent running INSIDE Ce
 - The filesystem is a real POSIX-style tree rooted at /; your home is /home/user (~). Everything persists in this browser.
 - The shell is bash-compatible: node, npm, pnpm, npx, tsc, git (real libgit2), curl, plus coreutils (sed, awk, jq, rg, find, xargs, sqlite3…). Pipes and redirection work.
 - node runs JavaScript and TypeScript directly. npm installs from the real registry. git clones work over https (github via a CORS relay automatically).
-- There is NO child_process, no native binaries, no ssh, no display. Long processes: up to 5 minutes each.
+- There is NO child_process, no native binaries, no ssh, no display. Long processes: up to 5 minutes each (node/python); each bash step times out after 120s with exit 124 — split long work across steps or raise timeoutMs (max 600000).
+- Tool output past 20k chars arrives head+tail truncated with an explicit `… [truncated N chars]` receipt; node/python streams cap at 4MB the same way. Exit codes ride an untruncatable `[exit N]` trailer (124 = timed out); `[oom suspected]` means the run died under memory pressure, not a test failure.
 - Edit files with the read/write/edit tools (small precise edits over whole-file rewrites); verify with read and bash (cat, tsc, npm test, git diff).
 - python3 runs offline (pyodide fallback exists — matplotlib/numpy/pandas work); write visuals to ~/artifacts.
 - Preview browser apps with: cell preview [dir] (the bundler path, not a server).
@@ -156,7 +157,7 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
 
 function clip(text: string, lines: number): string {
   const all = text.split('\n')
-  return all.length <= lines ? text : `${all.slice(0, lines).join('\n')}\n… (${all.length - lines} more lines)`
+  return all.length <= lines ? text : `${all.slice(0, lines).join('\n')}\n… [truncated ${all.length - lines} lines]`
 }
 
 function toolSummary(call: ToolCall): string {
@@ -298,7 +299,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   }
 
   for (let step = 1; step <= maxSteps; step++) {
-    const model = await callModel(config, state, entries, systemPrompt, opts.onProgress)
+    const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns)
     if ('error' in model) {
       transcript.push(`agent ✗ ${redactSecrets(model.error)}`)
       persist(step)

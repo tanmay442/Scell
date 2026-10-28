@@ -43,12 +43,41 @@ export interface ToolResult {
   id: string
   content: string
   isError?: boolean
+  /** the tool step hit its time budget (exit 124); content is partial */
+  timedOut?: boolean
+}
+
+/** default budget for one agent bash step: no step wedges the tab forever */
+export const AGENT_BASH_TIMEOUT_MS = 120_000
+export const AGENT_BASH_MAX = 20_000
+export const AGENT_READ_MAX = 30_000
+
+/** head+tail truncation with an explicit receipt — never silent (P0-6). */
+export function truncateWithReceipt(text: string, max: number): string {
+  if (text.length <= max) return text
+  const dropped = text.length - max
+  const headLen = Math.floor(max * 0.75)
+  const tailLen = max - headLen
+  return `${text.slice(0, headLen)}\n… [truncated ${dropped} chars]\n${text.slice(text.length - tailLen)}`
+}
+
+/** Untruncatable trailer appended AFTER truncation (P0-5). */
+export function exitTrailer(result: { exitCode: number; timedOut?: boolean; oomSuspected?: boolean }, timeoutMs?: number): string {
+  const parts: string[] = []
+  if (result.timedOut) {
+    const secs = timeoutMs !== undefined ? Math.round(timeoutMs / 1000) : 120
+    parts.push(`[exit 124 — timed out after ${secs}s]`)
+  } else if (result.exitCode !== 0) {
+    parts.push(`[exit ${result.exitCode}]`)
+  }
+  if (result.oomSuspected) parts.push('[oom suspected — output may be partial]')
+  return parts.length > 0 ? `\n${parts.join(' ')}` : ''
 }
 
 const TOOLS_DIR = '/home/user/.cell/tools'
 
 const BUILTIN_DEFS: { name: string; description: string; approval: ApprovalPolicy }[] = [
-  { name: 'bash', description: 'Run a shell command in the workspace (bash-compatible). Returns stdout+stderr and the exit code. cd is per-call.', approval: 'ask' },
+  { name: 'bash', description: 'Run a shell command in the workspace (bash-compatible). Returns stdout+stderr and the exit code. cd is per-call. Each step times out after 120s (exit 124, overridable with timeoutMs up to 600000); output past 20k chars is head+tail truncated with a receipt.', approval: 'ask' },
   { name: 'read', description: 'Read a text file from the filesystem. Long files are paged — pass offset/limit.', approval: 'auto' },
   { name: 'edit', description: 'Replace one exact block of text in a file. The old text must occur exactly once.', approval: 'ask' },
   { name: 'write', description: 'Create or overwrite a text file. Parent directories are created.', approval: 'ask' },
@@ -62,6 +91,7 @@ const PARAM_SCHEMAS: Record<string, Record<string, unknown>> = {
     properties: {
       command: { type: 'string', description: 'the command line to run' },
       cwd: { type: 'string', description: 'working directory (default: home)' },
+      timeoutMs: { type: 'number', description: 'step budget in ms (default 120000, max 600000; exit 124 on expiry)' },
     },
     required: ['command'],
   },
@@ -192,6 +222,13 @@ export function approvalFor(entries: ToolInfo[], name: string): ApprovalPolicy {
   return entries.find((entry) => entry.name === name)?.approval ?? 'ask'
 }
 
+/** per-call step budget, clamped so one typo cannot wedge the tab (P0-1). */
+export function clampTimeout(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(n)) return AGENT_BASH_TIMEOUT_MS
+  return Math.min(600_000, Math.max(1_000, Math.floor(n)))
+}
+
 export function expand(path: string, cwd: string): string {
   const raw = path.trim()
   if (raw === '~') return '/home/user'
@@ -215,22 +252,36 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     if (call.name === 'load_skill') {
       const name = String(call.input.name ?? '')
       const body = deps.skills?.get(name)
-      if (body !== undefined) return { id: call.id, content: body.slice(0, 30_000) }
+      if (body !== undefined) return { id: call.id, content: truncateWithReceipt(body, AGENT_READ_MAX) }
       return { id: call.id, content: `unknown skill '${name}'`, isError: true }
     }
     const custom = deps.customTools?.get(call.name)
     if (custom !== undefined) {
       const command = interpolateArgs(custom.run.command, call.input)
-      const result = await shell.exec(command, deps.cwd)
-      const text = `${result.stdout}${result.stderr}${result.exitCode !== 0 ? `\n[exit ${result.exitCode}]` : ''}`.trim()
-      return { id: call.id, content: (text === '' ? '(no output)' : text).slice(0, 20_000), isError: result.exitCode !== 0 }
+      const timeoutMs = clampTimeout(call.input.timeoutMs)
+      const result = await shell.exec(command, deps.cwd, undefined, { timeoutMs })
+      const body = truncateWithReceipt(`${result.stdout}${result.stderr}`.trim(), AGENT_BASH_MAX)
+      const text = `${body}${exitTrailer(result, timeoutMs)}`.trim()
+      return {
+        id: call.id,
+        content: text === '' ? '(no output)' : text,
+        isError: result.exitCode !== 0,
+        ...(result.timedOut ? { timedOut: true } : {}),
+      }
     }
     if (call.name === 'bash') {
       const command = String(call.input.command ?? '')
       const cwd = call.input.cwd !== undefined ? expand(String(call.input.cwd), deps.cwd) : deps.cwd
-      const result = await shell.exec(command, cwd)
-      const text = `${result.stdout}${result.stderr}${result.exitCode !== 0 ? `\n[exit ${result.exitCode}]` : ''}`.trim()
-      return { id: call.id, content: text === '' ? '(no output)' : text.slice(0, 20_000), isError: result.exitCode !== 0 }
+      const timeoutMs = clampTimeout(call.input.timeoutMs)
+      const result = await shell.exec(command, cwd, undefined, { timeoutMs })
+      const body = truncateWithReceipt(`${result.stdout}${result.stderr}`.trim(), AGENT_BASH_MAX)
+      const text = `${body}${exitTrailer(result, timeoutMs)}`.trim()
+      return {
+        id: call.id,
+        content: text === '' ? '(no output)' : text,
+        isError: result.exitCode !== 0,
+        ...(result.timedOut ? { timedOut: true } : {}),
+      }
     }
     if (call.name === 'read') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
@@ -241,7 +292,7 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
       const limit = Math.max(1, Number(call.input.limit ?? 2000))
       const page = lines.slice(offset - 1, offset - 1 + limit)
       const shown = `lines ${offset}-${offset + page.length - 1} of ${lines.length}\n${page.join('\n')}`
-      return { id: call.id, content: shown.slice(0, 30_000) }
+      return { id: call.id, content: truncateWithReceipt(shown, AGENT_READ_MAX) }
     }
     if (call.name === 'edit') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)

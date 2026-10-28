@@ -44,10 +44,10 @@ export function truncateTurns(turns: SessionTurn[]): SessionTurn[] {
   // shrink oversized tool payloads in what we keep
   const shrink = (turn: SessionTurn): SessionTurn => ({
     ...turn,
-    text: turn.text.length > 8000 ? `${turn.text.slice(0, 8000)}\n… [truncated]` : turn.text,
+    text: turn.text.length > 8000 ? `${turn.text.slice(0, 6000)}\n… [truncated ${turn.text.length - 8000} chars, head+tail kept]\n${turn.text.slice(-2000)}` : turn.text,
     toolResults: turn.toolResults?.map((result) => ({
       ...result,
-      content: result.content.length > 8000 ? `${result.content.slice(0, 8000)}\n… [truncated]` : result.content,
+      content: result.content.length > 8000 ? `${result.content.slice(0, 6000)}\n… [truncated ${result.content.length - 8000} chars, head+tail kept]\n${result.content.slice(-2000)}` : result.content,
     })),
   })
   return [...head.map(shrink), ...tail.map(shrink)]
