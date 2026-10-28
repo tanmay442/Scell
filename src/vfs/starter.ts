@@ -85,8 +85,47 @@ export { count, shout }
 [core]
 	autocrlf = false
 `,
-  [`${HOME}/.profile`]: `# ~/.profile — sourced by login shells
+  [`${HOME}/.profile`]: `# ~/.profile — sourced by login shells; interactive shells read ~/.bashrc
 export PATH="$HOME/.local/bin:$PATH"
+if [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+`,
+  [`${HOME}/.bashrc`]: `# ~/.bashrc — sourced for every interactive shell
+# (in Cell: executed in front of every command, so exports apply everywhere)
+
+# history and session behaviour
+HISTSIZE=1000
+HISTFILE=$HOME/.bash_history
+HISTCONTROL=ignoreboth
+
+# paths
+export PATH="$HOME/.local/bin:$PATH"
+export EDITOR=vi
+export VISUAL=vi
+export PAGER=less
+export LESS=-R
+export LANG=en_US.UTF-8
+export NODE_ENV=development
+export NPM_CONFIG_UPDATE_NOTIFIER=false
+export NPM_CONFIG_FUND=false
+export NPM_CONFIG_AUDIT=false
+
+# shell options
+shopt -s histappend
+shopt -s checkwinsize
+
+# aliases
+alias ll='ls -laF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias grep='grep --color=auto'
+alias df='df -h'
+alias free='free -m'
+
+# prompt (informational; Cell renders its own)
+PS1='\\u@\\h:\\w\\$ '
 `,
 }
 
@@ -140,6 +179,9 @@ export function migrateStarter(vfs: Vfs): void {
   }
   if (vfs.read(`${HOME}/.profile`) === null) {
     vfs.write(`${HOME}/.profile`, FILES[`${HOME}/.profile`])
+  }
+  if (vfs.read(`${HOME}/.bashrc`) === null) {
+    vfs.write(`${HOME}/.bashrc`, FILES[`${HOME}/.bashrc`])
   }
   const pkg = vfs.read(`${PROJECT}/package.json`)
   if (pkg === LEGACY_STARTER_PACKAGE_JSON) {

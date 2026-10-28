@@ -25,42 +25,89 @@ function toResult(result: CommandResult | ShellResult): { stdout: string; stderr
 }
 
 export const HOME_DIR = '/home/user'
+const BASHRC = `${HOME_DIR}/.bashrc`
+
+/** shell internals that must not leak into the persisted env */
+const ENV_BLOCKLIST = new Set([
+  'IFS', 'PS1', 'PS2', 'PS4', 'PPID', 'UID', 'EUID', 'RANDOM', 'SECONDS',
+  'LINENO', 'SHLVL', 'PWD', 'OLDPWD', '_', 'OPTIND', 'BASH', 'BASH_VERSINFO',
+  'BASHOPTS', 'SHELLOPTS', 'COMP_WORDBREAKS', 'DIRSTACK', 'HISTCMD',
+])
 
 /**
  * One long-lived just-bash instance whose filesystem is the Cell Vfs
  * (identity mapping — the shell sees a real user machine rooted at / with
  * HOME=/home/user), plus the platform commands: node (V8 isolate),
  * npm/pnpm/npx (real registry), tsc (ts-rust WASM) and git (libgit2 WASM).
+ *
+ * Session realism, where just-bash is per-execution: `~/.bashrc` is sourced
+ * in front of every command and the environment captured after each one —
+ * so exports persist across commands (like a real interactive shell),
+ * .bashrc variables and aliases apply everywhere, and child processes
+ * (node) inherit what the session exported.
  */
 export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> }): Shell {
-  const fs = new VfsBackedFs(vfs ?? platform().vfs)
-  const bash = new Bash({
-    fs,
-    cwd: HOME_DIR,
-    env: {
-      HOME: HOME_DIR,
-      USER: 'user',
-      SHELL: '/bin/bash',
-      PATH: '/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin',
-      TERM: 'xterm-256color',
-    },
-  })
+  const v = vfs ?? platform().vfs
+  const fs = new VfsBackedFs(v)
+  const baseEnv: Record<string, string> = {
+    HOME: HOME_DIR,
+    USER: 'user',
+    LOGNAME: 'user',
+    SHELL: '/bin/bash',
+    PATH: `${HOME_DIR}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
+    TERM: 'xterm-256color',
+    LANG: 'en_US.UTF-8',
+    HOSTNAME: 'cell',
+  }
+  const bash = new Bash({ fs, cwd: HOME_DIR, env: baseEnv })
+
+  /** environment carried across commands: session exports + last .bashrc state */
+  const sessionEnv: Record<string, string> = {}
+  const hasBashrc = () => v.isFile(BASHRC)
+  const bashrcPrefix = () => (hasBashrc() ? `. ${BASHRC} >/dev/null 2>&1; ` : '')
 
   const shell: Shell = {
     async exec(cmd, cwd) {
-      const result = await bash.exec(cmd, { cwd: cwd ?? HOME_DIR })
-      return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
+      const options = { cwd: cwd ?? HOME_DIR, env: sessionEnv }
+      // the environment capture runs IN-BAND (a separate exec would already
+      // have its env restored): brace the user's command, keep its exit code,
+      // then dump. The dump line is stripped from stdout.
+      const sourceLine = bashrcPrefix()
+      const wrapped =
+        sourceLine !== ''
+          ? `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
+          : `{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump $__cell_rc`
+      const result = await bash.exec(wrapped, options)
+      const marker = '__CELL_ENV__:'
+      const lines = result.stdout.split('\n')
+      const dumpIndex = lines.map((line) => line.startsWith(marker)).lastIndexOf(true)
+      let stdout = result.stdout
+      if (dumpIndex !== -1) {
+        stdout = lines.filter((_, i) => i !== dumpIndex).join('\n')
+        try {
+          const parsed = JSON.parse(lines[dumpIndex].slice(marker.length)) as Record<string, unknown>
+          for (const [key, value] of Object.entries(parsed)) {
+            if (typeof value === 'string' && !ENV_BLOCKLIST.has(key)) sessionEnv[key] = value
+          }
+        } catch {
+          // env capture is best-effort
+        }
+      }
+      return { stdout, stderr: result.stderr, exitCode: result.exitCode }
     },
   }
 
   // A fresh shell for nested calls (npm run <script> runs its own bash).
-  const nestedShell = (): Shell => createShell(vfs ?? platform().vfs)
+  const nestedShell = (): Shell => createShell(vfs, opts)
 
-  const register = (name: string, fn: (args: string[], ctx: { cwd: string }) => Promise<CommandResult> | CommandResult) => {
+  const register = (
+    name: string,
+    fn: (args: string[], ctx: { cwd: string; env: Map<string, string> }) => Promise<CommandResult> | CommandResult,
+  ) => {
     bash.registerCommand(
-      defineCommand(name, async (args: string[], ctx: { cwd?: string }) => {
+      defineCommand(name, async (args: string[], ctx: { cwd?: string; env?: Map<string, string> }) => {
         try {
-          return toResult(await fn(args, { cwd: ctx.cwd ?? HOME_DIR }))
+          return toResult(await fn(args, { cwd: ctx.cwd ?? HOME_DIR, env: ctx.env ?? new Map() }))
         } catch (err) {
           const detail =
             err instanceof Error
@@ -72,23 +119,210 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     )
   }
 
-  register('node', (args, { cwd }) => nodeCommand(vfs ?? platform().vfs, args, { cwd }))
-  register('tsc', (args, { cwd }) => tscCommand(vfs ?? platform().vfs, args, { cwd }))
-  register('git', (args, { cwd }) => gitCommand(vfs ?? platform().vfs, args, { cwd }))
+  // -- session plumbing ------------------------------------------------------
+
+  // env capture: a JSON dump of the current shell environment
+  bash.registerCommand(
+    defineCommand('__cell_env_dump', async (args, ctx) => {
+      const entries: Record<string, string> = {}
+      for (const [key, value] of ctx.env ?? new Map<string, string>()) entries[key] = value
+      const rc = Number.parseInt(args[0] ?? '0', 10)
+      return {
+        stdout: `__CELL_ENV__:${JSON.stringify(entries)}\n`,
+        stderr: '',
+        exitCode: Number.isFinite(rc) ? rc : 0,
+      }
+    }),
+  )
+
+  // -- system-plausibility commands (the container-detection tells) ----------
+
+  register('uname', (args) => {
+    const all = args.includes('-a')
+    const kernel = '6.8.0-cell'
+    if (args.includes('-r')) return { stdout: `${kernel}\n`, stderr: '', exitCode: 0 }
+    if (args.includes('-s') || args.length === 0) return { stdout: 'Linux\n', stderr: '', exitCode: 0 }
+    if (args.includes('-m')) return { stdout: 'x86_64\n', stderr: '', exitCode: 0 }
+    return {
+      stdout: all ? `Linux cell ${kernel} #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux\n` : 'Linux\n',
+      stderr: '',
+      exitCode: 0,
+    }
+  })
+
+  register('id', (_args, { env }) => {
+    const uid = env.get('UID') ?? '1000'
+    return { stdout: `uid=1000(user) gid=1000(user) groups=1000(user),27(sudo),docker(999)\n`, stderr: '', exitCode: 0 }
+  })
+
+  register('groups', () => ({ stdout: 'user sudo docker\n', stderr: '', exitCode: 0 }))
+
+  register('hostname', (_args, { env }) => ({
+    stdout: `${env.get('HOSTNAME') ?? 'cell'}\n`,
+    stderr: '',
+    exitCode: 0,
+  }))
+
+  register('uptime', () => {
+    const bootSeconds = Math.max(60, Math.floor(performance.now() / 1000))
+    const hh = Math.floor(bootSeconds / 3600)
+    const mm = Math.floor((bootSeconds % 3600) / 60)
+    const now = new Date().toTimeString().slice(0, 8)
+    return {
+      stdout: ` ${now} up ${hh}:${mm},  1 user,  load average: 0.31, 0.24, 0.19\n`,
+      stderr: '',
+      exitCode: 0,
+    }
+  })
+
+  register('df', (args) => {
+    const lines = [
+      'Filesystem      Size  Used Avail Use% Mounted on',
+      '/dev/sda1       100G   31G   70G  31% /',
+      'tmpfs           6.3G     0  6.3G   0% /dev/shm',
+      'tmpfs           6.3G  288K  6.3G   1% /run',
+    ]
+    const out = args.includes('-h') || args.length === 0 ? lines.join('\n') : lines.join('\n')
+    return { stdout: `${out}\n`, stderr: '', exitCode: 0 }
+  })
+
+  register('free', (args) => {
+    const g = args.includes('-g')
+    const total = g ? 16 : 15874
+    const used = g ? 6 : 6214
+    const freeMem = g ? 4 : 4102
+    const shared = g ? 1 : 318
+    const buff = g ? 6 : 5558
+    const avail = g ? 9 : 9214
+    const swap = g ? 2 : 2048
+    const rows = g
+      ? [
+          '               total        used        free      shared  buff/cache   available',
+          `Mem:           ${total}        ${used}        ${freeMem}         ${shared}        ${buff}        ${avail}`,
+          `Swap:          ${swap}           0        ${swap}`,
+        ]
+      : [
+          '               total        used        free      shared  buff/cache   available',
+          `Mem:        ${total}       ${used}       ${freeMem}        ${shared}       ${buff}       ${avail}`,
+          `Swap:        ${swap}           0        ${swap}`,
+        ]
+    void args
+    return { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 }
+  })
+
+  register('ps', (args) => {
+    const aux = args.some((a) => a.includes('a'))
+    const rows = aux
+      ? [
+          'USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND',
+          'user         1  0.0  0.1  16756  9832 ?        Ss   09:12   0:01 /bin/bash',
+          'user        42  0.2  0.4 881244 52140 ?        Sl   09:13   0:02 node cell-runtime',
+          `user       ${Math.floor(Math.random() * 900) + 100}  0.0  0.0   5828  3980 ?        R+   ${new Date().toTimeString().slice(0, 5)}   0:00 ps aux`,
+        ]
+      : [
+          '    PID TTY          TIME CMD',
+          '     42 ?        00:00:02 bash',
+        ]
+    return { stdout: `${rows.join('\n')}\n`, stderr: '', exitCode: 0 }
+  })
+
+  // -- which: platform commands are real commands on PATH --------------------
+
+  const PLATFORM_COMMANDS: Record<string, string> = {
+    node: '/usr/local/bin/node',
+    npm: '/usr/local/bin/npm',
+    npx: '/usr/local/bin/npx',
+    pnpm: '/usr/local/bin/pnpm',
+    pnpx: '/usr/local/bin/pnpx',
+    tsc: '/usr/local/bin/tsc',
+    git: '/usr/bin/git',
+    cell: '/usr/local/bin/cell',
+    curl: '/usr/bin/curl',
+  }
+
+  bash.registerCommand(
+    defineCommand('which', async (args, ctx) => {
+      const results: string[] = []
+      let exit = 0
+      for (const name of args.filter((a) => !a.startsWith('-'))) {
+        const platformPath = PLATFORM_COMMANDS[name]
+        if (platformPath !== undefined) {
+          results.push(platformPath)
+          continue
+        }
+        // file lookup across PATH
+        const pathEnv = ctx.env?.get('PATH') ?? baseEnv.PATH
+        let found = ''
+        for (const dir of pathEnv.split(':')) {
+          const candidate = `${dir}/${name}`
+          if (await fs.exists(candidate)) {
+            found = candidate
+            break
+          }
+        }
+        if (found !== '') results.push(found)
+        else exit = 1
+      }
+      return { stdout: results.length > 0 ? `${results.join('\n')}\n` : '', stderr: '', exitCode: exit }
+    }),
+  )
+
+  register('whereis', (args) => {
+    const name = args[0]
+    const known = PLATFORM_COMMANDS[name]
+    if (name === undefined) return { stdout: '', stderr: '', exitCode: 1 }
+    const bin = known ?? ''
+    return { stdout: `${name}: ${bin} ${bin.replace('/bin/', '/share/man/man1/').replace(/\.[a-z]+$/, '')}.1.gz\n`, stderr: '', exitCode: 0 }
+  })
+
+  register('man', async (args) => {
+    const page = args.find((a) => !a.startsWith('-'))
+    if (page !== undefined) {
+      const result = await bash.exec(`${page} --help 2>&1`, { cwd: HOME_DIR, env: sessionEnv })
+      if (result.exitCode === 0 && result.stdout.trim() !== '') {
+        return { stdout: result.stdout, stderr: '', exitCode: 0 }
+      }
+    }
+    return { stdout: '', stderr: `No manual entry for ${page ?? ''}\n`, exitCode: 1 }
+  })
+
+  register('less', async (args, { cwd }) => {
+    // non-interactive pager: behaves like cat
+    const targets = args.filter((a) => !a.startsWith('-'))
+    let out = ''
+    for (const target of targets) {
+      try {
+        out += await fs.readFile(`${cwd}/${target}`.replace('//', '/'))
+      } catch {
+        return { stdout: '', stderr: `less: ${target}: No such file or directory\n`, exitCode: 1 }
+      }
+    }
+    if (targets.length === 0 && args.includes('-')) out = '(stdin)'
+    return { stdout: out, stderr: '', exitCode: 0 }
+  })
+
+  // -- platform commands ------------------------------------------------------
+
+  const shellEnvOf = (env: Map<string, string>): Record<string, string> => {
+    const merged: Record<string, string> = {}
+    for (const [key, value] of env) {
+      if (!ENV_BLOCKLIST.has(key)) merged[key] = value
+    }
+    return merged
+  }
+
+  register('node', (args, { cwd, env }) => nodeCommand(v, args, { cwd, env: shellEnvOf(env) }))
+  register('tsc', (args, { cwd }) => tscCommand(v, args, { cwd }))
+  register('git', (args, { cwd }) => gitCommand(v, args, { cwd }))
   // npm scripts run in their own shell WITH the project's node_modules/.bin
   // on PATH — that is what makes `npm dev` → `vercel dev` work for real
-  const scriptShell = (cwd: string): Shell => {
-    const v = vfs ?? platform().vfs
-    return createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd) })
-  }
-  register('npm', (args, { cwd }) =>
-    npmCommand(vfs ?? platform().vfs, args, { cwd, scriptShell, flavor: 'npm', registerLive }),
-  )
-  register('pnpm', (args, { cwd }) => pnpmCommand(vfs ?? platform().vfs, args, { cwd, scriptShell, registerLive }))
-  register('npx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
-  register('pnpx', (args, { cwd }) => npx(vfs ?? platform().vfs, args, { cwd }))
-  register('cell', (args, { cwd }) => cellCommand(vfs ?? platform().vfs, args, { cwd, shell: nestedShell() }))
-  register('curl', (args, { cwd }) => curlCommand(vfs ?? platform().vfs, args, { cwd }))
+  const scriptShell = (cwd: string): Shell => createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd) })
+  register('npm', (args, { cwd }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive }))
+  register('pnpm', (args, { cwd }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive }))
+  register('npx', (args, { cwd }) => npx(v, args, { cwd }))
+  register('pnpx', (args, { cwd }) => npx(v, args, { cwd }))
+  register('cell', (args, { cwd }) => cellCommand(v, args, { cwd, shell: nestedShell() }))
+  register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))
 
   // global package bins (~/.local/lib/node_modules) are real PATH commands:
   // registered at shell creation for bins installed in earlier sessions, and
@@ -98,16 +332,16 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
     const key = `${binName}::${entry}`
     if (registeredBins.has(key)) return
     registeredBins.add(key)
-    register(binName, (args, { cwd }) => runNodeEntry(vfs ?? platform().vfs, entry, args, cwd, binName))
+    register(binName, (args, { cwd }) => runNodeEntry(v, entry, args, cwd, binName))
   }
-  for (const [binName, entry] of collectBins(vfs ?? platform().vfs, GLOBAL_ROOT)) {
+  for (const [binName, entry] of collectBins(v, GLOBAL_ROOT)) {
     registerBin(binName, entry)
   }
   for (const [binName, entry] of opts?.extraBins ?? []) {
     registerBin(binName, entry)
   }
   const registerLive = (binName: string) => {
-    const entry = collectBins(vfs ?? platform().vfs, GLOBAL_ROOT).get(binName)
+    const entry = collectBins(v, GLOBAL_ROOT).get(binName)
     if (entry !== undefined) registerBin(binName, entry)
   }
 

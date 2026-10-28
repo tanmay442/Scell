@@ -68,7 +68,51 @@ type Zone = { zone: 'vfs'; vpath: string } | { zone: 'sys'; spath: string } | { 
  */
 export class VfsBackedFs implements IFileSystem {
   private sysDirs = new Set<string>(['/', '/tmp', '/dev', '/dev/null', '/proc', '/etc', '/home'])
-  private sysFiles = new Map<string, string>()
+  private sysFiles = new Map<string, string>([
+    // system identity: agents (and packages) read these to place themselves
+    ['/etc/os-release', [
+      'PRETTY_NAME="Cell Linux 1.0 (x86_64)"',
+      'NAME="Cell Linux"',
+      'VERSION_ID="1.0"',
+      'VERSION="1.0 (x86_64)"',
+      'VERSION_CODENAME=cell',
+      'ID=cell',
+      'ID_LIKE=debian',
+      'HOME_URL="https://cell.local"',
+      'SUPPORT_URL="https://cell.local/support"',
+      'BUG_REPORT_URL="https://cell.local/bugs"',
+      '',
+    ].join('\n')],
+    ['/etc/hostname', 'cell\n'],
+    ['/etc/hosts', '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n'],
+    ['/etc/passwd', 'root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:user:/home/user:/bin/bash\n'],
+    ['/etc/group', 'root:x:0:\nuser:x:1000:\nsudo:x:27:user\ndocker:x:999:user\n'],
+    ['/etc/resolv.conf', 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'],
+    ['/proc/version', 'Linux version 6.8.0-cell (cell@cell) (gcc 13.2.0) #1 SMP PREEMPT_DYNAMIC\n'],
+    ['/proc/uptime', '8640.00 31200.00\n'],
+    ['/proc/meminfo', [
+      'MemTotal:       16254912 kB',
+      'MemFree:         4202496 kB',
+      'MemAvailable:    9433088 kB',
+      'Buffers:          512000 kB',
+      'Cached:          5690368 kB',
+      'SwapTotal:       2097152 kB',
+      'SwapFree:        2097152 kB',
+      '',
+    ].join('\n')],
+    ['/proc/cpuinfo', [
+      'processor\t: 0',
+      'vendor_id\t: CellV8',
+      'model name\t: Virtual V8 Isolate @ 3.2GHz',
+      'flags\t\t: fpu sse sse2 avx2',
+      '',
+      'processor\t: 1',
+      'vendor_id\t: CellV8',
+      'model name\t: Virtual V8 Isolate @ 3.2GHz',
+      'flags\t\t: fpu sse sse2 avx2',
+      '',
+    ].join('\n')],
+  ])
   private symlinks = new Map<string, string>()
   private modes = new Map<string, number>()
   private mtimes = new Map<string, Date>()

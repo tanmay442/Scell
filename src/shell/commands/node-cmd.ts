@@ -10,8 +10,8 @@ const HOME = '/home/user'
  * `node` — executes JS (and TS, via the ts-rust WASM transform) from the
  * VFS inside a fresh V8 isolate with Node-flavored globals.
  */
-export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string }): Promise<CommandResult> {
-  const { cwd } = opts
+export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string; env?: Record<string, string> }): Promise<CommandResult> {
+  const { cwd, env: shellEnv } = opts
 
   if (args[0] === '-v' || args[0] === '--version') {
     return { stdout: `${nodeBinaryReport()}\n`, stderr: '', exitCode: 0 }
@@ -22,7 +22,7 @@ export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string 
     if (code === undefined) return { stdout: '', stderr: 'node: -e requires a script string\n', exitCode: 1 }
     const evalPath = `${opts.cwd === '/' ? '' : opts.cwd}/.cell-eval.js`
     vfs.write(evalPath, code)
-    const result = await runNodeProcess(vfs, { entry: evalPath, argv: [], cwd: opts.cwd })
+    const result = await runNodeProcess(vfs, { entry: evalPath, argv: [], cwd: opts.cwd, env: shellEnv })
     vfs.delete(evalPath)
     return result
   }
@@ -54,6 +54,7 @@ export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string 
       entry: transformed.entry,
       argv: args.slice(1),
       cwd,
+      env: shellEnv,
       filesOverride: transformed.emitted,
       hidePaths: transformed.hidden,
       timeoutMs: 120_000,
@@ -61,6 +62,6 @@ export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string 
     return result
   }
 
-  const result = await runNodeProcess(vfs, { entry, argv: args.slice(1), cwd, timeoutMs: 120_000 })
+  const result = await runNodeProcess(vfs, { entry, argv: args.slice(1), cwd, env: shellEnv, timeoutMs: 120_000 })
   return result
 }

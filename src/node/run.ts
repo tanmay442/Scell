@@ -4,6 +4,8 @@ export interface NodeRunOptions {
   entry: string
   argv?: string[]
   cwd?: string
+  /** the calling shell session's environment (exports included) */
+  env?: Record<string, string>
   /** extra/overridden files (e.g. TS→JS emit output), VFS paths */
   filesOverride?: Record<string, string>
   /** files to hide from the sandbox (e.g. original .ts sources after emit) */
@@ -165,8 +167,9 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
       finish({ exitCode: 1, timedOut: false })
     }
 
-    // user-provided env (API keys and friends) from ~/.cell/env.json rides
-    // along: {"GOOGLE_API_KEY": "..."} — the same file cell agent documents
+    // process.env, most-specific last: defaults in the worker < ~/.cell/env.json
+    // (API keys and friends) < the shell session's exports — like inheriting
+    // a real interactive shell's environment
     let env: Record<string, string> | undefined
     const envRaw = vfs.read('/home/user/.cell/env.json')
     if (envRaw !== null) {
@@ -179,6 +182,9 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
       } catch {
         // malformed env file — run with defaults
       }
+    }
+    if (options.env !== undefined) {
+      env = { ...(env ?? {}), ...options.env }
     }
     worker.postMessage({ type: 'exec', id: 1, payload, entry, argv, cwd, env }, [payload.buffer.buffer as ArrayBuffer])
   })

@@ -252,6 +252,16 @@ try {
   ))
   await run('')
 
+  // shell env must reach node process.env (the agent workhorse pattern)
+  await run('export E2E_TOKEN=secret-987')
+  await typeLine('node -e "console.log(\'tok=\' + process.env.E2E_TOKEN)"')
+  report('shell exports reach node process.env', await waitUntil(
+    async () => (await termText()).includes('tok=secret-987'),
+    30000,
+    'env in node',
+  ))
+  await run('')
+
   report('no renderer crashes', crashes.length === 0, crashes.slice(0, 3).join(' | '))
 } catch (err) {
   console.log(`HARNESS ERROR  ${err?.stack ?? err}`)
