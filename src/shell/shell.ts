@@ -16,14 +16,25 @@ export interface ShellResult {
   stdout: string
   stderr: string
   exitCode: number
+  /** the step exceeded its time budget (exit 124); session env was not updated */
+  timedOut?: boolean
+  /** the env-dump marker was absent (exit/syntax killed the epilogue, or a
+   *  timed-out step finished late) — session env may be stale */
+  envStale?: boolean
 }
 
 export interface Shell {
-  exec(cmd: string, cwd?: string, onProgress?: (line: string) => void): Promise<ShellResult>
+  exec(cmd: string, cwd?: string, onProgress?: (line: string) => void, opts?: { timeoutMs?: number }): Promise<ShellResult>
 }
 
-function toResult(result: CommandResult | ShellResult): { stdout: string; stderr: string; exitCode: number } {
-  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode }
+function toResult(result: CommandResult | ShellResult): CommandResult {
+  return {
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    ...('timedOut' in result && result.timedOut !== undefined ? { timedOut: result.timedOut } : {}),
+    ...('oomSuspected' in result && result.oomSuspected !== undefined ? { oomSuspected: result.oomSuspected } : {}),
+  }
 }
 
 export const HOME_DIR = '/home/user'
@@ -69,67 +80,153 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // process), then accumulate their own exports from there
   const sessionEnv: Record<string, string> = { ...(opts?.seedEnv ?? {}) }
   const hasBashrc = () => v.isFile(BASHRC)
-  const bashrcPrefix = () => (hasBashrc() ? `. ${BASHRC} >/dev/null 2>&1; ` : '')
 
   // Progress sink for long commands (git clone, npm install): the terminal
   // passes a live-line writer per exec; platform commands report phases
   // through it while their buffered stdout/stderr still arrive at the end.
   // Save/restore keeps nested shells and sequential execs from clobbering.
   let liveProgress: ((line: string) => void) | undefined
-  // per-exec nonce for the env-dump marker: the dump rides in-band in
-  // stdout, so a fixed marker lets command output forge session env vars —
-  // a random nonce per exec makes that unguessable
+  // per-exec nonce for the env-dump marker and the temp command file: the
+  // dump rides in-band in stdout, so a fixed marker lets command output
+  // forge session env vars — a random nonce per exec makes that unguessable.
+  // The same nonce names the temp file (/tmp/.cell-exec-<nonce>.sh) and the
+  // result-var prefix (__cell_<nonce>_rc), so concurrent execs cannot collide.
   let liveNonce = ''
   const randomHex = (): string =>
     [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('')
 
-  const shell: Shell = {
-    async exec(cmd, cwd, onProgress) {
+  /** default step budget: no agent step wedges the tab forever (P0-1) */
+  const DEFAULT_TIMEOUT_MS = 120_000
+
+  // exec is serialized through a queue: the Bash instance, sessionEnv and
+  // liveProgress are shared, so parallel tool calls would corrupt each other
+  // (P0-2). A timed-out step releases the queue at expiry while its
+  // underlying shell keeps running detached — its late env merge is
+  // skipped (envStale) so it cannot clobber a newer step.
+  let queue: Promise<void> = Promise.resolve()
+
+  const recordFromMap = (env: Map<string, string>): Record<string, string> => {
+    const record: Record<string, string> = {}
+    for (const [key, value] of env) record[key] = value
+    return record
+  }
+
+  const shell = {
+    async exec(cmd, cwd, onProgress, opts) {
+      const ticket = queue
+      let release!: () => void
+      queue = new Promise<void>((resolve) => (release = resolve))
+      await ticket
+      try {
+        return await doExec(cmd, cwd, onProgress, opts)
+      } finally {
+        release()
+      }
+    },
+  } as Shell
+
+  async function doExec(
+    cmd: string,
+    cwd?: string,
+    onProgress?: (line: string) => void,
+    opts?: { timeoutMs?: number },
+  ): Promise<ShellResult> {
       const prev = liveProgress
       liveProgress = onProgress
       const nonce = randomHex()
       const prevNonce = liveNonce
       liveNonce = nonce
+      // collision-proof result var for this exec only
+      const rcVar = `__cell_${nonce}_rc`
+      const tmpPath = `/tmp/.cell-exec-${nonce}.sh`
+      // the user command rides a temp file, never raw interpolation:
+      // unclosed quotes/syntax in the file fail the `source` alone, so
+      // the epilogue below still runs (P0-3). `exit` is shadowed by a
+      // function whose `return` stops the sourced file with that code
+      // instead of killing the long-lived session shell.
+      const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS
       try {
-      const options = { cwd: cwd ?? HOME_DIR, env: sessionEnv }
-      // the environment capture runs IN-BAND (a separate exec would already
-      // have its env restored): brace the user's command, keep its exit code,
-      // then dump. The dump line is stripped from stdout.
-      const sourceLine = bashrcPrefix()
-      const wrapped =
-        `${sourceLine}{ ${cmd}\n}; __cell_rc=$?; __cell_env_dump ${nonce} $__cell_rc`
-      const result = await bash.exec(wrapped, options)
-      // the dump may CONCATENATE onto the command's own output (no trailing
-      // newline) — find the marker anywhere and cut to its end of line
-      const marker = `__CELL_ENV__:${nonce}:`
-      let stdout = result.stdout
-      const markerAt = stdout.lastIndexOf(marker)
-      if (markerAt !== -1) {
-        const lineEnd = stdout.indexOf('\n', markerAt)
-        const dumpText = lineEnd === -1 ? stdout.slice(markerAt) : stdout.slice(markerAt, lineEnd)
-        stdout = lineEnd === -1 ? stdout.slice(0, markerAt) : stdout.slice(0, markerAt) + stdout.slice(lineEnd + 1)
+        await fs.writeFile(tmpPath, cmd)
+        const options = { cwd: cwd ?? HOME_DIR, env: { ...sessionEnv } }
+        // always-run epilogue (`;`-chained, never `&&`): captures the exit
+        // code, dumps the env in-band, then cleans the temp file. The dump
+        // command exits with the user's code, so the step's exitCode is his.
+        const sourceLine = hasBashrc() ? `. ${BASHRC} >/dev/null 2>&1; ` : ''
+        const wrapped =
+          `${sourceLine}exit() { return \${1:-0}; } 2>/dev/null; ${rcVar}=0; source '${tmpPath}' || ${rcVar}=$?; rm -f '${tmpPath}' >/dev/null 2>&1; __cell_env_dump ${nonce} $${rcVar}`
+        const underlying = bash.exec(wrapped, options)
+        let timer: ReturnType<typeof setTimeout> | null = null
         try {
-          const parsed = JSON.parse(dumpText.slice(marker.length)) as Record<string, unknown>
-          for (const [key, value] of Object.entries(parsed)) {
-            if (typeof value !== 'string' || ENV_BLOCKLIST.has(key)) continue
-            if (key.startsWith('BASH_ALIAS_') || key.startsWith('__cell_') || key === '?') continue
-            // the .bashrc re-sourcing prepends PATH every exec — dedupe
-            sessionEnv[key] = key === 'PATH' ? [...new Set(value.split(':'))].filter(Boolean).join(':') : value
+          const result = timeoutMs > 0
+            ? await new Promise<Awaited<ReturnType<typeof bash.exec>>>((resolve, reject) => {
+                timer = setTimeout(() => {
+                  // detach: the shell keeps running, but its late env merge
+                  // is skipped and the temp file is reaped best-effort
+                  void underlying.then(
+                    () => fs.rm(tmpPath, { force: true }).catch(() => {}),
+                    () => fs.rm(tmpPath, { force: true }).catch(() => {}),
+                  )
+                  reject(Object.assign(new Error(`timed out after ${timeoutMs}ms`), { code: 'CELL_TIMEOUT' }))
+                }, timeoutMs)
+                void underlying.then(resolve, reject)
+              })
+            : await underlying
+          // the dump may CONCATENATE onto the command's own output (no trailing
+          // newline) — find the marker anywhere and cut to its end of line
+          const marker = `__CELL_ENV__:${nonce}:`
+          let stdout = result.stdout
+          const markerAt = stdout.lastIndexOf(marker)
+          if (markerAt === -1) {
+            return {
+              stdout,
+              stderr: `${result.stderr}[cell: env capture missed — session env may be stale]\n`,
+              exitCode: result.exitCode,
+              envStale: true,
+            }
           }
-        } catch {
-          // env capture is best-effort
+          const lineEnd = stdout.indexOf('\n', markerAt)
+          const dumpText = lineEnd === -1 ? stdout.slice(markerAt) : stdout.slice(markerAt, lineEnd)
+          stdout = lineEnd === -1 ? stdout.slice(0, markerAt) : stdout.slice(0, markerAt) + stdout.slice(lineEnd + 1)
+          try {
+            const parsed = JSON.parse(dumpText.slice(marker.length)) as Record<string, unknown>
+            for (const [key, value] of Object.entries(parsed)) {
+              if (typeof value !== 'string' || ENV_BLOCKLIST.has(key)) continue
+              if (key.startsWith('BASH_ALIAS_') || key.startsWith('__cell_') || key === '?') continue
+              // the .bashrc re-sourcing prepends PATH every exec — dedupe
+              sessionEnv[key] = key === 'PATH' ? [...new Set(value.split(':'))].filter(Boolean).join(':') : value
+            }
+          } catch {
+            // env capture is best-effort
+          }
+          return { stdout, stderr: result.stderr, exitCode: result.exitCode }
+        } catch (err) {
+          if ((err as { code?: string })?.code === 'CELL_TIMEOUT') {
+            return {
+              stdout: '',
+              stderr: `cell: command timed out after ${Math.round(timeoutMs / 1000)}s (exit 124)\n`,
+              exitCode: 124,
+              timedOut: true,
+              envStale: true,
+            }
+          }
+          throw err
+        } finally {
+          if (timer !== null) clearTimeout(timer)
         }
-      }
-      return { stdout, stderr: result.stderr, exitCode: result.exitCode }
       } finally {
         liveProgress = prev
         liveNonce = prevNonce
       }
-    },
   }
 
   // A fresh shell for nested calls (npm run <script> runs its own bash).
-  const nestedShell = (): Shell => createShell(vfs, opts)
+  // Nested shells seed from the caller's live session env like a real
+  // child process (P0-4); without a caller env they snapshot this shell's.
+  const nestedShellFrom = (callerEnv?: Map<string, string>): Shell =>
+    createShell(vfs, {
+      extraBins: opts?.extraBins,
+      seedEnv: callerEnv !== undefined ? shellEnvOf(callerEnv) : { ...sessionEnv },
+    })
 
   const register = (
     name: string,
@@ -309,12 +406,14 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
     return { stdout: `${name}: ${bin} ${bin.replace('/bin/', '/share/man/man1/').replace(/\.[a-z]+$/, '')}.1.gz\n`, stderr: '', exitCode: 0 }
   })
 
-  register('man', async (args) => {
+  register('man', async (args, { env }) => {
     const page = args.find((a) => !a.startsWith('-'))
     // the name is interpolated into a shell line — reject anything that is
     // not a plain command name so `man "x; evil"` cannot execute
     if (page !== undefined && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(page)) {
-      const result = await bash.exec(`${page} --help 2>&1`, { cwd: HOME_DIR, env: sessionEnv })
+      // re-entry inherits the caller's live env, not the last settled
+      // session snapshot (P0-4)
+      const result = await bash.exec(`${page} --help 2>&1`, { cwd: HOME_DIR, env: recordFromMap(env) })
       if (result.exitCode === 0 && result.stdout.trim() !== '') {
         return { stdout: result.stdout, stderr: '', exitCode: 0 }
       }
@@ -405,7 +504,8 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
         const line = repl !== null
           ? base.replaceAll(repl, batch.join(' '))
           : `${base} ${batch.map(quote).join(' ')}`.trim()
-        const result = await bash.exec(line, { cwd: ctx.cwd, env: sessionEnv })
+        // re-entry inherits the caller's live env (P0-4), not the settled snapshot
+        const result = await bash.exec(line, { cwd: ctx.cwd, env: ctx.env !== undefined ? recordFromMap(ctx.env) : { ...sessionEnv } })
         stdout += result.stdout
         stderr += result.stderr
         if (result.exitCode !== 0) exit = result.exitCode
@@ -452,12 +552,12 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // on PATH — that is what makes `npm dev` → `vercel dev` work for real.
   // The script shell seeds from the caller's session env like a real child.
   const scriptShell = (cwd: string, seed?: Map<string, string>): ShellLike =>
-    createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : undefined })
+    createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : { ...sessionEnv } })
   register('npm', (args, { cwd, env, progress }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive, progress, env }))
   register('pnpm', (args, { cwd, env, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress, env }))
   register('npx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
   register('pnpx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
-  register('cell', (args, { cwd, progress }) => cellCommand(v, args, { cwd, shell: nestedShell(), onProgress: progress }))
+  register('cell', (args, { cwd, env, progress }) => cellCommand(v, args, { cwd, shell: nestedShellFrom(env), onProgress: progress }))
   const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown; progress?: (line: string) => void }) =>
     pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined, progress: ctx.progress })
   register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))

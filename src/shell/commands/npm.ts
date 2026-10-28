@@ -9,13 +9,17 @@ export interface CommandResult {
   stdout: string
   stderr: string
   exitCode: number
+  /** the run exceeded its time budget (exit 124); output is partial */
+  timedOut?: boolean
+  /** the run died or was capped under memory pressure; output may be partial */
+  oomSuspected?: boolean
 }
 
 const ok = (stdout = ''): CommandResult => ({ stdout, stderr: '', exitCode: 0 })
 const fail = (stderr: string, code = 1): CommandResult => ({ stdout: '', stderr, exitCode: code })
 
 export interface ShellLike {
-  exec(cmd: string, cwd?: string): Promise<{ stdout: string; stderr: string; exitCode: number }>
+  exec(cmd: string, cwd?: string, onProgress?: (line: string) => void, opts?: { timeoutMs?: number }): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut?: boolean }>
 }
 
 /** session env carried into npm script shells (a real child inherits them) */
