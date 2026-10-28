@@ -20,6 +20,8 @@ export interface PythonRunOptions {
   cwd: string
   env: Record<string, string>
   payload: PythonPayload
+  /** bytes for the program's stdin (echo data | python script.py); EOF when absent */
+  stdin?: Uint8Array
   /** loading progress (package installs) */
   onStatus?: (text: string) => void
   onOut: (stream: 'stdout' | 'stderr', text: string) => void
@@ -110,6 +112,30 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   // ---- streams ----
   pyodide.setStdout({ batched: (text: string) => options.onOut('stdout', `${text}\n`) })
   pyodide.setStderr({ batched: (text: string) => options.onOut('stderr', `${text}\n`) })
+
+  // ---- stdin: piped bytes for the program (P0-7). just-bash hands us a
+  // latin1 ByteString (one char per byte); the runner takes raw bytes so
+  // `echo data | python script.py` reads `data` instead of silent EOF.
+  // Absent stdin is explicit EOF — input()/read() return '' rather than
+  // blocking the worker forever.
+  const stdinBytes = options.stdin ?? new Uint8Array(0)
+  let stdinCursor = 0
+  try {
+    pyodide.setStdin({
+      error: false,
+      isatty: false,
+      autoEOF: true,
+      read: (buffer: Uint8Array): number => {
+        if (stdinCursor >= stdinBytes.length) return 0
+        const n = Math.min(buffer.length, stdinBytes.length - stdinCursor)
+        buffer.set(stdinBytes.subarray(stdinCursor, stdinCursor + n), 0)
+        stdinCursor += n
+        return n
+      },
+    })
+  } catch {
+    // older pyodide without setStdin.read — stdin stays EOF
+  }
 
   // ---- argv + __file__ + script dir on sys.path (CPython semantics) ----
   const argv = [options.entry, ...options.argv]

@@ -20,11 +20,17 @@ export async function nodeCommand(vfs: Vfs, args: string[], opts: { cwd: string;
   if (args[0] === '-e' || args[0] === '--eval') {
     const code = args[1]
     if (code === undefined) return { stdout: '', stderr: 'node: -e requires a script string\n', exitCode: 1 }
-    const evalPath = `${opts.cwd === '/' ? '' : opts.cwd}/.cell-eval.js`
+    // unique temp name per eval: a fixed `.cell-eval.js` races parallel
+    // `node -e` invocations against each other (P1-8)
+    const suffix = [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, '0')).join('')
+    const evalPath = `${opts.cwd === '/' ? '' : opts.cwd}/.cell-eval-${suffix}.js`
     vfs.write(evalPath, code)
-    const result = await runNodeProcess(vfs, { entry: evalPath, argv: [], cwd: opts.cwd, env: shellEnv })
-    vfs.delete(evalPath)
-    return result
+    try {
+      const result = await runNodeProcess(vfs, { entry: evalPath, argv: [], cwd: opts.cwd, env: shellEnv })
+      return result
+    } finally {
+      if (vfs.exists(evalPath)) vfs.delete(evalPath)
+    }
   }
 
   const entryArg = args[0]

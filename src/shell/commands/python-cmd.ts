@@ -29,6 +29,12 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
   let code: string
   let entry: string
   const argv: string[] = []
+  // bytes for the PROGRAM's stdin (P0-7). When the program itself comes
+  // from stdin (`python -` / bare `python`), stdin is consumed as source
+  // and the program gets EOF; otherwise piped bytes flow to input()/read().
+  const stdinBytesOf = (text: string): Uint8Array =>
+    Uint8Array.from({ length: text.length }, (_, i) => text.charCodeAt(i) & 0xff)
+  let programStdin = stdinBytesOf(opts.stdin ?? '')
 
   if (args[0] === '-c') {
     code = args[1] ?? ''
@@ -48,6 +54,7 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
     }
     code = stdinText
     entry = '-'
+    programStdin = new Uint8Array(0)
   } else {
     const scriptArg = args[0]
     entry = scriptArg.startsWith('/') ? scriptArg : `${opts.cwd}/${scriptArg}`.replace(/\/{2,}/g, '/')
@@ -78,31 +85,56 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
   const payload = buildRunPayload(vfs, hide)
 
   return new Promise<CommandResult>((resolve) => {
-    let stdout = ''
-    let stderr = ''
     let settled = false
-    const MAX_OUTPUT = 4 * 1024 * 1024
+    let oomSuspected = false
+    const OOM_RE = /out of memory|allocation failed|heap out of memory|\bOOM\b|memory limit/i
+    // 4MB cap per stream, head+tail with an explicit receipt (P0-6)
+    const HEAD = 3 * 1024 * 1024
+    const TAIL = 1 * 1024 * 1024
+    const cappedStdout = { head: '', tail: '', total: 0 }
+    const cappedStderr = { head: '', tail: '', total: 0 }
     const append = (stream: 'stdout' | 'stderr', text: string) => {
-      if (stream === 'stdout') {
-        if (stdout.length < MAX_OUTPUT) stdout = (stdout + text).slice(0, MAX_OUTPUT)
-      } else if (stderr.length < MAX_OUTPUT) {
-        stderr = (stderr + text).slice(0, MAX_OUTPUT)
+      const box = stream === 'stdout' ? cappedStdout : cappedStderr
+      if (OOM_RE.test(text)) oomSuspected = true
+      box.total += text.length
+      if (box.head.length < HEAD) {
+        const space = HEAD - box.head.length
+        box.head += text.slice(0, space)
+        text = text.slice(space)
+        if (text === '') return
       }
+      box.tail += text
+      if (box.tail.length > TAIL) box.tail = box.tail.slice(-TAIL)
     }
-
-    const finish = (result: { exitCode: number }) => {
+    const assembled = (box: { head: string; tail: string; total: number }): string => {
+      const kept = box.head + box.tail
+      const dropped = box.total - kept.length
+      if (dropped <= 0) return kept
+      return `${box.head}\n… [truncated ${dropped} chars]\n${box.tail}`
+    }
+    const finish = (result: { exitCode: number; timedOut?: boolean }, trailer?: string) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       worker.terminate()
-      resolve({ stdout, stderr, exitCode: result.exitCode })
+      let stderr = assembled(cappedStderr)
+      if (trailer !== undefined) stderr += trailer
+      resolve({
+        stdout: assembled(cappedStdout),
+        stderr,
+        exitCode: result.exitCode,
+        ...(result.timedOut !== undefined ? { timedOut: result.timedOut } : {}),
+        ...(oomSuspected ? { oomSuspected: true } : {}),
+      })
     }
 
     // pyodide has no interruption API without SharedArrayBuffer — a wedged
     // script is bounded by terminating the worker (in-flight FS changes lost)
     const timer = setTimeout(() => {
-      append('stderr', `python: run exceeded ${TIMEOUT_MS / 1000}s — terminated\n`)
-      finish({ exitCode: 124 })
+      finish(
+        { exitCode: 124, timedOut: true },
+        `python: run exceeded ${TIMEOUT_MS / 1000}s — terminated (exit 124)\n`,
+      )
     }, TIMEOUT_MS)
 
     worker.onmessage = (event: MessageEvent) => {
@@ -139,12 +171,16 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
     }
 
     worker.onerror = (event) => {
-      append('stderr', `${(event as ErrorEvent).message}\n`)
+      const text = `${(event as ErrorEvent).message}\n`
+      if (OOM_RE.test(text)) oomSuspected = true
+      append('stderr', text)
       finish({ exitCode: 1 })
     }
 
+    // the program's stdin rides alongside the run request (P0-7); just-bash
+    // stdin is a latin1 ByteString (one char per byte) — map it back to bytes
     worker.postMessage(
-      { type: 'run', id: 1, payload, code, entry, argv, cwd: opts.cwd, env },
+      { type: 'run', id: 1, payload, code, entry, argv, cwd: opts.cwd, env, stdin: programStdin },
       [payload.buffer.buffer as ArrayBuffer],
     )
   })

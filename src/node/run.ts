@@ -18,6 +18,9 @@ export interface NodeRunResult {
   stderr: string
   exitCode: number
   timedOut: boolean
+  /** worker died under memory pressure, or the crash text says so — the
+   *  exit code alone (usually 1) cannot tell OOM from a test failure */
+  oomSuspected?: boolean
 }
 
 /**
@@ -89,29 +92,50 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
       return
     }
 
-    let stdout = ''
-    let stderr = ''
     let settled = false
     const pendingOut: (boolean | string)[] = []
     let flushTimer: ReturnType<typeof setTimeout> | null = null
-    const MAX_OUTPUT = 4 * 1024 * 1024
+    // 4MB cap per stream, head+tail with an explicit receipt (P0-6): the
+    // first 3MB (the failure context that matters) plus the last 1MB
+    // (the crash line), never silent middle-dropping.
+    const HEAD = 3 * 1024 * 1024
+    const TAIL = 1 * 1024 * 1024
+    const cappedStdout = { head: '', tail: '', total: 0 }
+    const cappedStderr = { head: '', tail: '', total: 0 }
+    const appendCapped = (box: { head: string; tail: string; total: number }, text: string) => {
+      box.total += text.length
+      if (box.head.length < HEAD) {
+        const space = HEAD - box.head.length
+        box.head += text.slice(0, space)
+        text = text.slice(space)
+        if (text === '') return
+      }
+      box.tail += text
+      if (box.tail.length > TAIL) box.tail = box.tail.slice(-TAIL)
+    }
+    const assembled = (box: { head: string; tail: string; total: number }): string => {
+      const kept = box.head + box.tail
+      const dropped = box.total - kept.length
+      if (dropped <= 0) return kept
+      return `${box.head}\n… [truncated ${dropped} chars]\n${box.tail}`
+    }
+    /** OOM looks like exit 1 from the outside — flag the suspicion (P0-5). */
+    let oomSuspected = false
+    const OOM_RE = /out of memory|allocation failed|heap out of memory|\bOOM\b|memory limit/i
     const scheduleFlush = () => {
       if (flushTimer !== null || settled) return
       flushTimer = setTimeout(() => {
         flushTimer = null
         for (let i = 0; i + 1 < pendingOut.length; i += 2) {
           const text = pendingOut[i + 1] ?? ''
-          if (pendingOut[i] === true) {
-            if (stderr.length < MAX_OUTPUT) stderr = (stderr + text).slice(0, MAX_OUTPUT)
-          } else if (stdout.length < MAX_OUTPUT) {
-            stdout = (stdout + text).slice(0, MAX_OUTPUT)
-          }
+          if (OOM_RE.test(String(text))) oomSuspected = true
+          appendCapped(pendingOut[i] === true ? cappedStderr : cappedStdout, String(text))
         }
         pendingOut.length = 0
       }, 40)
     }
 
-    const finish = (result: Omit<NodeRunResult, 'stdout' | 'stderr'>) => {
+    const finish = (result: Omit<NodeRunResult, 'stdout' | 'stderr'>, trailer?: string) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
@@ -121,19 +145,24 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
       }
       for (let i = 0; i + 1 < pendingOut.length; i += 2) {
         const text = pendingOut[i + 1] ?? ''
-        if (pendingOut[i] === true) {
-          if (stderr.length < MAX_OUTPUT) stderr = (stderr + text).slice(0, MAX_OUTPUT)
-        } else if (stdout.length < MAX_OUTPUT) {
-          stdout = (stdout + text).slice(0, MAX_OUTPUT)
-        }
+        if (OOM_RE.test(String(text))) oomSuspected = true
+        appendCapped(pendingOut[i] === true ? cappedStderr : cappedStdout, String(text))
       }
       pendingOut.length = 0
+      // the trailer (timeout/OOM note) appends AFTER truncation so it can
+      // never be cut off (P0-5 untruncatable trailer)
+      let stdout = assembled(cappedStdout)
+      let stderr = assembled(cappedStderr)
+      if (trailer !== undefined) stderr += trailer
       worker.terminate()
-      resolve({ stdout, stderr, ...result })
+      resolve({ stdout, stderr, oomSuspected: oomSuspected || undefined, ...result })
     }
 
     const timer = setTimeout(() => {
-      finish({ exitCode: 124, timedOut: true })
+      finish(
+        { exitCode: 124, timedOut: true },
+        `node: run exceeded ${Math.round(timeoutMs / 1000)}s — terminated (exit 124)\n`,
+      )
     }, timeoutMs)
 
     worker.onmessage = (event: MessageEvent) => {
@@ -163,8 +192,29 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
     }
 
     worker.onerror = (event) => {
-      stderr += `${(event as ErrorEvent).message}\n`
-      finish({ exitCode: 1, timedOut: false })
+      const text = `${(event as ErrorEvent).message}\n`
+      if (OOM_RE.test(text)) oomSuspected = true
+      appendCapped(cappedStderr, text)
+      // drain anything still queued so the crash context is not lost
+      for (let i = 0; i + 1 < pendingOut.length; i += 2) {
+        appendCapped(pendingOut[i] === true ? cappedStderr : cappedStdout, String(pendingOut[i + 1] ?? ''))
+      }
+      pendingOut.length = 0
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer)
+        flushTimer = null
+      }
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      worker.terminate()
+      resolve({
+        stdout: assembled(cappedStdout),
+        stderr: assembled(cappedStderr),
+        exitCode: 1,
+        timedOut: false,
+        oomSuspected: oomSuspected || undefined,
+      })
     }
 
     // process.env, most-specific last: defaults in the worker < ~/.cell/env.json

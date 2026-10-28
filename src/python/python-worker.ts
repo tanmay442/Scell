@@ -62,6 +62,7 @@ interface RunRequest {
   argv: string[]
   cwd: string
   env: Record<string, string>
+  stdin?: Uint8Array
 }
 
 self.onmessage = async (event: MessageEvent<RunRequest>) => {
@@ -76,6 +77,7 @@ self.onmessage = async (event: MessageEvent<RunRequest>) => {
       cwd: msg.cwd,
       env: msg.env,
       payload: msg.payload,
+      stdin: msg.stdin,
       onStatus: (text) => self.postMessage({ type: 'status', id: msg.id, text }),
       onOut: (stream, text) => self.postMessage({ type: 'out', id: msg.id, stream, text }),
     })
