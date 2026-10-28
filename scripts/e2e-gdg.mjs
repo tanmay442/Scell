@@ -193,7 +193,7 @@ try {
   // diagnostics: what is the panel doing?
   for (let i = 0; i < 8; i++) {
     await sleep(8000)
-    console.log(`PANEL+${(i + 1) * 10}s:`, String(await evalJS(`(() => { const p = document.querySelector('.preview-panel'); if (!p) return 'no panel'; const err = p.querySelector('.preview-error')?.textContent ?? ''; const frame = p.querySelector('.preview-frame'); const status = p.querySelector('.preview-status')?.textContent ?? ''; return JSON.stringify({ boot: String(frame?.contentWindow?.__cellBoot ?? 'none').slice(0, 120), status: status.slice(0, 120), error: err.slice(0, 300), frame: !!frame, title: frame?.contentDocument?.title ?? null, root: frame ? (frame.contentDocument?.getElementById('root')?.children?.length ?? -1) : -1, errs: (frame?.contentWindow?.__cellErrors ?? []).slice(0, 6), reactKeys: frame ? Object.keys(frame.contentDocument?.getElementById('root') ?? {}).slice(0, 8) : [], bodyKids: frame ? frame.contentDocument?.body?.children?.length : -1, scripts: frame ? frame.contentDocument?.scripts?.length : -1, scriptSrcs: frame ? Array.from(frame.contentDocument?.scripts ?? []).map(function (s) { var t = s.textContent || ''; try { new Function(t); var parse = 'parses' } catch (e) { var parse = 'SYNTAX:' + e.message } return (s.getAttribute('src') ? 'src=' + s.getAttribute('src').slice(0, 30) : 'inline') + ':' + t.length + ':' + parse + ':rawClose=' + t.includes('</' + 'script') }) : [], bodyTail: frame ? (frame.contentDocument?.body?.innerHTML ?? '').slice(-200) : '' }) })()`)))
+    console.log(`PANEL+${(i + 1) * 10}s:`, String(await evalJS(`(() => { const p = document.querySelector('.preview-panel'); if (!p) return 'no panel'; const frame = p.querySelector('.preview-frame'); if (!frame) return 'no frame'; const doc = frame.contentDocument; if (!doc) return 'no doc'; const bodyCs = getComputedStyle(doc.body); const htmlCs = getComputedStyle(doc.documentElement); const imgs = Array.from(doc.images).slice(0, 6).map((im) => ({ src: im.src.slice(0, 70), ok: im.complete && im.naturalWidth > 0 })); const sheet = doc.styleSheets[doc.styleSheets.length - 1]; let rules = -1; try { rules = sheet ? sheet.cssRules.length : -1 } catch (e) { rules = 'x' } return JSON.stringify({ title: doc.title.slice(0, 30), rootKids: doc.getElementById('root')?.children?.length ?? -1, bg: bodyCs.backgroundColor, htmlCls: doc.documentElement.className, htmlDark: htmlCs.colorScheme, font: bodyCs.fontFamily.slice(0, 30), sheets: doc.styleSheets.length, rules: rules, imgCount: doc.images.length, imgs: imgs, errs: (frame.contentWindow.__cellErrors ?? []).slice(0, 4) }) })()`)))
   }
   report(
     'preview renders the app',
@@ -211,6 +211,31 @@ try {
       'root children',
     ),
   )
+
+  // STYLING + ASSET ground truth: tailwind compiled, custom css present and
+  // applied, public/ images fetchable (not img.complete — svg/lazy lied)
+  await sleep(8000)
+  const styleTruth = await evalJS(`(function () {
+    const doc = document.querySelector('.preview-frame')?.contentDocument
+    if (!doc) return 'no doc'
+    let hasAppContainer = false
+    let total = 0
+    try { for (const sheet of doc.styleSheets) { total += sheet.cssRules.length; for (const rule of sheet.cssRules) { if (rule.cssText && rule.cssText.indexOf('app-container') !== -1) hasAppContainer = true } } } catch (e) { total = -1 }
+    const el = doc.querySelector('.app-container')
+    const bg = el ? getComputedStyle(el).backgroundColor : 'missing-element'
+    return JSON.stringify({ totalRules: total, hasAppContainer: hasAppContainer, appBg: bg, font: getComputedStyle(doc.body).fontFamily.slice(0, 24) })
+  })()`)
+  console.log('STYLE TRUTH:', styleTruth)
+  const assetTruth = await evalJS(`(async function () {
+    const doc = document.querySelector('.preview-frame')?.contentDocument
+    if (!doc) return 'no doc'
+    const out = {}
+    for (const path of ['/logo.svg', '/media/1.webp', '/image.webp']) {
+      try { const r = await fetch(path); out[path] = r.status } catch (e) { out[path] = 'ERR ' + e.message }
+    }
+    return JSON.stringify(out)
+  })()`)
+  console.log('ASSET TRUTH:', assetTruth)
 
   // the tab must still be USEFUL afterwards, with no crashes along the way
   await run('echo benchmark-done')

@@ -69,6 +69,41 @@ export function escapeInlineScript(js: string): string {
     .replace(/<!--/g, '<\\!--')
 }
 
+export interface PublicAsset {
+  /** url path the asset is served at (root-relative, e.g. /logo.svg) */
+  url: string
+  bytes: Uint8Array
+}
+
+/**
+ * The project's public/ tree, mapped to its root paths — React can reference
+ * these at RUNTIME (img src="/logo.svg"), long after the static html rewrite
+ * ran; the service worker serves them from the preview cache.
+ */
+export function collectPublicAssets(vfs: Vfs, dir: string, limit = 300): PublicAsset[] {
+  const out: PublicAsset[] = []
+  const walk = (fsDir: string, urlDir: string) => {
+    if (out.length >= limit) return
+    let names: string[]
+    try {
+      names = vfs.readDir(fsDir)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      const fsPath = `${fsDir}/${name}`
+      const urlPath = urlDir === '' ? `/${name}` : `${urlDir}/${name}`
+      if (vfs.isDir(fsPath)) walk(fsPath, urlPath)
+      else {
+        const bytes = vfs.readBytes(fsPath)
+        if (bytes !== null) out.push({ url: urlPath, bytes })
+      }
+    }
+  }
+  walk(`${dir}/public`, '')
+  return out
+}
+
 export interface PreviewBuild {
   html: string
   /** blob URLs created for this document — revoked on rebuild */

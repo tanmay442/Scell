@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ExternalLink, RefreshCw, X } from 'lucide-react'
 import { platform } from '../platform'
-import { buildPreviewDocument, type PreviewBuild } from '../preview/document'
+import { buildPreviewDocument, collectPublicAssets, type PreviewBuild } from '../preview/document'
 import { runApiFunction } from '../preview/run-api'
 
 interface PendingApi {
@@ -74,12 +74,19 @@ export function PreviewPanel() {
               url,
               new Response(result.html, { headers: { 'content-type': 'text/html; charset=utf-8' } }),
             )
+            // seed public/ at root paths — React references these at runtime
+            // (img src="/logo.svg") long after the static rewrite ran
+            for (const asset of collectPublicAssets(vfs, target)) {
+              const assetUrl = new URL(asset.url, location.href).href
+              await cache.put(assetUrl, new Response(asset.bytes as unknown as BodyInit))
+            }
             // one live preview: drop older documents — keys() returns
             // ABSOLUTE urls, so compare normalized (the relative comparison
             // was never equal and deleted the entry we just wrote)
             const absolute = new URL(url, location.href).href
+            const keep = new Set([absolute, ...collectPublicAssets(vfs, target).map((a) => new URL(a.url, location.href).href)])
             for (const key of await cache.keys()) {
-              if (key.url !== absolute) await cache.delete(key)
+              if (!keep.has(key.url)) await cache.delete(key)
             }
           }
         } catch (err) {

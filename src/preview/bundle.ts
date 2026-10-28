@@ -185,10 +185,13 @@ export interface BundleResult {
 
 const BARE_CSS_IMPORT = /@import\s+["']([^"'.][^"']*)["']\s*;/g
 
-/** Expand bare `@import "pkg"` lines in css from node_modules (tw-animate-css & friends). */
+/** Expand bare `@import "pkg"` lines in css from node_modules (tw-animate-css
+ * & friends) — EXCEPT tailwindcss itself: that directive must survive for the
+ * @tailwindcss/browser runtime, which compiles the whole stylesheet. */
 function expandBareCssImports(resolver: Resolver, css: string, fromDir: string): string {
   return css.replace(BARE_CSS_IMPORT, (full, spec: string) => {
     const sub = spec.split(' ')[0]
+    if (sub === 'tailwindcss' || sub.startsWith('tailwindcss/')) return full
     const resolved = resolver.resolve(fromDir, sub)
     if (resolved === null) return full
     const text = resolver.readText(resolved)

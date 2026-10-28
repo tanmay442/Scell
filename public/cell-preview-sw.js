@@ -33,7 +33,10 @@ self.addEventListener('activate', function (event) {
 })
 
 self.addEventListener('fetch', function (event) {
+  if (event.request.method !== 'GET') return
   const url = new URL(event.request.url)
+  if (url.origin !== self.location.origin) return
+  // preview document navigations
   if (event.request.mode === 'navigate' && url.pathname === '/' && url.searchParams.has('cellpreview')) {
     event.respondWith(
       (async function () {
@@ -50,5 +53,15 @@ self.addEventListener('fetch', function (event) {
         return new Response('<h1>preview expired — run cell preview again</h1>', { status: 404, headers: { 'content-type': 'text/html' } })
       })(),
     )
+    return
   }
+  // project assets referenced at RUNTIME (React img src="/logo.svg") — the
+  // panel seeds public/ into this cache; anything not cached hits the network
+  event.respondWith(
+    (async function () {
+      const cache = await caches.open(CACHE)
+      const hit = await cache.match(event.request)
+      return hit !== undefined ? hit : fetch(event.request)
+    })(),
+  )
 })
