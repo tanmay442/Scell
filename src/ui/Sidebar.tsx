@@ -87,21 +87,41 @@ function Explorer() {
     setEditing(kind === 'file' ? { mode: 'create-file', dir } : { mode: 'create-dir', dir })
   }
 
-  const commitCreate = (dir: string, kind: 'file' | 'dir', name: string) => {
-    const path = vfsPath.join(dir, name)
-    if (!name.trim()) return
-    if (kind === 'file') {
-      vfs.write(path, '')
-      workspaceActions.openFile(path)
-    } else {
-      vfs.mkdir(path)
+  const commitCreate = (dir: string, kind: 'file' | 'dir', name: string): boolean => {
+    const trimmed = name.trim()
+    if (!trimmed) return true
+    const path = vfsPath.join(dir, trimmed)
+    if (vfs.exists(path)) {
+      // never truncate: keep the input open and say why
+      platform().bus.emit('app:status', { message: `'${trimmed}' already exists`, tone: 'error' })
+      return false
     }
+    try {
+      if (kind === 'file') {
+        vfs.write(path, '')
+        workspaceActions.openFile(path)
+      } else {
+        vfs.mkdir(path)
+      }
+    } catch (err) {
+      platform().bus.emit('app:status', { message: `cannot create '${trimmed}': ${err instanceof Error ? err.message : String(err)}`, tone: 'error' })
+      return false
+    }
+    return true
   }
 
-  const commitRename = (path: string, name: string) => {
-    if (!name.trim()) return
-    const to = vfsPath.join(vfsPath.dirname(path), name)
-    if (to !== path) vfs.rename(path, to)
+  const commitRename = (path: string, name: string): boolean => {
+    const trimmed = name.trim()
+    if (!trimmed) return true
+    const to = vfsPath.join(vfsPath.dirname(path), trimmed)
+    if (to === path) return true
+    try {
+      vfs.rename(path, to)
+    } catch (err) {
+      platform().bus.emit('app:status', { message: `cannot rename: ${err instanceof Error ? err.message : String(err)}`, tone: 'error' })
+      return false
+    }
+    return true
   }
 
   const confirmDeleteRow = (
@@ -146,8 +166,7 @@ function Explorer() {
           defaultValue={entry.name}
           placeholder={editing!.dir ? 'folder name' : 'file name'}
           onCommit={(name) => {
-            commitRename(entry.path, name)
-            setEditing(null)
+            if (commitRename(entry.path, name) !== false) setEditing(null)
           }}
           onCancel={() => setEditing(null)}
         />
@@ -187,8 +206,9 @@ function Explorer() {
                 defaultValue=""
                 placeholder={editing.mode === 'create-file' ? 'file name' : 'folder name'}
                 onCommit={(name) => {
-                  commitCreate(entry.path, editing.mode === 'create-file' ? 'file' : 'dir', name)
-                  setEditing(null)
+                  if (commitCreate(entry.path, editing.mode === 'create-file' ? 'file' : 'dir', name) !== false) {
+                    setEditing(null)
+                  }
                 }}
                 onCancel={() => setEditing(null)}
               />
@@ -250,8 +270,9 @@ function Explorer() {
             defaultValue=""
             placeholder={editing.mode === 'create-file' ? 'file name' : 'folder name'}
             onCommit={(name) => {
-              commitCreate('/', editing.mode === 'create-file' ? 'file' : 'dir', name)
-              setEditing(null)
+              if (commitCreate('/', editing.mode === 'create-file' ? 'file' : 'dir', name) !== false) {
+                setEditing(null)
+              }
             }}
             onCancel={() => setEditing(null)}
           />
@@ -276,10 +297,23 @@ function NameInput({
   onCancel(): void
 }) {
   const ref = useRef<HTMLInputElement>(null)
+  const done = useRef(false)
   useEffect(() => {
     ref.current?.focus()
     ref.current?.select()
   }, [])
+  // Enter/Escape/blur can all fire for one dismissal (Escape then blur is
+  // the classic double-fire that created stray files) — run exactly once
+  const commit = (value: string) => {
+    if (done.current) return
+    done.current = true
+    onCommit(value)
+  }
+  const cancel = () => {
+    if (done.current) return
+    done.current = true
+    onCancel()
+  }
   return (
     <div className="tree-row name-input-row" style={{ paddingLeft: 8 + depth * 14 }}>
       <input
@@ -289,10 +323,10 @@ function NameInput({
         placeholder={placeholder}
         spellCheck={false}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') onCommit((e.target as HTMLInputElement).value)
-          if (e.key === 'Escape') onCancel()
+          if (e.key === 'Enter') commit((e.target as HTMLInputElement).value)
+          if (e.key === 'Escape') cancel()
         }}
-        onBlur={(e) => onCommit(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
         onClick={(e) => e.stopPropagation()}
       />
     </div>

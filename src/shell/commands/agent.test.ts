@@ -81,6 +81,36 @@ describe('cell agent loop', () => {
     expect(result.exitCode).toBe(1)
     expect(result.stderr).toContain('~/.cell/agent.json')
   })
+
+  it('rejects unknown providers instead of silently coercing', async () => {
+    const vfs = createVfs()
+    vfs.mkdir('/home/user/.cell')
+    vfs.write('/home/user/.cell/agent.json', JSON.stringify({ provider: 'mars', apiKey: 'x' }))
+    const result = await runAgent(vfs, ['hello'], { cwd: '/home/user', shell: { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) } })
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain("unknown provider 'mars'")
+  })
+
+  it('edits with old/new text and reads with paging', async () => {
+    const vfs = agentVfs()
+    vfs.write('/home/user/notes.txt', 'one\ntwo\nthree\n')
+    const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+    const stub = stubAnthropic([
+      { content: [{ type: 'tool_use', id: 'e1', name: 'edit', input: { path: '~/notes.txt', oldText: 'two\n', newText: 'TWO\n' } }] },
+      { content: [{ type: 'tool_use', id: 'r1', name: 'read', input: { path: '~/notes.txt', offset: 2, limit: 1 } }] },
+      { content: [{ type: 'text', text: 'edited and paged' }] },
+    ])
+    try {
+      const result = await runAgent(vfs, ['edit and read'], { cwd: '/home/user', shell })
+      expect(result.exitCode).toBe(0)
+      expect(vfs.read('/home/user/notes.txt')).toBe('one\nTWO\nthree\n')
+      expect(result.stdout).toContain('lines 2-2 of 4')
+      const toolDefs = stub.requests[0].body.tools.map((t: { name: string }) => t.name)
+      expect(toolDefs).toContain('edit')
+    } finally {
+      stub.restore()
+    }
+  })
 })
 
 describe('npm project roots and bins', () => {

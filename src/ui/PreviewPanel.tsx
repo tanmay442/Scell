@@ -197,11 +197,12 @@ export function PreviewPanel() {
         <span className="preview-title">PREVIEW · {dir.replace(/^\/home\/user/, '~')}</span>
         <span className={`preview-status ${status !== 'idle' ? 'busy' : ''}`}>{status}</span>
         <span className="preview-actions">
-          <button title="Rebuild" onClick={() => rebuild(dir)}>
+          <button title="Rebuild" aria-label="Rebuild preview" onClick={() => rebuild(dir)}>
             <RefreshCw size={13} />
           </button>
           <button
             title={previewUrl !== null ? 'Open in a new tab' : 'Open in a new tab (static — api calls need this panel)'}
+            aria-label="Open preview in a new tab"
             onClick={() => {
               if (previewUrl !== null) window.open(previewUrl, '_blank')
               else if (build) {
@@ -214,6 +215,7 @@ export function PreviewPanel() {
           </button>
           <button
             title="Close preview"
+            aria-label="Close preview"
             onClick={() => {
               if (build) for (const url of build.objectUrls) URL.revokeObjectURL(url)
               sessionStorage.removeItem('cell-preview-dir')

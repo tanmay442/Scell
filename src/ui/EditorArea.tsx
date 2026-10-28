@@ -82,6 +82,16 @@ export function EditorArea() {
           <Welcome />
         ) : (
           ws.openPaths.map((path) => {
+            // deleted files and directories have no editable content — show
+            // a placeholder instead of crashing (EISDIR) or silently
+            // recreating the file on save
+            if (!vfs.isFile(path)) {
+              return (
+                <div key={path} className="editor-missing">
+                  {vfs.exists(path) ? 'This is a directory.' : 'This file no longer exists.'}
+                </div>
+              )
+            }
             // images render; other binaries get a placeholder, not a lossy
             // text editor
             if (vfs.isFile(path) && !vfs.isText(path)) {

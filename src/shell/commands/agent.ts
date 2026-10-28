@@ -27,6 +27,8 @@ interface AgentConfig {
   model: string
 }
 
+const KNOWN_PROVIDERS = ['anthropic', 'openai'] as const
+
 function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
   const raw = vfs.read(AGENT_CONFIG_PATH)
   if (raw === null) {
@@ -48,6 +50,9 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
   try {
     const parsed = JSON.parse(raw) as { provider?: string; apiKey?: string; model?: string }
     if (!parsed.apiKey) return { error: 'cell agent: apiKey missing in ~/.cell/agent.json\n' }
+    if (parsed.provider !== undefined && !(KNOWN_PROVIDERS as readonly string[]).includes(parsed.provider)) {
+      return { error: `cell agent: unknown provider '${parsed.provider}' (use anthropic or openai)\n` }
+    }
     const provider = parsed.provider === 'openai' ? 'openai' : 'anthropic'
     return {
       config: {
@@ -67,7 +72,7 @@ const SYSTEM_PROMPT = `You are an autonomous coding agent running INSIDE Cell �
 - The shell is bash-compatible: node, npm, pnpm, npx, tsc, git (real libgit2), curl, plus coreutils (sed, awk, jq, rg, find, xargs, sqlite3…). Pipes and redirection work.
 - node runs JavaScript and TypeScript directly. npm installs from the real registry. git clones work over https (github via a CORS relay automatically).
 - There is NO child_process, no native binaries, no ssh, no display. Long processes: up to 5 minutes each.
-- Edit files with the write tool; verify with read and bash (cat, tsc, npm test, git diff).
+- Edit files with the read/write/edit tools (small precise edits over whole-file rewrites); verify with read and bash (cat, tsc, npm test, git diff).
 
 Work like a careful engineer: inspect before changing, make small verifiable moves, run the checks, and say plainly what you did at the end.`
 
@@ -105,11 +110,28 @@ function toolDefs(provider: 'anthropic' | 'openai') {
     },
     {
       name: 'read',
-      description: 'Read a text file from the filesystem.',
+      description: 'Read a text file from the filesystem. Long files are paged — pass offset/limit.',
       schema: {
         type: 'object',
-        properties: { path: { type: 'string', description: 'absolute path, ~ allowed' } },
+        properties: {
+          path: { type: 'string', description: 'absolute path, ~ allowed' },
+          offset: { type: 'number', description: 'first line (1-based, default 1)' },
+          limit: { type: 'number', description: 'max lines (default 2000)' },
+        },
         required: ['path'],
+      },
+    },
+    {
+      name: 'edit',
+      description: 'Replace one exact block of text in a file. The old text must occur exactly once.',
+      schema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'absolute path, ~ allowed' },
+          oldText: { type: 'string', description: 'exact text to replace (must be unique)' },
+          newText: { type: 'string', description: 'replacement text' },
+        },
+        required: ['path', 'oldText', 'newText'],
       },
     },
     {
@@ -161,7 +183,25 @@ async function runTool(deps: AgentToolsDeps, call: ToolCall): Promise<ToolResult
       const path = expand(String(call.input.path ?? ''), deps.cwd)
       const content = vfs.read(path)
       if (content === null) return { id: call.id, content: `no such file (or binary): ${path}`, isError: true }
-      return { id: call.id, content: content.slice(0, 30_000) }
+      const lines = content.split('\n')
+      const offset = Math.max(1, Number(call.input.offset ?? 1))
+      const limit = Math.max(1, Number(call.input.limit ?? 2000))
+      const page = lines.slice(offset - 1, offset - 1 + limit)
+      const shown = `lines ${offset}-${offset + page.length - 1} of ${lines.length}\n${page.join('\n')}`
+      return { id: call.id, content: shown.slice(0, 30_000) }
+    }
+    if (call.name === 'edit') {
+      const path = expand(String(call.input.path ?? ''), deps.cwd)
+      const content = vfs.read(path)
+      if (content === null) return { id: call.id, content: `no such file (or binary): ${path}`, isError: true }
+      const oldText = String(call.input.oldText ?? '')
+      const newText = String(call.input.newText ?? '')
+      if (oldText === '') return { id: call.id, content: 'edit: oldText must not be empty', isError: true }
+      const occurrences = content.split(oldText).length - 1
+      if (occurrences === 0) return { id: call.id, content: 'edit: old text not found', isError: true }
+      if (occurrences > 1) return { id: call.id, content: `edit: old text matches ${occurrences} times — include more context`, isError: true }
+      vfs.write(path, content.replace(oldText, newText))
+      return { id: call.id, content: `edited ${path}` }
     }
     if (call.name === 'write') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
@@ -239,6 +279,21 @@ export async function runAgent(
     }
     if (model.text.trim().length > 0) transcript.push(`⏺ ${clip(model.text.trim(), 4)}`)
 
+    if (model.truncated) {
+      // max_tokens cut the turn mid-stream: partial tool calls would
+      // execute with made-up arguments, so discard them and ask to continue
+      transcript.push('agent: model output truncated — continuing briefly')
+      if (config.provider === 'anthropic') {
+        anthropicMessages.push({
+          role: 'user',
+          content: 'Your previous output was truncated by max_tokens. Continue briefly from where you left off.',
+        })
+      } else {
+        openaiMessages.push({ role: 'user', content: 'Your previous output was truncated. Continue briefly from where you left off.' } as never)
+      }
+      continue
+    }
+
     if (model.calls.length === 0) {
       transcript.push('agent: model returned nothing runnable — stopping')
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
@@ -303,6 +358,7 @@ export async function runAgent(
 interface ModelTurn {
   text: string
   calls: ToolCall[]
+  truncated: boolean
 }
 
 async function callModel(
@@ -314,6 +370,7 @@ async function callModel(
     if (config.provider === 'anthropic') {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
+        signal: AbortSignal.timeout(120_000),
         headers: {
           'content-type': 'application/json',
           'x-api-key': config.apiKey,
@@ -332,17 +389,19 @@ async function callModel(
         return { error: `anthropic ${response.status}: ${(await response.text()).slice(0, 300)}` }
       }
       const data = (await response.json()) as {
+        stop_reason?: string
         content: { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> }[]
       }
       const text = (data.content ?? []).filter((block) => block.type === 'text').map((block) => block.text ?? '').join('\n')
       const calls = (data.content ?? [])
         .filter((block) => block.type === 'tool_use')
         .map((block) => ({ id: block.id ?? '', name: block.name ?? '', input: block.input ?? {} }))
-      return { text, calls }
+      return { text, calls, truncated: data.stop_reason === 'max_tokens' }
     }
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
+      signal: AbortSignal.timeout(120_000),
       headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
       body: JSON.stringify({
         model: config.model,
@@ -354,7 +413,7 @@ async function callModel(
       return { error: `openai ${response.status}: ${(await response.text()).slice(0, 300)}` }
     }
     const data = (await response.json()) as {
-      choices: { message: { content?: string | null; tool_calls?: { id: string; function: { name: string; arguments: string } }[] } }[]
+      choices: { finish_reason?: string; message: { content?: string | null; tool_calls?: { id: string; function: { name: string; arguments: string } }[] } }[]
     }
     const message = data.choices[0]?.message
     const calls = (message?.tool_calls ?? []).map((call) => {
@@ -366,7 +425,7 @@ async function callModel(
       }
       return { id: call.id, name: call.function.name, input }
     })
-    return { text: message?.content ?? '', calls }
+    return { text: message?.content ?? '', calls, truncated: data.choices[0]?.finish_reason === 'length' }
   } catch (err) {
     const hint = err instanceof TypeError ? ' (network/CORS — the browser could not reach the API)' : ''
     return { error: `${err instanceof Error ? err.message : String(err)}${hint}` }

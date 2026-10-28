@@ -361,8 +361,12 @@ export async function bundleEntry(
     const failure = result.errors.map((item) => item.text).join('\n')
     return { error: failure !== '' ? failure : 'preview: bundler produced no javascript' }
   }
-  const cssRoot = cssFiles[0] !== undefined ? vfsPath.dirname(cssFiles[0]) : projectDir
-  const css = expandBareCssImports(resolver, [...new Set(cssFiles)].map((path) => resolver.readText(path) ?? '').join('\n'), cssRoot)
-  const tailwind = /@import\s+["']tailwindcss/.test(css) || /tailwindcss/.test(css.slice(0, 500))
+  // expand bare css imports per file (each resolves against its own dir),
+  // then join — EXCEPT tailwindcss itself: that directive must survive for
+  // the @tailwindcss/browser runtime, which compiles the whole stylesheet
+  const css = [...new Set(cssFiles)]
+    .map((path) => expandBareCssImports(resolver, resolver.readText(path) ?? '', vfsPath.dirname(path)))
+    .join('\n')
+  const tailwind = /@import\s+["']tailwindcss["']?\s*;|@(theme|custom-variant|utility|apply)\b/.test(css)
   return { js, css, tailwind }
 }

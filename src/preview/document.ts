@@ -183,12 +183,14 @@ export async function buildPreviewDocument(
   let out = html
   const warnings: string[] = []
 
-  // bundle the module entry (src/main.tsx + node_modules) — before the
-  // generic attribute pass so the script src isn't mistaken for a file link
-  const moduleScript = /<script[^>]*type=["']module["'][^>]*\ssrc=["']([^"']+)["'][^>]*>\s*<\/script>/i.exec(out)
+  // bundle every module entry (most apps have one; some have several) —
+  // before the generic attribute pass so script srcs aren't mistaken for
+  // file links
+  const moduleScripts = [...out.matchAll(/<script[^>]*type=["']module["'][^>]*\ssrc=["']([^"']+)["'][^>]*>\s*<\/script>/gi)]
   let bundledCss = ''
   let tailwind = false
-  if (moduleScript !== null) {
+  for (let i = moduleScripts.length - 1; i >= 0; i--) {
+    const moduleScript = moduleScripts[i]
     const entryAbs = vfsPath.join(dir, moduleScript[1])
     const bundle = await bundleEntry(vfs, dir, entryAbs)
     if ('error' in bundle) return { error: bundle.error }
@@ -199,11 +201,10 @@ export async function buildPreviewDocument(
     // boot markers + sync-throw capture: execution evidence survives even
     // when window.onerror cannot attribute the failure
     const inlined = `<script>window.__cellBoot=(window.__cellBoot||'')+'start;';try{${safeJs}}catch(e){window.__cellErrors.push('boot: '+(e&&e.message?e.message:String(e)))}window.__cellBoot+='end;';</script>`
-    // function replacer: the bundle contains $-patterns (e.g. react-dom's
-    // "$&/") which a string replacer would expand into match artifacts
-    out = out.replace(moduleScript[0], () => inlined)
-    bundledCss = bundle.css
-    tailwind = bundle.tailwind
+    const at = moduleScript.index ?? out.indexOf(moduleScript[0])
+    out = `${out.slice(0, at)}${inlined}${out.slice(at + moduleScript[0].length)}`
+    bundledCss += `${bundle.css}\n`
+    tailwind = tailwind || bundle.tailwind
   }
 
   // src= / href= attributes pointing at local files become blob URLs

@@ -133,8 +133,20 @@ export default function TerminalPanel() {
 
       const tokens = trimmed.split(/\s+/)
       // only a BARE cd is intercepted — `cd x && build` must run in the shell
-      if (tokens[0] === 'cd' && !/(&|\|\|)/.test(trimmed)) {
-        if (tokens[1] === '-') {
+      if (tokens[0] === 'cd' && !/(&|\|\||;)/.test(trimmed)) {
+        // quote-aware target: cd "my dir" works like a real shell
+        let target = '~'
+        const rest = trimmed.slice(2).trim()
+        if (rest !== '') {
+          if (rest.length >= 2 && rest.startsWith('"') && rest.endsWith('"')) {
+            target = rest.slice(1, -1).replace(/\\(.)/g, '$1')
+          } else if (rest.length >= 2 && rest.startsWith("'") && rest.endsWith("'")) {
+            target = rest.slice(1, -1)
+          } else {
+            target = rest.split(/\s+/)[0]
+          }
+        }
+        if (target === '-') {
           const previous = previousCwd
           if (previous === null) {
             writeErr('bash: cd: OLDPWD not set\n')
@@ -148,14 +160,14 @@ export default function TerminalPanel() {
           printPrompt()
           return
         }
-        const target = resolveCd(tokens[1] ?? '~')
-        if (vfs.isDir(target)) {
+        const resolved = resolveCd(target)
+        if (vfs.isDir(resolved)) {
           previousCwd = cwd
-          cwd = target
+          cwd = resolved
           bus.emit('terminal:cwd', { cwd })
           term.write('\r\n')
         } else {
-          writeErr(`bash: cd: ${tokens[1]}: No such file or directory\n`)
+          writeErr(`bash: cd: ${target}: No such file or directory\n`)
         }
         printPrompt()
         return
@@ -331,5 +343,5 @@ export default function TerminalPanel() {
     }
   }, [])
 
-  return <div ref={hostRef} className="terminal-host" />
+  return <div ref={hostRef} className="terminal-host" role="log" aria-label="terminal" />
 }

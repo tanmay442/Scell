@@ -79,8 +79,15 @@ export async function runApiFunction(
   request: ApiRequest,
 ): Promise<ApiResponse | { error: string }> {
   const cleanPath = request.path.split('?')[0].replace(/\/+$/, '')
-  const apiFile = `${projectDir}${cleanPath}.js`
-  if (!vfs.isFile(apiFile)) {
+  // .js first, then .ts, then directory indexes — like real routers
+  const candidates = [
+    `${projectDir}${cleanPath}.js`,
+    `${projectDir}${cleanPath}.ts`,
+    `${projectDir}${cleanPath}/index.js`,
+    `${projectDir}${cleanPath}/index.ts`,
+  ]
+  const apiFile = candidates.find((file) => vfs.isFile(file))
+  if (!apiFile) {
     return { error: `no function at ${cleanPath}.js` }
   }
 

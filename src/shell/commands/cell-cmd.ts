@@ -78,9 +78,14 @@ function restoreTar(vfs: Vfs, bytes: Uint8Array): { files: number; bytes: number
   const files: VfsFileMap = {}
   for (const entry of entries) {
     if (entry.type && entry.type !== 'file') continue
-    const path = entry.path.replace(/^\.\//, '')
-    if (!path.startsWith('/')) continue
+    // snapshots store root-absolute paths, but never trust the archive:
+    // normalize everything in and drop anything that escapes the root
+    const path = `/${entry.path.replace(/^\.\//, '').replace(/^\/+/, '')}`
+    if (path === '/' || path.includes('/../')) continue
     files[path] = looksLikeText(entry.data) ? new TextDecoder().decode(entry.data) : entry.data
+  }
+  if (Object.keys(files).length === 0) {
+    throw new Error('archive contains no restorable files — workspace left untouched')
   }
   vfs.restore(files)
   let total = 0
