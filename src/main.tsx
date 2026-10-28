@@ -23,6 +23,9 @@ async function boot() {
   } else {
     seedStarterProject(vfs)
   }
+  // installed dependencies live in IndexedDB now — ask Chrome not to evict
+  // them under storage pressure (granted silently in most cases)
+  void navigator.storage?.persist?.().catch(() => {})
   // Earlier builds kept repo state in a separate IndexedDB store; .git is a
   // real VFS directory now, so that database is dead weight — remove it once.
   if (typeof indexedDB !== 'undefined') {

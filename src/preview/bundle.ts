@@ -229,7 +229,11 @@ export async function bundleEntry(
         }
         const resolved = resolver.resolve(fromDir, args.path)
         if (resolved === null) {
-          return { errors: [{ text: `preview: cannot resolve '${args.path}' from ${fromDir}` }] }
+          const isBare = !args.path.startsWith('.') && !args.path.startsWith('/')
+          const pkgName = isBare ? args.path.split('/').slice(0, args.path.startsWith('@') ? 2 : 1).join('/') : null
+          const missingDeps = pkgName !== null && !vfs.isDir(`${projectDir}/node_modules/${pkgName}`)
+          const hint = missingDeps ? ` — dependencies are not installed: run npm install in ${projectDir}` : ''
+          return { errors: [{ text: `preview: cannot resolve '${args.path}' from ${fromDir}${hint}` }] }
         }
         return { path: resolved, namespace: 'cell-fs' }
       })

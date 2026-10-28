@@ -2,14 +2,18 @@
  * Cell preview service worker: the preview iframe must load the generated
  * app document from a REAL url on this origin (pathname '/', so router apps
  * match their routes; about:srcdoc breaks them and history.replaceState is
- * forbidden there). The panel generates the document, hands it over here,
- * waits for the ack, then points the iframe at /?cellpreview=<token>.
+ * forbidden there).
+ *
+ * The PANEL writes the document straight into Cache Storage from the page
+ * (CacheStorage is shared origin-wide — no message channel needed), then
+ * navigates the iframe to /?cellpreview=<token>. This worker only SERVES:
+ * every navigation to that url comes from the cache.
  *
  * PLAIN JAVASCRIPT — the browser parses service worker scripts without a
  * transpiler; a type annotation here silently kills the whole preview.
  */
 
-const CACHE = 'cell-preview-v2'
+const CACHE = 'cell-preview-v3'
 
 self.addEventListener('install', function (event) {
   self.skipWaiting()
@@ -24,33 +28,6 @@ self.addEventListener('activate', function (event) {
         if (name !== CACHE) await caches.delete(name)
       }
       await self.clients.claim()
-    })(),
-  )
-})
-
-self.addEventListener('message', function (event) {
-  const msg = event.data
-  if (!msg || msg.type !== 'cell-preview-put') return
-  const reply = function (payload) {
-    if (event.source && event.source.postMessage) {
-      event.source.postMessage(payload)
-    }
-  }
-  event.waitUntil(
-    (async function () {
-      try {
-        const cache = await caches.open(CACHE)
-        // put FIRST, then evict everything except the fresh entry — a
-        // delete-all before the put raced navigations into "preview expired"
-        await cache.put(msg.url, new Response(msg.html, { headers: { 'content-type': 'text/html; charset=utf-8' } }))
-        const keys = await cache.keys()
-        for (const key of keys) {
-          if (key.url !== msg.url) await cache.delete(key)
-        }
-        reply({ type: 'cell-preview-put-done', url: msg.url })
-      } catch (err) {
-        reply({ type: 'cell-preview-put-done', url: msg.url, error: String(err && err.message ? err.message : err) })
-      }
     })(),
   )
 })

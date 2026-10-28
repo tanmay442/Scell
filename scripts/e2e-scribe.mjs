@@ -189,6 +189,24 @@ try {
   // THE way to run this app without vercel: cell preview
   await run('cell preview')
   report('cell preview opens the panel', await waitUntil(async () => (await evalJS(`!!document.querySelector('.preview-panel')`)) === true, 15000, 'panel'))
+  // SW ground truth: attach to the worker target and ask it directly
+  await sleep(6000)
+  try {
+    const { targetInfos } = await conn.send('Target.getTargets')
+    const swTarget = targetInfos.find((t) => t.type === 'service_worker')
+    console.log('SW target:', swTarget ? `${swTarget.url} (${swTarget.state ?? '?'})` : 'NONE FOUND')
+    if (swTarget) {
+      const swSession = (await conn.send('Target.attachToTarget', { targetId: swTarget.targetId, flatten: true })).sessionId
+      const swEval = async (expression) => {
+        const m = await conn.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, swSession)
+        return m.result?.result?.value
+      }
+      console.log('SW cache keys:', JSON.stringify(await swEval(`caches.open('cell-preview-v3').then((c) => c.keys()).then((keys) => keys.map((k) => k.url))`)))
+      console.log('SW registrations:', JSON.stringify(await swEval(`self.registration.scope + ' active=' + !!self.registration.active`)))
+    }
+  } catch (err) { console.log('SW probe error:', err.message) }
+  console.log('iframe href:', JSON.stringify(await evalJS(`document.querySelector('.preview-frame')?.contentWindow?.location?.href ?? 'no-frame'`)))
+  console.log('iframe body head:', JSON.stringify(await evalJS(`(document.querySelector('.preview-frame')?.contentDocument?.body?.textContent ?? 'no-doc').slice(0, 120)`)))
   report(
     'preview renders the app',
     await waitUntil(
@@ -218,6 +236,22 @@ try {
   // the tab must still be USEFUL afterwards
   await run('echo still-alive')
   report('shell works after the run', (await termRows() ?? []).includes('still-alive'))
+
+  // dependencies must SURVIVE a reload (they live in IndexedDB now)
+  await conn.send('Page.reload', {}, sessionId)
+  await waitUntil(async () => (await evalJS(`document.querySelector('.sidebar-body')?.textContent ?? ''`)).includes('scribe'), 40000, 'reload boot')
+  await sleep(1000)
+  await run('cd ~/scribe')
+  await run('test -d node_modules && echo nm-present')
+  report('node_modules survives reload', (await termText()).includes('nm-present'))
+  await typeLine("node -e \"console.log(require('@google/generative-ai') ? 'deps-ok' : 'deps-broken')\"")
+  report('installed deps still resolve after reload', await waitUntil(
+    async () => (await termText()).includes('deps-ok'),
+    30000,
+    'deps resolve',
+  ))
+  await run('')
+
   report('no renderer crashes', crashes.length === 0, crashes.slice(0, 3).join(' | '))
 } catch (err) {
   console.log(`HARNESS ERROR  ${err?.stack ?? err}`)

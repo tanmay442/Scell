@@ -52,8 +52,9 @@ export function PreviewPanel() {
         // /?cellpreview=<token>; fall back to srcDoc when unavailable.
         let url: string | null = null
         try {
-          // register once; ready never resolves without it — race a timeout
-          // so unavailable service workers (private mode, no https) fall back
+          // the worker only INTERCEPTS navigations; the document is written
+          // into CacheStorage directly from this page (shared origin store —
+          // the message-channel version raced its own acks into 404s)
           const registration =
             navigator.serviceWorker !== undefined
               ? await Promise.race([
@@ -64,32 +65,24 @@ export function PreviewPanel() {
                   new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
                 ])
               : null
-          if (registration?.active) {
+          if (registration?.active && typeof caches !== 'undefined') {
             const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
             url = `/?cellpreview=${token}`
-            // navigate only after the worker confirms the document is cached —
-            // racing the write was the 'preview expired' bug
-            const ack = new Promise<boolean>((resolve) => {
-              const listener = (event: MessageEvent) => {
-                if (event.data?.type === 'cell-preview-put-done' && event.data.url === url) {
-                  navigator.serviceWorker.removeEventListener('message', listener)
-                  resolve(event.data.error === undefined)
-                }
-              }
-              navigator.serviceWorker.addEventListener('message', listener)
-              setTimeout(() => {
-                navigator.serviceWorker.removeEventListener('message', listener)
-                resolve(false)
-              }, 3000)
-            })
-            registration.active.postMessage({ type: 'cell-preview-put', url, html: result.html })
-            const stored = await ack
-            if (!stored) {
-              pushLog('preview service worker did not confirm the document', 'error')
-              url = null
+            const cache = await caches.open('cell-preview-v3')
+            await cache.put(
+              url,
+              new Response(result.html, { headers: { 'content-type': 'text/html; charset=utf-8' } }),
+            )
+            // one live preview: drop older documents — keys() returns
+            // ABSOLUTE urls, so compare normalized (the relative comparison
+            // was never equal and deleted the entry we just wrote)
+            const absolute = new URL(url, location.href).href
+            for (const key of await cache.keys()) {
+              if (key.url !== absolute) await cache.delete(key)
             }
           }
-        } catch {
+        } catch (err) {
+          pushLog(`preview cache write failed: ${err instanceof Error ? err.message : String(err)}`, 'error')
           url = null
         }
         setPreviewUrl(url)
