@@ -79,6 +79,11 @@ const shout = add('two', 2)
 
 export { count, shout }
 `,
+  [`${HOME}/.cell/skills/commit/SKILL.md`]: `---\nname: commit\ndescription: Stage and commit the worktree with a clear message (git add/commit, panel flow).\n---\n\n# commit\n\nCommit the current work the way Cell expects:\n\n1. git status to see what changed; git diff to review it.\n2. Read the changed files (read) - never commit code you have not inspected.\n3. git add exactly the files that belong together (leave scratch files out).\n4. git commit -m "<imperative summary>" - one change per commit.\n5. Verify with git log --oneline -3 and git status (tree should be clean).\n\nIdentity comes from ~/.gitconfig. Do not push unless the user asked.\n`,
+  [`${HOME}/.cell/skills/preview/SKILL.md`]: `---\nname: preview\ndescription: Open and verify a static app with cell preview (index.html + api/ functions).\n---\n\n# preview\n\nVerify a browser app the Cell way:\n\n1. The entry is index.html at the project dir (or a subdir you name).\n2. Run cell preview [dir] - it opens the panel and bundles with esbuild-wasm.\n3. api/*.js files run as Vercel-style functions in the node isolate on every request.\n4. Edits hot-reload (600ms debounce). Check the terminal for bundler errors.\n`,
+  [`${HOME}/.cell/skills/debug-tsc/SKILL.md`]: `---\nname: debug-tsc\ndescription: Fix TypeScript errors - reproduce with tsc, edit precisely, re-check.\n---\n\n# debug-tsc\n\nFix type errors without guessing:\n\n1. Reproduce - run tsc in the project and read the errors.\n2. read each flagged file around the reported line - fix the cause, not the message.\n3. Prefer small edit replacements over rewrites; keep the tsconfig strictness as-is.\n4. Re-run tsc until clean, then run the relevant unit check.\n`,
+  [`${HOME}/.cell/commands/commit.md`]: `Review git status and git diff, stage the files that belong together, and commit with a clear imperative message. Verify with git log --oneline -3.\n`,
+  [`${HOME}/.cell/commands/preview.md`]: `Run cell preview for this project and verify it bundles and renders. Report bundler errors and fix missing installs.\n`,
   [`${HOME}/.gitconfig`]: `[user]
 	name = Cell User
 	email = user@cell.local

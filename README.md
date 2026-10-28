@@ -29,7 +29,7 @@ That's the whole setup. The WASM toolchain (21 MB total) is committed under
 | git | Real libgit2 1.9.4 (wasm-git). `.git` is a visible directory; clone/fetch/push over https — CORS-blocked hosts (github) go through a relay chain automatically; `pull` = fetch+merge | e2e: clone from a real git server + github through the relay |
 | App preview | `cell preview`: esbuild-wasm bundles the module graph in-page (exports maps, subpaths, tsx, images), Tailwind compiled live by the oxide runtime, `public/` served at root, Vercel-style `api/*.js` executed per request in the isolate, hot reload | browser e2e benchmarks (style + asset truth probes) |
 | Object storage | `cell save/list/load/status` — whole-workspace tar.gz to any S3-compatible endpoint, SigV4 on WebCrypto (verified against botocore) | `cell-cmd.test.ts` |
-| AI agent | `cell agent "task"` — Anthropic/OpenAI tool loop over `bash`/`read`/`write`/`ls` on the same filesystem, step budget, full transcript | `agent.test.ts` |
+| AI agent | `cell agent "task" [--steps N] [--resume <id>]` — Meta/Anthropic/OpenAI tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill` + custom `~/.cell/tools/*.json`, skills with progressive disclosure, slash commands, sessions in `~/.cell/sessions/`, per-tool approval, secret redaction, SSE streaming | `agent*.test.ts` |
 
 ## Architecture
 
@@ -113,7 +113,7 @@ Chrome over raw CDP.
 ## Testing
 
 ```sh
-pnpm test        # 128 unit tests (vitest)
+pnpm test        # unit tests (vitest)
 pnpm build       # typecheck + production build
 
 # browser e2e (needs the dev server on :5199 — `pnpm dev` — plus internet:
@@ -122,6 +122,7 @@ pnpm build       # typecheck + production build
 pnpm e2e              # main flow (or: node scripts/e2e.mjs)
 pnpm e2e:gdg          # gdg-hbtu benchmark
 pnpm e2e:scribe       # scribe repro
+CELL_AGENT_LIVE_KEY=LLM_… pnpm e2e:agent  # meta agent harness (skips without the key)
 ```
 
 The e2e scripts are dependency-free (raw Chrome DevTools Protocol over
@@ -137,8 +138,12 @@ plus the live registry and github (internet required).
 | File | Purpose |
 |---|---|
 | `~/.gitconfig` | git identity — edited in the app, bridged into libgit2 |
-| `~/.cell/agent.json` | `{ "provider": "anthropic" \| "openai", "apiKey": "…", "model": "…" }` |
+| `~/.cell/agent.json` | `{ "provider": "meta" \| "anthropic" \| "openai", "model": "…", "apiKey": "…" }` — meta uses `muse-spark-1.3-contributor` and reads the key from the machine auth file when `apiKey` is omitted |
 | `~/.cell/env.json` | env vars for node processes and api functions (`{"GOOGLE_API_KEY": "…"}`) |
+| `~/.cell/tools/*.json` | custom agent tools: `{ "name", "description", "parameters", "run": { "kind": "bash", "command": "… {{arg}} …" } }` |
+| `~/.cell/skills/<name>/SKILL.md` | agent skills (frontmatter `name`+`description`, markdown body); project override at `<project>/.cell/skills/` |
+| `~/.cell/commands/*.md` | agent slash commands (`/commit`, `/preview` seeds) |
+| `~/.cell/sessions/*.json` | agent run transcripts + resumable history (`cell agent --resume <id>`) |
 | `~/.cell/storage.json` | S3-compatible endpoint for `cell save/load` snapshots |
 | `~/.gitconfig` `[cell] corsproxy` | custom git CORS relay list (`off` disables) |
 

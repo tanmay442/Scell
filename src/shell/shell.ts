@@ -457,7 +457,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   register('pnpm', (args, { cwd, env, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress, env }))
   register('npx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
   register('pnpx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
-  register('cell', (args, { cwd }) => cellCommand(v, args, { cwd, shell: nestedShell() }))
+  register('cell', (args, { cwd, progress }) => cellCommand(v, args, { cwd, shell: nestedShell(), onProgress: progress }))
   const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown; progress?: (line: string) => void }) =>
     pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined, progress: ctx.progress })
   register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))

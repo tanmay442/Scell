@@ -113,12 +113,12 @@ async function safeText(response: Response): Promise<string> {
   }
 }
 
-export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike }): Promise<CommandResult> {
+export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike; onProgress?: (line: string) => void }): Promise<CommandResult> {
   const sub = args[0] ?? 'help'
 
   if (sub === 'agent') {
     if (!opts.shell) return { stdout: '', stderr: 'cell agent: no shell available in this context\n', exitCode: 1 }
-    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell })
+    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell, onProgress: opts.onProgress })
   }
 
   if (sub === 'preview') {
@@ -212,7 +212,7 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
 
   return {
     stdout:
-      'usage: cell <command>\n\npreview run the app right here: cell preview [dir] — static + Vercel-style api/\nagent   run the headless AI agent: cell agent "fix the failing test" [--steps N]\nsave    snapshot the whole workspace to object storage (tar.gz, SigV4 PUT)\nlist    snapshots in the bucket\nload    restore a snapshot: `cell load` (latest) or `cell load 3`\nstatus  configuration and workspace summary\n\nagent config: ~/.cell/agent.json — storage: ~/.cell/storage.json — env keys: ~/.cell/env.json\n',
+      'usage: cell <command>\n\npreview run the app right here: cell preview [dir] — static + Vercel-style api/\nagent   run the headless AI agent: cell agent "fix the failing test" [--steps N] [--resume <id>]\nsave    snapshot the whole workspace to object storage (tar.gz, SigV4 PUT)\nlist    snapshots in the bucket\nload    restore a snapshot: `cell load` (latest) or `cell load 3`\nstatus  configuration and workspace summary\n\nagent config: ~/.cell/agent.json — storage: ~/.cell/storage.json — env keys: ~/.cell/env.json\n',
     stderr: '',
     exitCode: sub === 'help' ? 0 : 1,
   }
