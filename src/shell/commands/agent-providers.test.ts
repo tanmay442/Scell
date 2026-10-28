@@ -121,6 +121,28 @@ describe('meta responses transport', () => {
     expect(seen[0]).toBe('Bearer env-meta-key')
   })
 
+  it('resume follow-up sends the new user message (not stale outputs)', async () => {
+    const vfs = createVfs()
+    vfs.mkdir('/home/user/.cell')
+    vfs.write('/home/user/.cell/agent.json', JSON.stringify({ provider: 'meta', model: 'muse-spark-1.3-contributor', apiKey: 'k' }))
+    const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+    const stub = stubMeta([
+      { id: 'resp_1', status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'noted' }] }] },
+    ])
+    const first = await runAgent(vfs, ['remember BLUEBIRD'], { cwd: '/home/user', shell })
+    expect(first.exitCode).toBe(0)
+    const [sessionFile] = vfs.readDir('/home/user/.cell/sessions')
+    const stub2 = stubMeta([
+      { id: 'resp_2', status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'BLUEBIRD' }] }] },
+    ])
+    const second = await runAgent(vfs, ['--resume', sessionFile.replace(/\.json$/, ''), 'what was it?'], { cwd: '/home/user', shell })
+    expect(second.exitCode).toBe(0)
+    // first request of the resumed run chains the prior response AND carries the new prompt
+    const followUp = stub2.requests[0].body
+    expect(followUp.previous_response_id).toBe('resp_1')
+    expect(followUp.input).toEqual([{ role: 'user', content: [{ type: 'input_text', text: expect.stringContaining('what was it?') }] }])
+  })
+
   it('saves a session and resumes it', async () => {
     const vfs = metaVfs()
     const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }

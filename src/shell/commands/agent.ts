@@ -1,6 +1,5 @@
 import type { Vfs } from '../../vfs/types'
 import type { CommandResult, ShellLike } from './npm'
-import { projectRoot } from './install'
 import { redactSecrets } from './agent-redact'
 import {
   registryEntries,
@@ -12,12 +11,13 @@ import {
   type ToolResult,
 } from './agent-tools'
 import { loadSkills, skillIndex } from './agent-skills'
-import { saveSession, loadSession, listSessions, sessionId, type SessionTurn } from './agent-sessions'
+import { saveSession, loadSession, sessionId, type SessionTurn } from './agent-sessions'
 import { expandSlashCommand } from './agent-commands'
 import {
   callModel,
   newProviderState,
   setMetaOutputs,
+  setMetaPendingUser,
   type AgentConfig,
   type ProviderKind,
   type ProviderState,
@@ -214,9 +214,6 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const configured = readConfig(vfs)
   if ('error' in configured) return { stdout: '', stderr: `${configured.error}\n`, exitCode: 1 }
 
-  // sessions live under ~/.cell/sessions regardless of resume/new
-  void listSessions
-
   // resume: restore transcript + turns, then continue with the new prompt
   let resumedTurns: SessionTurn[] = []
   let resumedTranscript: string[] = []
@@ -267,7 +264,6 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   } catch {
     // no custom tools
   }
-  void projectRoot
   const { skills } = loadSkills(vfs, opts.cwd)
   const skillBodies = new Map(skills.map((skill) => [skill.name, `# ${skill.name}\n\n${skill.body}`]))
 
@@ -311,8 +307,15 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
     if (model.text.trim().length > 0 && model.calls.length === 0) {
       transcript.push(`\n${redactSecrets(model.text.trim())}`)
-      turns.push({ role: 'assistant', text: model.text })
+      turns.push({
+        role: 'assistant',
+        text: model.text,
+        ...(model && 'responseId' in model && typeof (model as { responseId?: string }).responseId === 'string'
+          ? { responseId: (model as { responseId?: string }).responseId }
+          : {}),
+      })
       recordProviderTurn(state, config.provider, model.text, model.calls, turns)
+      transcript.push(`session ${id} — resume with \`cell agent --resume ${id} "…"\``)
       persist(step)
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
     }
@@ -333,6 +336,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
         state.openaiMessages.push({ role: 'user', content: 'Your previous output was truncated. Continue briefly from where you left off.' } as never)
         turns.push({ role: 'user', text: 'Your previous output was truncated. Continue briefly from where you left off.' })
       } else {
+        setMetaPendingUser(state, 'Your previous output was truncated. Continue briefly from where you left off.')
         turns.push({ role: 'user', text: 'Your previous output was truncated. Continue briefly from where you left off.' })
       }
       continue
@@ -402,6 +406,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 function pushUserTurn(state: ProviderState, provider: ProviderKind, text: string): void {
   if (provider === 'anthropic') state.anthropicMessages.push({ role: 'user', content: text })
   else if (provider === 'openai') state.openaiMessages.push({ role: 'user', content: text } as never)
+  else setMetaPendingUser(state, text)
 }
 
 function recordAssistantMessage(state: ProviderState, provider: ProviderKind, text: string, calls: ToolCall[]): void {

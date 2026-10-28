@@ -35,7 +35,6 @@ export interface AgentSession {
 }
 
 const MAX_TURNS = 40
-const MAX_TOOL_CHARS = 60_000
 
 /** Keep the first user prompt + the last turns; drop the middle. */
 export function truncateTurns(turns: SessionTurn[]): SessionTurn[] {
@@ -51,7 +50,6 @@ export function truncateTurns(turns: SessionTurn[]): SessionTurn[] {
       content: result.content.length > 8000 ? `${result.content.slice(0, 8000)}\n… [truncated]` : result.content,
     })),
   })
-  void MAX_TOOL_CHARS
   return [...head.map(shrink), ...tail.map(shrink)]
 }
 

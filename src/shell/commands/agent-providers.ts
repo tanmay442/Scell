@@ -50,6 +50,8 @@ export interface ProviderState {
   openaiMessages: { role: string; content: string | null }[]
   metaResponseId: string | null
   metaFirstInput: { role: string; content: { type: string; text: string }[] } | null
+  /** new user text awaiting send on the chained (previous_response_id) path */
+  metaPendingUser: string | null
 }
 
 export function newProviderState(prompt: string): ProviderState {
@@ -58,6 +60,7 @@ export function newProviderState(prompt: string): ProviderState {
     openaiMessages: [{ role: 'user', content: prompt }],
     metaResponseId: null,
     metaFirstInput: { role: 'user', content: [{ type: 'input_text', text: prompt }] },
+    metaPendingUser: prompt,
   }
 }
 
@@ -230,22 +233,6 @@ async function callMeta(
 ): Promise<ModelTurn | { error: string }> {
   const maxOutput = config.maxOutputTokens ?? 4096
   const tools = toMetaTools(entries)
-  // First turn carries the system prompt + user prompt; later turns chain
-  // through previous_response_id with function_call_output inputs.
-  const body: Record<string, unknown> = state.metaResponseId === null
-    ? {
-        model: config.model,
-        input: [
-          { role: 'system', content: [{ type: 'input_text', text: systemPrompt }] },
-          state.metaFirstInput,
-        ],
-        tools,
-        tool_choice: 'auto',
-        max_output_tokens: maxOutput,
-      }
-    : null as unknown as Record<string, unknown>
-  void body
-
   // Streaming when the shell offers a progress line: text deltas stream
   // live through onProgress; the final response still comes from the
   // response.completed event. Non-streaming otherwise (simpler for tests).
@@ -255,10 +242,7 @@ async function callMeta(
   const requestBody = state.metaResponseId === null
     ? {
         model: config.model,
-        input: [
-          { role: 'system', content: [{ type: 'input_text', text: systemPrompt }] },
-          state.metaFirstInput,
-        ],
+        input: metaInput(state, systemPrompt),
         tools,
         tool_choice: 'auto',
         max_output_tokens: maxOutput,
@@ -266,7 +250,7 @@ async function callMeta(
     : {
         model: config.model,
         previous_response_id: state.metaResponseId,
-        input: (state as { pendingOutputs?: unknown }).pendingOutputs ?? [],
+        input: metaInput(state, systemPrompt),
         tools,
         tool_choice: 'auto',
         max_output_tokens: maxOutput,
@@ -299,10 +283,7 @@ async function callMetaStream(
       ? {
           model: config.model,
           stream: true,
-          input: [
-            { role: 'system', content: [{ type: 'input_text', text: systemPrompt }] },
-            state.metaFirstInput,
-          ],
+          input: metaInput(state, systemPrompt),
           tools,
           tool_choice: 'auto',
           max_output_tokens: maxOutput,
@@ -311,7 +292,7 @@ async function callMetaStream(
           model: config.model,
           stream: true,
           previous_response_id: state.metaResponseId,
-          input: (state as { pendingOutputs?: unknown }).pendingOutputs ?? [],
+          input: metaInput(state, systemPrompt),
           tools,
           tool_choice: 'auto',
           max_output_tokens: maxOutput,
@@ -339,6 +320,33 @@ async function callMetaStream(
 /** Stash function_call_output items for the next Meta request (chained via previous_response_id). */
 export function setMetaOutputs(state: ProviderState, outputs: { type: string; call_id: string; output: string }[]): void {
   (state as { pendingOutputs?: unknown }).pendingOutputs = outputs;
+  state.metaPendingUser = null
+}
+
+/** Stash new user text for the next chained Meta request (e.g. after --resume). */
+export function setMetaPendingUser(state: ProviderState, text: string): void {
+  state.metaPendingUser = text
+  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+}
+
+/**
+ * Input for the next Meta request. First turn: system + user prompt.
+ * Later turns chain through previous_response_id: a fresh user message
+ * goes as a user item; tool results go as function_call_output items.
+ */
+function metaInput(state: ProviderState, systemPrompt: string): Record<string, unknown>[] {
+  if (state.metaResponseId === null) {
+    return [
+      { role: 'system', content: [{ type: 'input_text', text: systemPrompt }] },
+      state.metaFirstInput ?? { role: 'user', content: [{ type: 'input_text', text: state.metaPendingUser ?? '' }] },
+    ]
+  }
+  if (state.metaPendingUser !== null) {
+    const text = state.metaPendingUser
+    state.metaPendingUser = null
+    return [{ role: 'user', content: [{ type: 'input_text', text }] }]
+  }
+  return ((state as { pendingOutputs?: unknown }).pendingOutputs ?? []) as Record<string, unknown>[]
 }
 
 export { META_URL }
