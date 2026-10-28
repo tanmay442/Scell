@@ -10,7 +10,7 @@ import { BottomPanel } from './BottomPanel'
 import { PreviewPanel } from './PreviewPanel'
 import { StatusBar } from './StatusBar'
 
-export type SidebarView = 'explorer' | 'git'
+export type SidebarView = 'explorer' | 'git' | 'agent'
 
 export function App() {
   const [panelVisible, setPanelVisible] = useState(true)

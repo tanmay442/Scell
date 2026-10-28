@@ -1,4 +1,4 @@
-import { Files, Search, GitBranch, Blocks, Settings } from 'lucide-react'
+import { Bot, Files, Search, GitBranch, Blocks, Settings } from 'lucide-react'
 import type { SidebarView } from './App'
 
 const ITEMS: {
@@ -10,6 +10,7 @@ const ITEMS: {
 }[] = [
   { id: 'explorer', label: 'Explorer', icon: Files, view: 'explorer' },
   { id: 'git', label: 'Source Control', icon: GitBranch, view: 'git' },
+  { id: 'agent', label: 'Agent', icon: Bot, view: 'agent' },
   { id: 'search', label: 'Search', icon: Search, hint: 'Search — Phase 5' },
   { id: 'packages', label: 'Packages', icon: Blocks, hint: 'npm install — you can already run it in the terminal' },
   { id: 'settings', label: 'Settings', icon: Settings, hint: 'Settings — later' },
