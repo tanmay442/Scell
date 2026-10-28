@@ -26,6 +26,12 @@ async function boot() {
   // installed dependencies live in IndexedDB now — ask Chrome not to evict
   // them under storage pressure (granted silently in most cases)
   void navigator.storage?.persist?.().catch(() => {})
+  // the preview service worker registers at boot so it is ACTIVE long before
+  // the first `cell preview` — a lazily-registered one raced its first build
+  // into the srcdoc fallback (and router apps warned 'No routes matched')
+  if (typeof navigator !== 'undefined' && navigator.serviceWorker) {
+    void navigator.serviceWorker.register('/cell-preview-sw.js').catch(() => {})
+  }
   // Earlier builds kept repo state in a separate IndexedDB store; .git is a
   // real VFS directory now, so that database is dead weight — remove it once.
   if (typeof indexedDB !== 'undefined') {

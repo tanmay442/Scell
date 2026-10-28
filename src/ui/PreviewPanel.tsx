@@ -27,6 +27,7 @@ export function PreviewPanel() {
   const [logs, setLogs] = useState<{ text: string; tone: 'info' | 'error' }[]>([])
   const [status, setStatus] = useState('idle')
   const buildRef = useRef<PreviewBuild | null>(null)
+  const restoredDir = useRef<string | null>(null)
   buildRef.current = build
   const pushLog = useCallback((text: string, tone: 'info' | 'error' = 'info') => {
     setLogs((prev) => [...prev.slice(-40), { text, tone }])
@@ -94,16 +95,19 @@ export function PreviewPanel() {
   )
 
   useEffect(() => {
-    // survive reloads: the last previewed dir reopens automatically
-    const saved = localStorage.getItem('cell-preview-dir')
+    // survive RELOADS (sessionStorage), not fresh tabs — a new tab starts
+    // with a clean workspace view
+    const saved = sessionStorage.getItem('cell-preview-dir')
     if (saved !== null && vfs.isDir(saved)) {
       pushLog(`preview restored for ${saved.replace(/^\/home\/user/, '~')}`)
       setDir(saved)
       rebuild(saved)
     }
     const off = bus.on('preview:open', (payload: { dir: string }) => {
+      if (payload.dir === sessionStorage.getItem('cell-preview-dir') && restoredDir.current === payload.dir) return
       pushLog(`preview opened for ${payload.dir.replace(/^\/home\/user/, '~')}`)
-      localStorage.setItem('cell-preview-dir', payload.dir)
+      sessionStorage.setItem('cell-preview-dir', payload.dir)
+      restoredDir.current = payload.dir
       setDir(payload.dir)
       rebuild(payload.dir)
     })
@@ -169,9 +173,10 @@ export function PreviewPanel() {
             <RefreshCw size={13} />
           </button>
           <button
-            title="Open in new tab (static — api calls need this panel)"
+            title={previewUrl !== null ? 'Open in a new tab' : 'Open in a new tab (static — api calls need this panel)'}
             onClick={() => {
-              if (build) {
+              if (previewUrl !== null) window.open(previewUrl, '_blank')
+              else if (build) {
                 const blob = new Blob([build.html], { type: 'text/html' })
                 window.open(URL.createObjectURL(blob), '_blank')
               }
@@ -183,7 +188,8 @@ export function PreviewPanel() {
             title="Close preview"
             onClick={() => {
               if (build) for (const url of build.objectUrls) URL.revokeObjectURL(url)
-              localStorage.removeItem('cell-preview-dir')
+              sessionStorage.removeItem('cell-preview-dir')
+              restoredDir.current = null
               setDir(null)
               setBuild(null)
               setPreviewUrl(null)
