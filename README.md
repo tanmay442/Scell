@@ -27,7 +27,7 @@ That's the whole setup. The WASM toolchain (21 MB total) is committed under
 | TypeScript | ts-rust (Rust port of TS 7) in WASM: live editor diagnostics, `tsc` CLI, TS runs directly on `node` | e2e |
 | npm/pnpm/npx | Real registry: semver, SHA-1-verified tarballs, scoped packages, npm aliases (`npm:x@y`), project-root installs, `-g` with PATH bins, scripts with `node_modules/.bin` | e2e: subdir install + global bins |
 | git | Real libgit2 1.9.4 (wasm-git). `.git` is a visible directory; clone/fetch/push over https — CORS-blocked hosts (github) go through a relay chain automatically; `pull` = fetch+merge | e2e: clone from a real git server + github through the relay |
-| App preview | `cell preview`: esbuild-wasm bundles the module graph in-page (exports maps, subpaths, tsx, images), Tailwind compiled live by the oxide runtime, `public/` served at root, Vercel-style `api/*.js` executed per request in the isolate, hot reload | `scripts/e2e-gdg.mjs` (style + asset truth probes) |
+| App preview | `cell preview`: esbuild-wasm bundles the module graph in-page (exports maps, subpaths, tsx, images), Tailwind compiled live by the oxide runtime, `public/` served at root, Vercel-style `api/*.js` executed per request in the isolate, hot reload | browser e2e benchmarks (style + asset truth probes) |
 | Object storage | `cell save/list/load/status` — whole-workspace tar.gz to any S3-compatible endpoint, SigV4 on WebCrypto (verified against botocore) | `cell-cmd.test.ts` |
 | AI agent | `cell agent "task"` — Anthropic/OpenAI tool loop over `bash`/`read`/`write`/`ls` on the same filesystem, step budget, full transcript | `agent.test.ts` |
 
@@ -91,10 +91,10 @@ src/
   preview/        esbuild bundler, document builder, SW, api runner
   terminal/ ui/   the IDE (xterm, CodeMirror, panels)
 scripts/
-  e2e.mjs         main e2e: 41 checks over headless Chrome (raw CDP, no deps)
-  e2e-scribe.mjs  real-repo benchmark: clone → install → preview → api → reload
-  e2e-gdg.mjs     modern-app benchmark: Vite/React/Tailwind repo, style probes
+  e2e.mjs              main e2e over headless Chrome (raw CDP, no deps)
   git-http-server.mjs  real `git http-backend` server for clone tests
+  (additional real-repo benchmark scripts live alongside — not part of the
+   shared test surface; they clone external repositories by name)
 public/
   wasm/           committed toolchain: esbuild (14M), ts_rust (6M), lg2 (1.6M)
   vendor/         @tailwindcss/browser runtime (rust oxide → wasm)
@@ -114,15 +114,13 @@ pnpm build       # typecheck + production build
 
 # browser e2e (needs the dev server running):
 node scripts/e2e.mjs          # main flow
-node scripts/e2e-scribe.mjs   # real github repo: clone → install → preview → api → reload
-node scripts/e2e-gdg.mjs      # modern Vite app benchmark: styles + assets asserted
 ```
 
 The e2e scripts are dependency-free (raw Chrome DevTools Protocol over
-WebSocket) and spawn their own headless Chrome. `e2e-scribe` clones a real
-github repository through the relay, installs, previews it, executes its
-serverless function, installs vercel globally, and verifies the tab survives
-— the exact user journeys, asserted.
+WebSocket) and spawn their own headless Chrome. The main script covers the
+full user journey: boot, editing, typecheck, node, npm, git cycles, preview
+with api functions, github clone through the relay, and reload persistence —
+against its own local git fixture server, no external repositories.
 
 ## Configuration (all optional, all in `~`)
 
