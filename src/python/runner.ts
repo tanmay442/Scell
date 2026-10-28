@@ -121,10 +121,13 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   const stdinBytes = options.stdin ?? new Uint8Array(0)
   let stdinCursor = 0
   try {
+    // NB: no autoEOF here — pyodide only allows it with the byte-wise
+    // `stdin` option, and passing it with `read` makes setStdin throw
+    // (which left stdin at the blocking worker default and wedged runs).
+    // With `read`, returning 0 is the EOF signal.
     pyodide.setStdin({
       error: false,
       isatty: false,
-      autoEOF: true,
       read: (buffer: Uint8Array): number => {
         if (stdinCursor >= stdinBytes.length) return 0
         const n = Math.min(buffer.length, stdinBytes.length - stdinCursor)
