@@ -36,11 +36,37 @@ export interface AgentSession {
 
 const MAX_TURNS = 40
 
-/** Keep the first user prompt + the last turns; drop the middle. */
+/** Live-state cap: drop oldest whole exchanges, newest kept (P1-4). */
+export const MAX_LIVE_MESSAGES = 100
+
+/** Resume ids are bare file stems, never paths: no traversal, no .json games. */
+const RESUME_ID = /^[A-Za-z0-9_.-]+$/
+
+function sanitizeResumeId(id: string): string | null {
+  const stem = id.endsWith('.json') ? id.slice(0, -5) : id
+  if (stem === '' || stem.includes('/') || stem.includes('\\') || stem.includes('..')) return null
+  if (!RESUME_ID.test(stem)) return null
+  return stem
+}
+
+/** Keep the first user prompt + the last turns; drop the middle.
+ * Cuts land on user-turn boundaries so a tool_use block is never
+ * orphaned from its tool_result (the API rejects orphans on resume). */
 export function truncateTurns(turns: SessionTurn[]): SessionTurn[] {
   if (turns.length <= MAX_TURNS) return turns
   const head = turns.slice(0, 1)
-  const tail = turns.slice(turns.length - (MAX_TURNS - 1))
+  let start = turns.length - (MAX_TURNS - 1)
+  // retreat to a user boundary so the tail never starts mid-exchange —
+  // but never keep more than MAX_TURNS - 1 tail turns (pathological
+  // all-assistant histories just take the newest slice)
+  while (start > 1 && turns[start]?.role !== 'user' && turns.length - start < MAX_TURNS - 1) start--
+  let tail = turns.slice(start)
+  // never end on an assistant turn whose calls have no results yet
+  while (tail.length > 0) {
+    const last = tail[tail.length - 1]
+    if (last.role === 'assistant' && (last.toolCalls?.length ?? 0) > 0) tail = tail.slice(0, -1)
+    else break
+  }
   // shrink oversized tool payloads in what we keep
   const shrink = (turn: SessionTurn): SessionTurn => ({
     ...turn,
@@ -73,22 +99,20 @@ export function saveSession(vfs: Vfs, session: AgentSession): string {
 }
 
 export function loadSession(vfs: Vfs, id: string): { session: AgentSession } | { error: string } {
-  const direct = id.endsWith('.json') ? id : `${SESSIONS_DIR}/${id}.json`
-  const candidates = [direct, `${SESSIONS_DIR}/${id}`]
-  for (const path of candidates) {
-    const raw = vfs.read(path)
-    if (raw === null) continue
-    try {
-      const parsed = JSON.parse(raw) as AgentSession
-      if (!Array.isArray(parsed.turns) || !Array.isArray(parsed.transcript)) {
-        return { error: `session '${id}' is corrupt (bad turns/transcript)\n` }
-      }
-      return { session: parsed }
-    } catch {
-      return { error: `session '${id}' is not valid JSON\n` }
+  const stem = sanitizeResumeId(id.trim())
+  if (stem === null) return { error: `bad session id '${id}' — use the bare file stem under ~/.cell/sessions/\n` }
+  const path = `${SESSIONS_DIR}/${stem}.json`
+  const raw = vfs.read(path)
+  if (raw === null) return { error: `no session '${id}' — see ~/.cell/sessions/\n` }
+  try {
+    const parsed = JSON.parse(raw) as AgentSession
+    if (!Array.isArray(parsed.turns) || !Array.isArray(parsed.transcript)) {
+      return { error: `session '${id}' is corrupt (bad turns/transcript)\n` }
     }
+    return { session: parsed }
+  } catch {
+    return { error: `session '${id}' is not valid JSON\n` }
   }
-  return { error: `no session '${id}' — see ~/.cell/sessions/\n` }
 }
 
 export function listSessions(vfs: Vfs): string[] {

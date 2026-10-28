@@ -13,6 +13,13 @@ import { projectRoot } from './install'
 
 const COMMANDS_DIR = '/home/user/.cell/commands'
 
+/** Slash names are bare stems — never paths, never traversal (P1-7). */
+const SLASH_NAME = /^[A-Za-z0-9_-]+$/
+
+export function isSafeCommandName(name: string): boolean {
+  return SLASH_NAME.test(name)
+}
+
 export const BUILTIN_COMMANDS: Record<string, string> = {
   commit: 'Review `git status` and `git diff`, stage the files that belong together, and commit with a clear imperative message. Verify with `git log --oneline -3`.',
   preview: 'Run `cell preview` for this project and verify it bundles and renders. Report bundler errors and fix missing installs.',
@@ -27,6 +34,7 @@ function readDirSafe(vfs: Vfs, dir: string): string[] {
 }
 
 export function loadCommand(vfs: Vfs, cwd: string, name: string): string | null {
+  if (!isSafeCommandName(name)) return null
   const root = projectRoot(vfs, cwd)
   if (root !== null) {
     const projectFile = `${root}/.cell/commands/${name}.md`

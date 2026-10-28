@@ -53,6 +53,10 @@ function readSkillDir(vfs: Vfs, dir: string, source: 'home' | 'project', out: Ma
       warnings.push(`${file}: ${parsed.error}`)
       continue
     }
+    if (!/^[A-Za-z0-9_-]+$/.test(parsed.name)) {
+      warnings.push(`${file}: bad skill name '${parsed.name}' — ignored`)
+      continue
+    }
     out.set(parsed.name, { name: parsed.name, description: parsed.description, body: parsed.body, source })
   }
 }

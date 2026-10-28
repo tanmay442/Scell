@@ -76,6 +76,42 @@ export function exitTrailer(result: { exitCode: number; timedOut?: boolean; oomS
 
 const TOOLS_DIR = '/home/user/.cell/tools'
 
+/** Paths the agent must never read/write through file tools (P0-3/P0-4):
+ * its own key material, live sessions, and the registries it could use
+ * to shadow tools, override skills, or rewrite its own instructions. */
+const DENIED_PREFIXES = [
+  '/home/user/.cell/agent.json',
+  '/home/user/.cell/auth.json',
+  '/home/user/.cell/sessions',
+  '/home/user/.cell/tools',
+  '/home/user/.cell/skills',
+]
+
+/** true when an expanded absolute path touches agent key/config/registry state. */
+export function isDeniedPath(absPath: string): boolean {
+  const normalized = absPath.replace(/\/+$/, '')
+  return DENIED_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`))
+}
+
+/** Bash patterns that error instead of running (P0-4): destructive or
+ * self-modifying commands the non-interactive approval line cannot gate. */
+const BASH_DENY: { re: RegExp; label: string }[] = [
+  { re: /\brm\s+[^|;&]*-[a-z]*r[a-z]*f/i, label: 'rm -rf' },
+  { re: /\brm\s+[^|;&]*(?:\s|^)(?:~|\/|\$HOME|\${HOME})/, label: 'rm on home/root' },
+  { re: /\bcell\s+(load|save)\b/, label: 'cell load/save' },
+  { re: /\bcurl\b[^|]*\|\s*(?:sh|bash)\b/, label: 'curl|sh' },
+  { re: /\bwget\b[^|]*\|\s*(?:sh|bash)\b/, label: 'wget|sh' },
+]
+
+/** non-null when a bash command must be refused before it runs. */
+export function bashDenyReason(command: string): string | null {
+  for (const { re, label } of BASH_DENY) {
+    re.lastIndex = 0
+    if (re.test(command)) return `refused ${label}: destructive or self-modifying commands cannot run non-interactively`
+  }
+  return null
+}
+
 const BUILTIN_DEFS: { name: string; description: string; approval: ApprovalPolicy }[] = [
   { name: 'bash', description: 'Run a shell command in the workspace (bash-compatible). Returns stdout+stderr and the exit code. cd is per-call. Each step times out after 120s (exit 124, overridable with timeoutMs up to 600000); output past 20k chars is head+tail truncated with a receipt.', approval: 'ask' },
   { name: 'read', description: 'Read a text file from the filesystem. Long files are paged — pass offset/limit.', approval: 'auto' },
@@ -192,6 +228,10 @@ export function loadCustomTools(vfs: Vfs): { tools: CustomToolDef[]; warnings: s
       warnings.push(`${path}: shadows a built-in tool — ignored`)
       continue
     }
+    if (tools.some((tool) => tool.name === parsed.name)) {
+      warnings.push(`${path}: duplicate custom tool '${parsed.name}' — ignored`)
+      continue
+    }
     tools.push(parsed)
   }
   return { tools, warnings }
@@ -258,9 +298,12 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     const custom = deps.customTools?.get(call.name)
     if (custom !== undefined) {
       const command = interpolateArgs(custom.run.command, call.input)
+      const denied = bashDenyReason(command)
+      if (denied !== null) return { id: call.id, content: denied, isError: true }
       const timeoutMs = clampTimeout(call.input.timeoutMs)
       const result = await shell.exec(command, deps.cwd, undefined, { timeoutMs })
-      const body = truncateWithReceipt(`${result.stdout}${result.stderr}`.trim(), AGENT_BASH_MAX)
+      const combined = result.stdout !== '' && result.stderr !== '' ? `${result.stdout}\n${result.stderr}` : `${result.stdout}${result.stderr}`
+      const body = truncateWithReceipt(combined.trim(), AGENT_BASH_MAX)
       const text = `${body}${exitTrailer(result, timeoutMs)}`.trim()
       return {
         id: call.id,
@@ -271,10 +314,13 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     if (call.name === 'bash') {
       const command = String(call.input.command ?? '')
+      const denied = bashDenyReason(command)
+      if (denied !== null) return { id: call.id, content: denied, isError: true }
       const cwd = call.input.cwd !== undefined ? expand(String(call.input.cwd), deps.cwd) : deps.cwd
       const timeoutMs = clampTimeout(call.input.timeoutMs)
       const result = await shell.exec(command, cwd, undefined, { timeoutMs })
-      const body = truncateWithReceipt(`${result.stdout}${result.stderr}`.trim(), AGENT_BASH_MAX)
+      const combined = result.stdout !== '' && result.stderr !== '' ? `${result.stdout}\n${result.stderr}` : `${result.stdout}${result.stderr}`
+      const body = truncateWithReceipt(combined.trim(), AGENT_BASH_MAX)
       const text = `${body}${exitTrailer(result, timeoutMs)}`.trim()
       return {
         id: call.id,
@@ -285,17 +331,21 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     if (call.name === 'read') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
+      if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not readable (${path})`, isError: true }
       const content = vfs.read(path)
       if (content === null) return { id: call.id, content: `no such file (or binary): ${path}`, isError: true }
       const lines = content.split('\n')
-      const offset = Math.max(1, Number(call.input.offset ?? 1))
-      const limit = Math.max(1, Number(call.input.limit ?? 2000))
+      const rawOffset = Number(call.input.offset ?? 1)
+      const rawLimit = Number(call.input.limit ?? 2000)
+      const offset = Number.isFinite(rawOffset) ? Math.max(1, Math.floor(rawOffset)) : 1
+      const limit = Number.isFinite(rawLimit) ? Math.min(5000, Math.max(1, Math.floor(rawLimit))) : 2000
       const page = lines.slice(offset - 1, offset - 1 + limit)
       const shown = `lines ${offset}-${offset + page.length - 1} of ${lines.length}\n${page.join('\n')}`
       return { id: call.id, content: truncateWithReceipt(shown, AGENT_READ_MAX) }
     }
     if (call.name === 'edit') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
+      if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not writable (${path})`, isError: true }
       const content = vfs.read(path)
       if (content === null) return { id: call.id, content: `no such file (or binary): ${path}`, isError: true }
       const oldText = String(call.input.oldText ?? '')
@@ -309,11 +359,13 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     if (call.name === 'write') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
+      if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not writable (${path})`, isError: true }
       vfs.write(path, String(call.input.content ?? ''))
       return { id: call.id, content: `wrote ${path}` }
     }
     if (call.name === 'ls') {
       const path = expand(String(call.input.path ?? '~'), deps.cwd)
+      if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not listable (${path})`, isError: true }
       const names = vfs.readDir(path)
       return { id: call.id, content: names.length === 0 ? '(empty)' : names.join('\n') }
     }

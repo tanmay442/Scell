@@ -14,11 +14,19 @@ const PATTERNS: { re: RegExp; replace: string }[] = [
   // Anthropic + OpenAI secret keys
   { re: /sk-ant-[A-Za-z0-9_-]{8,}/g, replace: 'sk-ant-…[redacted]' },
   { re: /sk-[A-Za-z0-9_-]{8,}/g, replace: 'sk-…[redacted]' },
-  // Authorization: Bearer <token>
-  { re: /Bearer\s+[A-Za-z0-9._~+/=-]{8,}/g, replace: 'Bearer …[redacted]' },
-  // JSON fields: "apiKey": "...", "key": "LLM_...", 'secretAccessKey' etc.
-  { re: /("(?:apiKey|api_key|secretAccessKey|secret|token)"\s*:\s*")[^"]{4,}(")/g, replace: '$1…[redacted]$2' },
+  // Authorization: Bearer <token> (any case)
+  { re: /bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: 'Bearer …[redacted]' },
+  // JSON / JS fields: "apiKey", "api_key", "key", secretAccessKey, secret, token —
+  // double- or single-quoted, colon or equals
+  { re: /(["'](?:apiKey|api_key|secretAccessKey|secret|token)["']\s*[:=]\s*["'])[^"']{4,}(["'])/g, replace: '$1…[redacted]$2' },
+  { re: /(["']key["']\s*[:=]\s*["'])[^"']{8,}(["'])/g, replace: '$1…[redacted]$2' },
   { re: /(x-api-key["'\s:]+)[A-Za-z0-9_.-]{8,}/gi, replace: '$1…[redacted]' },
+  // bare KEY=value env lines (env dumps, .env files): SECRET=…, MY_API_KEY=…
+  { re: /((?:^|_)(?:KEY|SECRET|TOKEN|PASSWORD)[A-Za-z_]*=)[^\s]+/gm, replace: '$1…[redacted]' },
+  // ?api_key= / &token= URL params
+  { re: /([?&](?:api_key|apiKey|key|token|secret)=)[^&\s]+/g, replace: '$1…[redacted]' },
+  // PEM private-key blocks (multiline — replaced whole)
+  { re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, replace: '-----BEGIN PRIVATE KEY…[redacted]-----' },
 ]
 
 export function redactSecrets(text: string): string {

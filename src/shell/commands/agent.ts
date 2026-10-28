@@ -4,6 +4,7 @@ import { redactSecrets } from './agent-redact'
 import {
   registryEntries,
   runTool,
+  loadCustomTools,
   approvalFor,
   type CustomToolDef,
   type ToolCall,
@@ -11,13 +12,16 @@ import {
   type ToolResult,
 } from './agent-tools'
 import { loadSkills, skillIndex } from './agent-skills'
-import { saveSession, loadSession, sessionId, type SessionTurn } from './agent-sessions'
+import { saveSession, loadSession, sessionId, truncateTurns, type SessionTurn } from './agent-sessions'
 import { expandSlashCommand } from './agent-commands'
 import {
   callModel,
   newProviderState,
+  emptyProviderState,
+  capLiveState,
   setMetaOutputs,
   setMetaPendingUser,
+  setMetaResumeFlush,
   type AgentConfig,
   type ProviderKind,
   type ProviderState,
@@ -220,12 +224,14 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   let resumedTurns: SessionTurn[] = []
   let resumedTranscript: string[] = []
   let resumedResponseId: string | null = null
+  let resumedStartedAt: string | null = null
   let sessionPrompt = prompt
   if (resumeId !== null) {
     const loaded = loadSession(vfs, resumeId)
     if ('error' in loaded) return { stdout: '', stderr: `cell agent: ${loaded.error}`, exitCode: 1 }
     resumedTurns = loaded.session.turns
     resumedTranscript = loaded.session.transcript
+    resumedStartedAt = loaded.session.startedAt ?? null
     resumedResponseId = [...loaded.session.turns].reverse().find((turn) => turn.responseId)?.responseId ?? null
     if (!prompt) prompt = loaded.session.prompt
     sessionPrompt = prompt
@@ -247,49 +253,46 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   prompt = expanded.prompt
 
   const { config } = configured
+  // registryEntries is the single source of truth for custom tools (P0-1):
+  // the loader inside already drops shadows/duplicates with warnings —
+  // rebuild the same map here so runTool resolves exactly what was listed.
   const { entries, warnings } = registryEntries(vfs)
-  const customTools = new Map<string, CustomToolDef>()
-  try {
-    if (vfs.isDir('/home/user/.cell/tools')) {
-      for (const name of vfs.readDir('/home/user/.cell/tools')) {
-        if (!name.endsWith('.json')) continue
-        const raw = vfs.read(`/home/user/.cell/tools/${name}`)
-        if (raw === null) continue
-        try {
-          const parsed = JSON.parse(raw) as CustomToolDef
-          if (parsed?.run?.kind === 'bash') customTools.set(parsed.name, parsed)
-        } catch {
-          // warning already collected by registryEntries
-        }
-      }
-    }
-  } catch {
-    // no custom tools
-  }
-  const { skills } = loadSkills(vfs, opts.cwd)
+  const customTools = new Map<string, CustomToolDef>(loadCustomTools(vfs).tools.map((tool) => [tool.name, tool]))
+  const { skills, warnings: skillWarnings } = loadSkills(vfs, opts.cwd)
   const skillBodies = new Map(skills.map((skill) => [skill.name, `# ${skill.name}\n\n${skill.body}`]))
 
   const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
 
-  const state: ProviderState = newProviderState(expanded.prompt)
+  const state: ProviderState = resumeId !== null ? emptyProviderState() : newProviderState(expanded.prompt)
   if (resumeId !== null) {
     rebuildState(state, config.provider, resumedTurns, resumedResponseId)
-    if (expanded.prompt !== '') pushUserTurn(state, config.provider, expanded.prompt)
+    if (expanded.prompt !== '') {
+      if (config.provider === 'meta') {
+        // flush tool outputs the saved run never sent before the new prompt (P0-6)
+        const unsent = unsentMetaOutputs(resumedTurns, resumedResponseId)
+        if (unsent.length > 0) setMetaResumeFlush(state, unsent, expanded.prompt)
+        else setMetaPendingUser(state, expanded.prompt)
+      } else {
+        pushUserTurn(state, config.provider, expanded.prompt)
+      }
+    }
   }
 
-  const transcript: string[] = resumeId !== null
+  let transcript: string[] = resumeId !== null
     ? [...resumedTranscript, `agent ▸ (resumed ${resumeId}) ${redactSecrets(sessionPrompt)}${expanded.command ? ` [/${expanded.command}]` : ''}`]
     : [`agent ▸ ${redactSecrets(prompt)}`, `model: ${config.provider}/${config.model}, max ${maxSteps} steps`]
   if (resumeId === null && expanded.command) transcript[0] += ` [/${expanded.command}]`
   for (const warning of warnings) transcript.push(`agent warning: ${warning}`)
+  for (const warning of skillWarnings) transcript.push(`agent warning: ${warning}`)
   if (skills.length > 0) transcript.push(`skills: ${skills.map((s) => s.name).join(', ')} (load_skill for the body)`)
 
-  const turns: SessionTurn[] = resumeId !== null ? [...resumedTurns] : [{ role: 'user', text: prompt }]
+  let turns: SessionTurn[] = resumeId !== null ? [...resumedTurns] : [{ role: 'user', text: prompt }]
   if (resumeId !== null && expanded.prompt !== '') turns.push({ role: 'user', text: expanded.prompt })
 
   const deps = { vfs, shell: opts.shell, cwd: opts.cwd, skills: skillBodies, customTools }
-  const id = resumeId ?? sessionId()
-  const startedAt = new Date().toISOString()
+  // strip a .json suffix so --resume x.json does not save x.json.json (P1-5)
+  const id = resumeId !== null ? resumeId.replace(/\.json$/, '') : sessionId()
+  const startedAt = resumedStartedAt ?? new Date().toISOString()
 
   const persist = (steps: number) => {
     try {
@@ -316,12 +319,13 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
           ? { responseId: (model as { responseId?: string }).responseId }
           : {}),
       })
-      recordProviderTurn(state, config.provider, model.text, model.calls, turns)
+      recordAssistantMessage(state, config.provider, model.text, model.calls)
+      capLiveState(state)
       transcript.push(`session ${id} — resume with \`cell agent --resume ${id} "…"\``)
       persist(step)
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
     }
-    if (model.text.trim().length > 0) transcript.push(redactSecrets(`⏺ ${clip(model.text.trim(), 4)}`))
+    if (model.text.trim().length > 0) transcript.push(`⏺ ${clip(redactSecrets(model.text.trim()), 4)}`)
 
     if (model.truncated) {
       // max_tokens cut the turn mid-stream: partial tool calls would
@@ -373,11 +377,14 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
         transcript.push(redactSecrets(`❓ approval: ${call.name} ${summary} — auto-approved (non-interactive run)`))
       }
       transcript.push(redactSecrets(`⏺ ${call.name} ${summary}`))
-      opts.onProgress?.(`⏺ ${call.name} ${summary}`)
+      opts.onProgress?.(redactSecrets(`⏺ ${call.name} ${summary}`))
       const result = await runTool(deps, call)
-      transcript.push(redactSecrets(clip(result.content.split('\n').map((line) => `  ${line}`).join('\n'), 12)))
-      toolResults.push(result)
-      metaOutputs.push({ type: 'function_call_output', call_id: call.id, output: result.content })
+      // redact BEFORE truncating: a secret split across the cut must not
+      // survive in either half (P2), and raw results never re-enter context (P0-3)
+      const safeContent = redactSecrets(result.content)
+      transcript.push(clip(safeContent.split('\n').map((line) => `  ${line}`).join('\n'), 12))
+      toolResults.push({ ...result, content: safeContent })
+      metaOutputs.push({ type: 'function_call_output', call_id: call.id, output: safeContent })
     }
     turns.push({ role: 'tool', text: toolResults.map((result) => result.content).join('\n'), toolResults: toolResults.map((result) => ({ id: result.id, content: result.content, isError: result.isError })) })
 
@@ -398,6 +405,11 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     } else {
       setMetaOutputs(state, metaOutputs)
     }
+    // live-state caps: provider logs stay bounded and pair-safe (P1-4),
+    // session turns/transcript stay bounded between persists
+    capLiveState(state)
+    if (turns.length > 60) turns = truncateTurns(turns)
+    if (transcript.length > 300) transcript = transcript.slice(-300)
   }
 
   transcript.push(`agent: reached the ${maxSteps}-step limit — continue with \`cell agent --resume ${id} "keep going"\``)
@@ -434,14 +446,33 @@ function recordAssistantMessage(state: ProviderState, provider: ProviderKind, te
   // meta needs no local message log — chaining rides previous_response_id
 }
 
-function recordProviderTurn(
-  state: ProviderState,
-  provider: ProviderKind,
-  text: string,
-  calls: ToolCall[],
-  _turns: SessionTurn[],
-): void {
-  recordAssistantMessage(state, provider, text, calls)
+/** Tool outputs recorded after the last chained response: the saved run
+ * ended before they were sent, so resume must flush them first (P0-6). */
+function unsentMetaOutputs(
+  turns: SessionTurn[],
+  responseId: string | null,
+): { type: string; call_id: string; output: string }[] {
+  if (responseId === null) return []
+  let lastAssistant = -1
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].role === 'assistant' && turns[i].responseId !== undefined) {
+      lastAssistant = i
+      break
+    }
+  }
+  if (lastAssistant === -1) return []
+  const anchor = turns[lastAssistant]
+  if (anchor.responseId !== responseId || (anchor.toolCalls?.length ?? 0) === 0) return []
+  const outputs: { type: string; call_id: string; output: string }[] = []
+  for (const turn of turns.slice(lastAssistant + 1)) {
+    if (turn.role === 'assistant') break
+    if (turn.role === 'tool' && turn.toolResults) {
+      for (const result of turn.toolResults) {
+        outputs.push({ type: 'function_call_output', call_id: result.id, output: result.content })
+      }
+    }
+  }
+  return outputs
 }
 
 function rebuildState(state: ProviderState, provider: ProviderKind, turns: SessionTurn[], responseId: string | null): void {

@@ -69,6 +69,18 @@ export function newProviderState(prompt: string): ProviderState {
   }
 }
 
+/** Empty seed for --resume: rebuildState replays the persisted turns, so
+ * seeding the prompt here would duplicate it (P0-5). */
+export function emptyProviderState(): ProviderState {
+  return {
+    anthropicMessages: [],
+    openaiMessages: [],
+    metaResponseId: null,
+    metaFirstInput: null,
+    metaPendingUser: null,
+  }
+}
+
 function toAnthropicTools(entries: ToolInfo[]) {
   return entries.map((entry) => ({ name: entry.name, description: entry.description, input_schema: entry.parameters }))
 }
@@ -79,6 +91,30 @@ function toOpenAITools(entries: ToolInfo[]) {
 
 function toMetaTools(entries: ToolInfo[]) {
   return entries.map((entry) => ({ type: 'function' as const, name: entry.name, description: entry.description, parameters: entry.parameters }))
+}
+
+/** Transient statuses worth a retry (429/529 rate limits, 5xx, 408/425). */
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529])
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** POST with jittered backoff on 429/529/5xx/timeout (P0-7). Model calls
+ * happen before any tool runs, so a retried call cannot double-execute. */
+async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Promise<Response> {
+  let lastError: unknown = null
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const response = await fetch(url, init)
+      if (response.ok || !RETRYABLE_STATUS.has(response.status) || attempt === attempts) return response
+      // drain nothing — the caller reads the final failure body
+      await sleep(Math.min(5000, 300 * 2 ** (attempt - 1)) + Math.random() * 250)
+    } catch (err) {
+      lastError = err
+      if (attempt === attempts) throw err
+      await sleep(Math.min(5000, 300 * 2 ** (attempt - 1)) + Math.random() * 250)
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError))
 }
 
 const META_URL = 'https://api.meta.ai/v1/responses'
@@ -111,16 +147,24 @@ function parseMetaResponse(data: {
   return { text, calls, truncated, responseId: data.id }
 }
 
-/** Minimal SSE parser for the Meta streaming channel (event: + data: lines). */
+/** Minimal SSE parser for the Meta streaming channel (event: + data: lines).
+ * Tolerates CRLF, accumulates multiple data: lines per block (spec), and
+ * skips the [DONE] terminator. Used by the non-streaming fallback path;
+ * the live path reads incrementally via readMetaStream. */
 export function parseMetaSseEvents(raw: string): { deltas: string[]; final: unknown | null } {
   const deltas: string[] = []
   let final: unknown | null = null
-  const blocks = raw.split('\n\n')
+  const blocks = raw.split(/\r?\n\r?\n/)
   for (const block of blocks) {
-    const event = /^event:\s*(.+)$/m.exec(block)?.[1].trim()
-    const dataMatch = /^data:\s*([\s\S]+)$/m.exec(block)
-    if (!dataMatch) continue
-    const dataText = dataMatch[1].trim()
+    const lines = block.split(/\r?\n/)
+    let event = ''
+    const dataLines: string[] = []
+    for (const line of lines) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    }
+    if (dataLines.length === 0) continue
+    const dataText = dataLines.join('\n').trim()
     if (dataText === '[DONE]') continue
     if (event === 'response.output_text.delta') {
       try {
@@ -138,6 +182,95 @@ export function parseMetaSseEvents(raw: string): { deltas: string[]; final: unkn
     }
   }
   return { deltas, final }
+}
+
+/** Cap for live-streamed text before a truncation mark (P1-2). */
+export const META_STREAM_MAX = 20_000
+
+/** Incremental SSE reader: parses chunks as they arrive, forwards each
+ * redacted delta to onProgress live, and marks truncation instead of
+ * silently slicing (P1-2). Falls back to buffered parsing when the
+ * body stream is unavailable (tests, non-browser transports). */
+export async function readMetaStream(
+  response: Response,
+  onProgress: (line: string) => void,
+  maxChars = META_STREAM_MAX,
+): Promise<{ deltas: string[]; final: unknown | null; truncated: boolean }> {
+  if (response.body === null || typeof (response.body as ReadableStream).getReader !== 'function') {
+    const raw = await response.text()
+    const { deltas, final } = parseMetaSseEvents(raw)
+    let total = 0
+    let truncated = false
+    for (const delta of deltas) {
+      if (delta === '') continue
+      total += delta.length
+      if (total > maxChars && !truncated) {
+        truncated = true
+        onProgress(`… [truncated ${total - maxChars} chars of streamed output]`)
+        continue
+      }
+      if (!truncated) onProgress(redactSecrets(delta).slice(0, 500))
+    }
+    return { deltas, final, truncated }
+  }
+  const reader = (response.body as ReadableStream<Uint8Array>).getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let done = false
+  const deltas: string[] = []
+  let final: unknown | null = null
+  let total = 0
+  let truncated = false
+  const handleBlock = (block: string) => {
+    const lines = block.split(/\r?\n/)
+    let event = ''
+    const dataLines: string[] = []
+    for (const line of lines) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    }
+    if (dataLines.length === 0) return
+    const dataText = dataLines.join('\n').trim()
+    if (dataText === '[DONE]') return
+    if (event === 'response.output_text.delta') {
+      try {
+        const parsed = JSON.parse(dataText) as { delta?: string }
+        if (typeof parsed.delta === 'string' && parsed.delta !== '') {
+          deltas.push(parsed.delta)
+          total += parsed.delta.length
+          if (total > maxChars) {
+            if (!truncated) {
+              truncated = true
+              onProgress(`… [truncated ${total - maxChars} chars of streamed output]`)
+            }
+          } else {
+            onProgress(redactSecrets(parsed.delta).slice(0, 500))
+          }
+        }
+      } catch {
+        // partial chunk — ignore
+      }
+    } else if (event === 'response.completed') {
+      try {
+        final = (JSON.parse(dataText) as { response?: unknown }).response ?? JSON.parse(dataText)
+      } catch {
+        // ignore
+      }
+    }
+  }
+  while (!done) {
+    const chunk = await reader.read()
+    done = chunk.done
+    buffer += decoder.decode(chunk.value, { stream: !done })
+    let sep = /\r?\n\r?\n/.exec(buffer)
+    while (sep !== null) {
+      handleBlock(buffer.slice(0, sep.index))
+      buffer = buffer.slice(sep.index + sep[0].length)
+      sep = /\r?\n\r?\n/.exec(buffer)
+    }
+  }
+  if (buffer.trim() !== '') handleBlock(buffer)
+  return { deltas, final, truncated }
 }
 
 export interface MetaHistoryTurn {
@@ -172,7 +305,7 @@ async function callAnthropic(
   entries: ToolInfo[],
   systemPrompt: string,
 ): Promise<ModelTurn | { error: string }> {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  const response = await fetchWithRetry('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     signal: AbortSignal.timeout(120_000),
     headers: {
@@ -209,7 +342,7 @@ async function callOpenAI(
   entries: ToolInfo[],
   systemPrompt: string,
 ): Promise<ModelTurn | { error: string }> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetchWithRetry('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     signal: AbortSignal.timeout(120_000),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
@@ -270,7 +403,7 @@ async function callMeta(
         tool_choice: 'auto',
         max_output_tokens: maxOutput,
       }
-  const response = await fetch(META_URL, {
+  const response = await fetchWithRetry(META_URL, {
     method: 'POST',
     signal: AbortSignal.timeout(180_000),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
@@ -315,7 +448,7 @@ async function callMetaStream(
           tool_choice: 'auto',
           max_output_tokens: maxOutput,
         }
-  const response = await fetch(META_URL, {
+  const response = await fetchWithRetry(META_URL, {
     method: 'POST',
     signal: AbortSignal.timeout(180_000),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}`, accept: 'text/event-stream' },
@@ -326,11 +459,7 @@ async function callMetaStream(
     if (reanchored !== null) return reanchored
     return { error: `meta ${response.status}: ${redactSecrets((await response.text()).slice(0, 300))}` }
   }
-  const raw = await response.text()
-  const { deltas, final } = parseMetaSseEvents(raw)
-  for (const delta of deltas) {
-    if (delta !== '') onProgress(delta.slice(0, 500))
-  }
+  const { final } = await readMetaStream(response, onProgress)
   if (final === null) return { error: 'meta: stream ended without response.completed' }
   const parsed = parseMetaResponse(final as Parameters<typeof parseMetaResponse>[0])
   if (parsed.responseId) state.metaResponseId = parsed.responseId
@@ -384,7 +513,7 @@ async function tryMetaReanchor(
   }
   state.metaPendingUser = null
   ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
-  const retry = await fetch(META_URL, {
+  const retry = await fetchWithRetry(META_URL, {
     method: 'POST',
     signal: AbortSignal.timeout(180_000),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
@@ -422,7 +551,7 @@ async function tryMetaReanchorStream(
   }
   state.metaPendingUser = null
   ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
-  const retry = await fetch(META_URL, {
+  const retry = await fetchWithRetry(META_URL, {
     method: 'POST',
     signal: AbortSignal.timeout(180_000),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}`, accept: 'text/event-stream' },
@@ -436,11 +565,7 @@ async function tryMetaReanchorStream(
     }),
   })
   if (!retry.ok) return null
-  const raw = await retry.text()
-  const { deltas, final } = parseMetaSseEvents(raw)
-  for (const delta of deltas) {
-    if (delta !== '') onProgress(delta.slice(0, 500))
-  }
+  const { final } = await readMetaStream(retry, onProgress)
   if (final === null) return { error: 'meta: stream ended without response.completed' }
   const parsed = parseMetaResponse(final as Parameters<typeof parseMetaResponse>[0])
   if (parsed.responseId) state.metaResponseId = parsed.responseId
@@ -459,10 +584,23 @@ export function setMetaPendingUser(state: ProviderState, text: string): void {
   ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
 }
 
+/** Resume flush (P0-6): tool outputs recorded in the saved session but
+ * never sent on the chain go out together with the new user message —
+ * outputs first, then the user turn, in one chained request. */
+export function setMetaResumeFlush(
+  state: ProviderState,
+  outputs: { type: string; call_id: string; output: string }[],
+  text: string,
+): void {
+  ;(state as { pendingOutputs?: unknown }).pendingOutputs = outputs
+  state.metaPendingUser = text
+}
+
 /**
  * Input for the next Meta request. First turn: system + user prompt.
- * Later turns chain through previous_response_id: a fresh user message
- * goes as a user item; tool results go as function_call_output items.
+ * Later turns chain through previous_response_id: queued tool results go
+ * first as function_call_output items, then a fresh user message — so a
+ * resumed run flushes unsent outputs before the new prompt (P0-6).
  */
 function metaInput(state: ProviderState, systemPrompt: string): Record<string, unknown>[] {
   if (state.metaResponseId === null) {
@@ -471,12 +609,45 @@ function metaInput(state: ProviderState, systemPrompt: string): Record<string, u
       state.metaFirstInput ?? { role: 'user', content: [{ type: 'input_text', text: state.metaPendingUser ?? '' }] },
     ]
   }
+  const items = [...(((state as { pendingOutputs?: unknown }).pendingOutputs ?? []) as Record<string, unknown>[])]
+  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
   if (state.metaPendingUser !== null) {
     const text = state.metaPendingUser
     state.metaPendingUser = null
-    return [{ role: 'user', content: [{ type: 'input_text', text }] }]
+    items.push({ role: 'user', content: [{ type: 'input_text', text }] })
   }
-  return ((state as { pendingOutputs?: unknown }).pendingOutputs ?? []) as Record<string, unknown>[]
+  return items
+}
+
+/** Cap for live provider message logs (P1-4). Meta needs none — it chains
+ * through previous_response_id instead of a local log. */
+export const MAX_LIVE_MESSAGES = 100
+
+/** Drop a prefix of the log, then repair the new head: the tail must not
+ * start with a continuation (tool_result/tool message) whose opener was
+ * dropped, and must not break user/assistant alternation. The prompt
+ * (index 0) is always kept. */
+function capLog<T>(messages: T[], roleOf: (message: T) => string, isContinuation: (message: T) => boolean): void {
+  while (messages.length > MAX_LIVE_MESSAGES) {
+    let cut = 1 + (messages.length - MAX_LIVE_MESSAGES)
+    while (cut < messages.length && (isContinuation(messages[cut]) || roleOf(messages[cut]) === roleOf(messages[0]))) cut++
+    if (cut >= messages.length) cut = messages.length - 1
+    messages.splice(1, Math.max(1, cut - 1))
+  }
+}
+
+/** Drop oldest whole exchanges, newest kept, never orphaning a tool_use
+ * from its tool_result (P1-4). Keeps the first message (the prompt). */
+export function capLiveState(state: ProviderState): void {
+  // anthropic: skip tool_result replies (their assistant was dropped) and any
+  // user turn (parity with the kept prompt) — the tail starts at an
+  // assistant whose pairs follow it intact. openai: skip orphan tool msgs.
+  capLog(state.anthropicMessages, (message) => message.role, (message) => message.role === 'user')
+  capLog(
+    state.openaiMessages,
+    (message) => message.role,
+    (message) => message.role === 'tool',
+  )
 }
 
 export { META_URL }
