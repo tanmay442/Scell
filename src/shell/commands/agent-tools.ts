@@ -94,17 +94,59 @@ export function isDeniedPath(absPath: string): boolean {
 }
 
 /** Bash patterns that error instead of running (P0-4): destructive or
- * self-modifying commands the non-interactive approval line cannot gate. */
+ * self-modifying commands the non-interactive approval line cannot gate.
+ * This is a guardrail, not a sandbox boundary: it catches the common
+ * shapes (rm -rf/-fr/-r -f/--recursive --force, pipe-to-shell) but a
+ * determined command can spell the same effect other ways. The real
+ * gate is the UI approval prompt; these patterns exist so a fat-fingered
+ * or prompt-injected `rm -rf` never runs unexamined in headless mode. */
 const BASH_DENY: { re: RegExp; label: string }[] = [
-  { re: /\brm\s+[^|;&]*-[a-z]*r[a-z]*f/i, label: 'rm -rf' },
   { re: /\brm\s+[^|;&]*(?:\s|^)(?:~|\/|\$HOME|\${HOME})/, label: 'rm on home/root' },
   { re: /\bcell\s+(load|save)\b/, label: 'cell load/save' },
   { re: /\bcurl\b[^|]*\|\s*(?:sh|bash)\b/, label: 'curl|sh' },
   { re: /\bwget\b[^|]*\|\s*(?:sh|bash)\b/, label: 'wget|sh' },
 ]
 
+/** rm is refused only when recursive AND force combine (any spelling:
+ * -rf, -fr, -r -f, --recursive --force). Plain `rm -f x` stays allowed. */
+function isRecursiveForceRm(command: string): boolean {
+  for (const segment of command.split(/[|;&\n]+/)) {
+    const tokens = segment.trim().split(/\s+/)
+    const rmIndex = tokens.findIndex((token) => token === 'rm')
+    if (rmIndex === -1) continue
+    const flagTokens = tokens.slice(rmIndex + 1).filter((token) => token.startsWith('-'))
+    const recursive = flagTokens.some((token) => token === '--recursive' || /^-[a-z]*r/i.test(token))
+    const force = flagTokens.some((token) => token === '--force' || /^-[a-z]*f/i.test(token))
+    if (recursive && force) return true
+  }
+  return false
+}
+
+/** First path-like token in a bash command that lands on denied agent
+ * state, or null. Tokens are normalized (., .., ~) before the check so
+ * spelling tricks do not walk around the file-tool deny-list. This is
+ * still text scanning, not parsing: `$(cat ~/.cell/agent.json)` spelled
+ * with variables or concatenation can evade it. The UI approval gate is
+ * the real boundary; this keeps honest and semi-honest commands out. */
+export function bashDeniedPath(command: string): string | null {
+  for (const rawToken of command.split(/[\s'"`]+/)) {
+    const token = rawToken.replace(/[),;]+$/, '')
+    if (!token.includes('/')) continue
+    const expanded = expand(token, '/home/user')
+    if (isDeniedPath(expanded)) return expanded
+  }
+  return null
+}
+
 /** non-null when a bash command must be refused before it runs. */
 export function bashDenyReason(command: string): string | null {
+  const deniedPath = bashDeniedPath(command)
+  if (deniedPath !== null) {
+    return `refused: agent key/config/registry paths are not reachable from bash (${deniedPath})`
+  }
+  if (isRecursiveForceRm(command)) {
+    return 'refused rm -rf: destructive or self-modifying commands cannot run non-interactively'
+  }
   for (const { re, label } of BASH_DENY) {
     re.lastIndex = 0
     if (re.test(command)) return `refused ${label}: destructive or self-modifying commands cannot run non-interactively`
@@ -271,9 +313,11 @@ export function clampTimeout(value: unknown): number {
 
 export function expand(path: string, cwd: string): string {
   const raw = path.trim()
+  // normalize here, not just in the VFS: the deny-list check below runs on
+  // this string, so `~/.cell/../.cell/agent.json` must collapse before it
   if (raw === '~') return '/home/user'
-  if (raw.startsWith('~/')) return `/home/user${raw.slice(1)}`
-  return raw.startsWith('/') ? raw : vfsPath.join(cwd, raw)
+  if (raw.startsWith('~/')) return vfsPath.normalize(`/home/user${raw.slice(1)}`)
+  return raw.startsWith('/') ? vfsPath.normalize(raw) : vfsPath.join(cwd, raw)
 }
 
 export interface RunToolDeps {

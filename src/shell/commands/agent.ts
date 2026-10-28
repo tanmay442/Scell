@@ -83,8 +83,9 @@ function hostMetaKey(): string | null {
     if (!getModule) return null
     const fs = getModule.call(proc, 'fs') as { readFileSync?: (path: string, enc: string) => string; existsSync?: (path: string) => boolean } | null
     if (!fs?.readFileSync) return null
-    const home = proc?.env?.HOME ?? '/home/tanmay442'
-    for (const path of ['/home/tanmay442/.pi/agent/auth.json', `${home}/.pi/agent/auth.json`]) {
+    const home = proc?.env?.HOME
+    if (!home) return null
+    for (const path of [`${home}/.pi/agent/auth.json`]) {
       try {
         const raw = fs.readFileSync(path, 'utf8')
         const key = (JSON.parse(raw) as { meta?: { key?: string } }).meta?.key

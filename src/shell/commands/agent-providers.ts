@@ -57,6 +57,8 @@ export interface ProviderState {
   metaFirstInput: { role: string; content: { type: string; text: string }[] } | null
   /** new user text awaiting send on the chained (previous_response_id) path */
   metaPendingUser: string | null
+  /** function_call_output items awaiting send on the next chained request */
+  metaPendingOutputs: { type: string; call_id: string; output: string }[] | null
 }
 
 export function newProviderState(prompt: string): ProviderState {
@@ -66,6 +68,7 @@ export function newProviderState(prompt: string): ProviderState {
     metaResponseId: null,
     metaFirstInput: { role: 'user', content: [{ type: 'input_text', text: prompt }] },
     metaPendingUser: prompt,
+    metaPendingOutputs: null,
   }
 }
 
@@ -78,6 +81,7 @@ export function emptyProviderState(): ProviderState {
     metaResponseId: null,
     metaFirstInput: null,
     metaPendingUser: null,
+    metaPendingOutputs: null,
   }
 }
 
@@ -512,7 +516,7 @@ async function tryMetaReanchor(
     content: [{ type: 'input_text', text: metaReanchorText(history, state.metaPendingUser) }],
   }
   state.metaPendingUser = null
-  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+  state.metaPendingOutputs = null
   const retry = await fetchWithRetry(META_URL, {
     method: 'POST',
     signal: AbortSignal.timeout(180_000),
@@ -550,7 +554,7 @@ async function tryMetaReanchorStream(
     content: [{ type: 'input_text', text: metaReanchorText(history, state.metaPendingUser) }],
   }
   state.metaPendingUser = null
-  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+  state.metaPendingOutputs = null
   const retry = await fetchWithRetry(META_URL, {
     method: 'POST',
     signal: AbortSignal.timeout(180_000),
@@ -574,14 +578,14 @@ async function tryMetaReanchorStream(
 
 /** Stash function_call_output items for the next Meta request (chained via previous_response_id). */
 export function setMetaOutputs(state: ProviderState, outputs: { type: string; call_id: string; output: string }[]): void {
-  (state as { pendingOutputs?: unknown }).pendingOutputs = outputs;
+  state.metaPendingOutputs = outputs
   state.metaPendingUser = null
 }
 
 /** Stash new user text for the next chained Meta request (e.g. after --resume). */
 export function setMetaPendingUser(state: ProviderState, text: string): void {
   state.metaPendingUser = text
-  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+  state.metaPendingOutputs = null
 }
 
 /** Resume flush (P0-6): tool outputs recorded in the saved session but
@@ -592,7 +596,7 @@ export function setMetaResumeFlush(
   outputs: { type: string; call_id: string; output: string }[],
   text: string,
 ): void {
-  ;(state as { pendingOutputs?: unknown }).pendingOutputs = outputs
+  state.metaPendingOutputs = outputs
   state.metaPendingUser = text
 }
 
@@ -609,8 +613,8 @@ function metaInput(state: ProviderState, systemPrompt: string): Record<string, u
       state.metaFirstInput ?? { role: 'user', content: [{ type: 'input_text', text: state.metaPendingUser ?? '' }] },
     ]
   }
-  const items = [...(((state as { pendingOutputs?: unknown }).pendingOutputs ?? []) as Record<string, unknown>[])]
-  ;(state as { pendingOutputs?: unknown }).pendingOutputs = undefined
+  const items: Record<string, unknown>[] = [...(state.metaPendingOutputs ?? [])]
+  state.metaPendingOutputs = null
   if (state.metaPendingUser !== null) {
     const text = state.metaPendingUser
     state.metaPendingUser = null

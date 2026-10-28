@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { createVfs } from '../../vfs'
 import {
+  bashDeniedPath,
+  bashDenyReason,
+  expand,
   interpolateArgs,
+  isDeniedPath,
   loadCustomTools,
   registryEntries,
   approvalFor,
@@ -90,6 +94,33 @@ describe('tool registry', () => {
     const result = await runTool({ vfs, shell, cwd: '/home/user', customTools: custom }, { id: 'c1', name: 'greet', input: { name: 'x' } })
     expect(result.isError).toBe(true)
     expect(result.content).toContain('[exit 3]')
+  })
+})
+
+describe('deny-list path checks', () => {
+  it('normalizes .. before the deny check (no spelling bypass)', () => {
+    expect(isDeniedPath(expand('~/.cell/../.cell/agent.json', '/home/user'))).toBe(true)
+    expect(isDeniedPath(expand('/home/user/x/../.cell/auth.json', '/home/user'))).toBe(true)
+    expect(isDeniedPath(expand('~/.cell/agent.json', '/home/user'))).toBe(true)
+    expect(isDeniedPath(expand('~/project/.cell/skills/x/SKILL.md', '/home/user'))).toBe(false)
+  })
+
+  it('bash cannot reach denied paths by any spelling', () => {
+    expect(bashDeniedPath('cat ~/.cell/agent.json')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('cat /home/user/.cell/../.cell/auth.json')).toBe('/home/user/.cell/auth.json')
+    expect(bashDeniedPath('ls ~/.cell/sessions')).toBe('/home/user/.cell/sessions')
+    expect(bashDeniedPath('cat ~/project/index.ts')).toBeNull()
+    expect(bashDenyReason('cat ~/.cell/agent.json')).toMatch(/not reachable from bash/)
+  })
+
+  it('rm recursive+force is refused in any spelling; plain rm -f is not', () => {
+    expect(bashDenyReason('rm -rf build')).toMatch(/rm -rf/)
+    expect(bashDenyReason('rm -fr build')).toMatch(/rm -rf/)
+    expect(bashDenyReason('rm -r -f build')).toMatch(/rm -rf/)
+    expect(bashDenyReason('rm --recursive --force build')).toMatch(/rm -rf/)
+    expect(bashDenyReason('rm -f tmp.txt')).toBeNull()
+    expect(bashDenyReason('rm old.txt')).toBeNull()
+    expect(bashDenyReason('echo hi && rm -rf /')).toMatch(/rm -rf/)
   })
 })
 
