@@ -80,3 +80,18 @@ describe('createVfs', () => {
     ])
   })
 })
+
+describe('binary identical-check (P1-3)', () => {
+  it('same bytes do not emit a watch event', async () => {
+    const { createVfs } = await import('./vfs')
+    const vfs = createVfs()
+    let events = 0
+    vfs.watch(() => events++)
+    vfs.writeBytes('/img.bin', new Uint8Array([1, 2, 3]))
+    expect(events).toBe(1)
+    vfs.writeBytes('/img.bin', new Uint8Array([1, 2, 3]))
+    expect(events).toBe(1)
+    vfs.writeBytes('/img.bin', new Uint8Array([1, 2, 4]))
+    expect(events).toBe(2)
+  })
+})

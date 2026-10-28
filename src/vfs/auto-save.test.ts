@@ -108,3 +108,63 @@ describe('autosave', () => {
     }
   })
 })
+
+describe('autosave retry + status signal (P0-8)', () => {
+  it('retries a flaky backend and persists without reporting', async () => {
+    domStubs()
+    const vfs = createVfs()
+    let attempts = 0
+    const errors: string[] = []
+    const store = new Map<string, string | Uint8Array>()
+    const backend = {
+      async saveChanges(upserts: VfsFileMap, deletes: string[]) {
+        attempts++
+        if (attempts < 3) throw new Error('store wedged')
+        for (const path of deletes) store.delete(path)
+        for (const [path, content] of Object.entries(upserts)) store.set(path, content)
+      },
+      async load() {
+        return null
+      },
+      async save(files: VfsFileMap) {
+        store.clear()
+        for (const [path, content] of Object.entries(files)) store.set(path, content)
+      },
+    }
+    const stop = startAutoSave(vfs, backend, 5, { onError: (m) => errors.push(m) })
+    try {
+      vfs.write('/retry.txt', 'kept')
+      await sleep(1500)
+      expect(store.get('/retry.txt')).toBe('kept')
+      expect(errors).toEqual([])
+    } finally {
+      stop()
+    }
+  })
+
+  it('signals the status bus and keeps changes dirty when the backend stays down', async () => {
+    domStubs()
+    const vfs = createVfs()
+    const errors: string[] = []
+    const backend = {
+      async saveChanges(): Promise<void> {
+        throw new Error('disk gone')
+      },
+      async load() {
+        return null
+      },
+      async save(): Promise<void> {
+        throw new Error('disk gone')
+      },
+    }
+    const stop = startAutoSave(vfs, backend, 5, { onError: (m) => errors.push(m), maxAttempts: 2 })
+    try {
+      vfs.write('/doomed.txt', 'x')
+      await sleep(1500)
+      expect(errors.length).toBeGreaterThan(0)
+      expect(errors[0]).toContain('autosave failed')
+    } finally {
+      stop()
+    }
+  })
+})

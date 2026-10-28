@@ -344,3 +344,50 @@ describe('edge cases', () => {
     expect(after.read('/home/user/artifacts/deep/nest/out.txt')).toBe('made it')
   })
 })
+
+describe('python stdin (P0-7)', () => {
+  it(
+    'piped bytes reach the program instead of silent EOF',
+    async () => {
+      const vfs = freshVfs()
+      const out: { stream: string; text: string }[] = []
+      const encoder = new TextEncoder()
+      const buffer = new Uint8Array(1 << 22)
+      const result = await runPython(pyodide, {
+        code: "import sys\ndata = sys.stdin.read()\nprint(f'got:{data}')",
+        entry: '/home/user/script.py',
+        argv: [],
+        cwd: '/home/user',
+        env: {},
+        payload: { buffer, index: [] },
+        stdin: encoder.encode('piped-input\n'),
+        onOut: (stream, text) => out.push({ stream, text }),
+      })
+      expect(result.exitCode).toBe(0)
+      expect(out.map((o) => o.text).join('')).toContain('got:piped-input')
+    },
+    120_000,
+  )
+
+  it(
+    'absent stdin is clean EOF',
+    async () => {
+      const vfs = freshVfs()
+      void vfs
+      const out: { stream: string; text: string }[] = []
+      const buffer = new Uint8Array(1 << 22)
+      const result = await runPython(pyodide, {
+        code: "import sys\ndata = sys.stdin.read()\nprint(f'eof:{data == \"\"}')",
+        entry: '/home/user/script.py',
+        argv: [],
+        cwd: '/home/user',
+        env: {},
+        payload: { buffer, index: [] },
+        onOut: (stream, text) => out.push({ stream, text }),
+      })
+      expect(result.exitCode).toBe(0)
+      expect(out.map((o) => o.text).join('')).toContain('eof:True')
+    },
+    120_000,
+  )
+})

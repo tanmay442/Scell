@@ -46,3 +46,22 @@ describe('idb persistence', () => {
     }
   })
 })
+
+describe('persistence write-then-swap (P0-8) + seed flag (P0-9)', () => {
+  it('full save removes stale keys without a clear window', async () => {
+    const persistence = fresh()
+    await persistence.save({ '/keep.txt': 'keep', '/old.txt': 'old' })
+    await persistence.save({ '/keep.txt': 'keep' })
+    const loaded = await persistence.load()
+    expect(loaded?.['/keep.txt']).toBe('keep')
+    expect(loaded?.['/old.txt']).toBeUndefined()
+  })
+
+  it('seed flag round-trips out of band', async () => {
+    const { loadSeedFlag, saveSeedFlag } = await import('./persistence')
+    const name = `cell-test-flag-${Date.now()}`
+    expect(await loadSeedFlag(name)).toBe(false)
+    await saveSeedFlag(name)
+    expect(await loadSeedFlag(name)).toBe(true)
+  })
+})

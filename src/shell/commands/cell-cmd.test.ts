@@ -112,3 +112,26 @@ describe('cell command against stubbed S3', () => {
     expect(result.stdout).toContain('1 files')
   })
 })
+
+describe('cell save excludes heavies (P1-6)', () => {
+  it('workspaceTar skips node_modules and .git', async () => {
+    const { createVfs } = await import('../../vfs')
+    const vfs = createVfs()
+    vfs.write('/home/user/project/index.js', 'console.log(1)')
+    vfs.write('/home/user/project/node_modules/dep/index.js', 'x'.repeat(100))
+    vfs.write('/home/user/project/.git/objects/big', 'y'.repeat(100))
+    const { cellCommand } = await import('./cell-cmd')
+    // without storage config the command fails before tarring — configure a fake
+    vfs.write('/home/user/.cell/storage.json', JSON.stringify({ endpoint: 'https://x', region: 'auto', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' }))
+    const original = globalThis.fetch
+    globalThis.fetch = (async () => new Response('ok', { status: 200 })) as typeof fetch
+    try {
+      const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+      const result = await cellCommand(vfs, ['save'], { cwd: '/home/user', shell })
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain('excluded 2 node_modules/.git files')
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+})

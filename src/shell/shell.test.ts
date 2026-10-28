@@ -111,3 +111,61 @@ describe('shell over VFS', () => {
     expect((await shell.exec('cat /linkdir/nested.txt')).stdout).toBe('hi\n')
   })
 })
+
+describe('agent-hardening (P0-1..P0-4)', () => {
+  it('times out a wedged step with exit 124 instead of hanging forever', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    const result = await shell.exec('sleep 30', HOME, undefined, { timeoutMs: 300 })
+    expect(result.exitCode).toBe(124)
+    expect(result.timedOut).toBe(true)
+    expect(result.envStale).toBe(true)
+    expect(result.stderr).toContain('124')
+    // the queue is released: the next step runs fine
+    expect((await shell.exec('echo alive')).stdout.trim()).toBe('alive')
+  })
+
+  it('survives exit with its code and keeps the session alive', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    await shell.exec('export KEEP=1')
+    const exited = await shell.exec('exit 3')
+    expect(exited.exitCode).toBe(3)
+    expect((await shell.exec('echo "kept=$KEEP"')).stdout.trim()).toBe('kept=1')
+  })
+
+  it('survives unclosed syntax and still captures env afterwards', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    const bad = await shell.exec('echo "unclosed')
+    expect(bad.exitCode).not.toBe(0)
+    expect(bad.envStale).not.toBe(true)
+    await shell.exec('export AFTER=ok')
+    expect((await shell.exec('echo $AFTER')).stdout.trim()).toBe('ok')
+  })
+
+  it('serializes concurrent execs so session env never corrupts', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    await Promise.all([shell.exec('export A=1'), shell.exec('export B=2')])
+    expect((await shell.exec('echo "$A-$B"')).stdout.trim()).toBe('1-2')
+  })
+
+  it('xargs re-entry sees the live env, not the settled snapshot', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    await shell.exec('export XQ=stale')
+    // prefix assignment changes the env for this exec only — the xargs
+    // re-invocation must observe 99, which never lands in sessionEnv
+    const result = await shell.exec(`XQ=99 printf 'x\\n' | xargs bash -c 'echo \\$XQ' _`)
+    expect(result.stdout.trim()).toBe('99')
+    expect((await shell.exec('echo $XQ')).stdout.trim()).toBe('stale')
+  })
+
+  it('node -e leaves no temp eval files behind', async () => {
+    const vfs = createVfs()
+    const shell = createShell(vfs)
+    await shell.exec('node -e "console.log(1)"')
+    expect(vfs.listAllFiles().filter((p) => p.includes('.cell-eval')).join(',')).toBe('')
+  })
+})

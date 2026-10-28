@@ -186,3 +186,41 @@ describe('meta responses transport', () => {
     expect(result.stdout).not.toContain('LLM_abcdefgh12345678')
   })
 })
+
+describe('meta chain-expiry re-anchor (builder gap)', () => {
+  it('replays the flattened turns as a fresh turn after a 400 expiry', async () => {
+    const vfs = metaVfs()
+    const shell = { exec: async () => ({ stdout: 'tool-out', stderr: '', exitCode: 0 }) }
+    let calls = 0
+    const seen: { body: any }[] = []
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      calls++
+      seen.push({ body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (calls === 1) {
+        return new Response(JSON.stringify({
+          id: 'resp_first',
+          status: 'completed',
+          output: [
+            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'will run it' }] },
+            { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'bash', arguments: '{"command":"echo hi"}', status: 'completed' },
+          ],
+        }), { status: 200 })
+      }
+      if (calls === 2) {
+        return new Response('referenced response not found or expired', { status: 400 })
+      }
+      return new Response(JSON.stringify({
+        id: 'resp_reanchored',
+        status: 'completed',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'recovered after expiry' }] }],
+      }), { status: 200 })
+    }) as typeof fetch
+    const result = await runAgent(vfs, ['run it'], { cwd: '/home/user', shell })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('recovered after expiry')
+    // the retry drops the dead chain id and replays history as fresh input
+    const retry = seen[seen.length - 1].body
+    expect(retry.previous_response_id).toBeUndefined()
+    expect(JSON.stringify(retry.input)).toContain('re-anchored')
+  })
+})

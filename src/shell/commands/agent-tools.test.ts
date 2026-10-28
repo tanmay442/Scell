@@ -92,3 +92,48 @@ describe('tool registry', () => {
     expect(result.content).toContain('[exit 3]')
   })
 })
+
+describe('agent truncation + trailers (P0-5/P0-6)', () => {
+  it('bash output past 20k arrives head+tail with an explicit receipt', async () => {
+    const { truncateWithReceipt, AGENT_BASH_MAX } = await import('./agent-tools')
+    const big = `x`.repeat(AGENT_BASH_MAX + 100)
+    const out = truncateWithReceipt(big, AGENT_BASH_MAX)
+    expect(out).toContain('… [truncated 100 chars]')
+    expect(out.length).toBeLessThan(big.length + 100)
+  })
+
+  it('bash timeouts carry the 124 trailer and timedOut', async () => {
+    const { runTool } = await import('./agent-tools')
+    const vfs = createVfs()
+    const shell = {
+      exec: async () => ({ stdout: 'partial', stderr: '', exitCode: 124, timedOut: true }),
+    }
+    const result = await runTool({ vfs, shell, cwd: '/home/user' }, { id: 't', name: 'bash', input: { command: 'sleep 600' } })
+    expect(result.isError).toBe(true)
+    expect(result.timedOut).toBe(true)
+    expect(result.content).toContain('[exit 124')
+    expect(result.content).toContain('partial')
+  })
+
+  it('exit codes ride an untruncatable trailer after truncation', async () => {
+    const { runTool } = await import('./agent-tools')
+    const vfs = createVfs()
+    const shell = {
+      exec: async () => ({ stdout: 'y'.repeat(30_000), stderr: '', exitCode: 3 }),
+    }
+    const result = await runTool({ vfs, shell, cwd: '/home/user' }, { id: 't', name: 'bash', input: { command: 'fail' } })
+    expect(result.content).toContain('[exit 3]')
+    expect(result.content).toContain('… [truncated')
+    // trailer survives: it is the last line
+    expect(result.content.trimEnd().endsWith('[exit 3]')).toBe(true)
+  })
+
+  it('clamps per-call timeouts so one typo cannot wedge the tab', async () => {
+    const { clampTimeout, AGENT_BASH_TIMEOUT_MS } = await import('./agent-tools')
+    expect(clampTimeout(undefined)).toBe(AGENT_BASH_TIMEOUT_MS)
+    expect(clampTimeout(5000)).toBe(5000)
+    expect(clampTimeout(0)).toBe(1000)
+    expect(clampTimeout(9_999_999)).toBe(600_000)
+    expect(clampTimeout('oops')).toBe(AGENT_BASH_TIMEOUT_MS)
+  })
+})
