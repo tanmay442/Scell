@@ -76,11 +76,26 @@ class LanguageService {
     this.worker.postMessage({ type: 'check', id, files: this.textFiles() })
   }
 
-  tscRun(args: string[], extraFiles: Record<string, string> = {}): Promise<TscRunResult> {
+  tscRun(args: string[], extraFiles: Record<string, string> = {}, timeoutMs = 120_000): Promise<TscRunResult> {
     const id = ++this.requestId
     const files = { ...extraFiles, ...this.textFiles() }
     return new Promise<TscRunResult>((resolve, reject) => {
-      this.pendingTsc.set(id, { resolve, reject })
+      // a wedged typechecker worker must fail loudly, not hang the shell
+      // (and the terminal with it) forever
+      const timer = setTimeout(() => {
+        this.pendingTsc.delete(id)
+        reject(new Error(`tsc: typechecker timed out after ${timeoutMs / 1000}s — reload the tab to restart it`))
+      }, timeoutMs)
+      this.pendingTsc.set(id, {
+        resolve: (result) => {
+          clearTimeout(timer)
+          resolve(result)
+        },
+        reject: (err) => {
+          clearTimeout(timer)
+          reject(err)
+        },
+      })
       this.worker.postMessage({ type: 'tsc', id, args, files })
     })
   }
