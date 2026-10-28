@@ -182,14 +182,48 @@ export default function TerminalPanel() {
       }
 
       running = true
+      // Long commands (git clone, npm install, python analysis) used to sit
+      // silent until they finished. Now the terminal keeps one live line:
+      // real progress phases from the command when it reports them, else a
+      // spinner with the elapsed time. The line is cleared before any real
+      // output, so scrollback and row-based tooling never see it.
+      const startedAt = Date.now()
+      const shortCmd = trimmed.length > 48 ? `${trimmed.slice(0, 47)}…` : trimmed
+      const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+      let frame = 0
+      let liveLabel: string | null = null
+      let liveShown = false
+      let finished = false
+      const renderLive = () => {
+        const elapsed = Math.floor((Date.now() - startedAt) / 1000)
+        term.write(`\r\x1b[K\x1b[90m${frames[frame++ % frames.length]} ${liveLabel ?? `running ${shortCmd}`} (${elapsed}s)\x1b[0m`)
+        liveShown = true
+      }
+      const liveTimer = window.setInterval(() => {
+        if (!finished && Date.now() - startedAt >= 1500) renderLive()
+      }, 250)
+      const clearLive = () => {
+        finished = true
+        window.clearInterval(liveTimer)
+        if (liveShown) {
+          term.write('\r\x1b[K')
+          liveShown = false
+        }
+      }
       try {
-        const result = await shell.exec(heredoc !== null ? cmd : trimmed, cwd)
+        const result = await shell.exec(trimmed, cwd, (line) => {
+          if (finished) return
+          liveLabel = line
+          renderLive()
+        })
+        clearLive()
         if (result.stdout) writeOut(result.stdout)
         if (result.stderr) writeErr(result.stderr)
         if (!result.stdout && !result.stderr && result.exitCode !== 0) {
           term.write(`\x1b[90m(exit ${result.exitCode})\x1b[0m\r\n`)
         }
       } catch (err) {
+        clearLive()
         writeErr(`shell error: ${err instanceof Error ? err.message : String(err)}\n`)
       } finally {
         running = false

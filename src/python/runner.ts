@@ -156,14 +156,55 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   }
 
   // ---- execute ----
+  // SystemExit is caught at the Python level, inside __main__: letting it
+  // propagate through pyodide's asyncio webloop re-raises it in a later
+  // macrotask, which node reports as an unhandled rejection (red CI) and
+  // browsers report as a page error. exec() keeps argv/env/cwd semantics
+  // identical; compile() keeps tracebacks pointed at the real script path;
+  // the eval+iscoroutine pair preserves top-level await.
   let exitCode = 0
+  const filename = options.entry !== '-' ? options.entry : '<stdin>'
   try {
-    // filename: tracebacks point at the real script path
-    await pyodide.runPythonAsync(options.code, { filename: options.entry !== '-' ? options.entry : '<stdin>' })
+    await pyodide.runPythonAsync(
+      [
+        'import ast as __cell_ast, inspect as __cell_inspect',
+        '__cell_exit_code = 0',
+        '__cell_exit_msg = None',
+        'try:',
+        `    __cell_unit = eval(compile(${JSON.stringify(options.code)}, ${JSON.stringify(filename)}, 'exec', flags=__cell_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT, dont_inherit=True))`,
+        '    if __cell_inspect.iscoroutine(__cell_unit):',
+        '        await __cell_unit',
+        'except SystemExit as __cell_e:',
+        '    __cell_code = __cell_e.code',
+        '    if __cell_code is None:',
+        '        __cell_exit_code = 0',
+        '    elif isinstance(__cell_code, int):',
+        '        __cell_exit_code = int(__cell_code)',
+        '    elif isinstance(__cell_code, str):',
+        '        __cell_exit_msg = __cell_code',
+        '        __cell_exit_code = 1',
+        '    else:',
+        '        __cell_exit_code = 1',
+      ].join('\n'),
+    )
+    const code = (await pyodide.runPythonAsync('__cell_exit_code')) as unknown
+    exitCode = typeof code === 'number' ? code : 0
+    if (exitCode !== 0) {
+      const msg = (await pyodide.runPythonAsync('__cell_exit_msg')) as unknown
+      if (typeof msg === 'string' && msg) options.onOut('stderr', `${msg}\n`)
+    }
   } catch (err) {
     const described = describeError(err)
     if (described.text) options.onOut('stderr', `${described.text}\n`)
     exitCode = described.exitCode
+  } finally {
+    try {
+      await pyodide.runPythonAsync(
+        'try:\n    del __cell_exit_code, __cell_exit_msg\n    del __cell_unit, __cell_code\nexcept NameError:\n    pass',
+      )
+    } catch {
+      // namespace hygiene must never fail the run
+    }
   }
 
   // ---- filesystem out: diff against what came in. Walk ONLY the payload's

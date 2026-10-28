@@ -22,7 +22,7 @@ export interface ShellLike {
  * npm (and pnpm, which routes here): init with templates, install from the
  * real registry, run scripts through a fresh shell, and npx for bins.
  */
-export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void }): Promise<CommandResult> {
+export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; flavor: 'npm' | 'pnpm'; registerLive?: (name: string) => void; progress?: (line: string) => void }): Promise<CommandResult> {
   const { cwd, scriptShell, flavor } = opts
   const [sub = 'help', ...rest] = args
 
@@ -33,7 +33,7 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   }
 
   if (sub === 'install' || sub === 'i' || sub === 'add') {
-    return npmInstall(vfs, rest, { cwd, registerLive: opts.registerLive })
+    return npmInstall(vfs, rest, { cwd, registerLive: opts.registerLive, progress: opts.progress })
   }
 
   if (sub === 'uninstall' || sub === 'remove' || sub === 'rm' || sub === 'un') {
@@ -65,7 +65,7 @@ export async function npmCommand(vfs: Vfs, args: string[], opts: { cwd: string; 
   return fail(`${flavor}: '${sub}' is not implemented in Cell yet. Supported: init, install (-g), uninstall, run, test, start, ls, exec/npx, info.\n`)
 }
 
-export async function npx(vfs: Vfs, args: string[], opts: { cwd: string }): Promise<CommandResult> {
+export async function npx(vfs: Vfs, args: string[], opts: { cwd: string; progress?: (line: string) => void }): Promise<CommandResult> {
   const name = args.find((a) => !a.startsWith('-'))
   if (!name) return fail('npx: specify a package binary to run, e.g. npx cowsay hi\n')
   const binArgs = args.slice(1)
@@ -80,7 +80,7 @@ export async function npx(vfs: Vfs, args: string[], opts: { cwd: string }): Prom
   const root = projectRoot(vfs, opts.cwd) ?? opts.cwd
   const before = new Set(findBins(vfs, opts.cwd).keys())
   try {
-    await installPackages(vfs, [{ name }], root)
+    await installPackages(vfs, [{ name }], root, opts.progress)
   } catch (err) {
     return fail(`npx: could not install ${name}: ${err instanceof Error ? err.message : String(err)}\n`)
   }
@@ -174,7 +174,7 @@ async function npmInit(vfs: Vfs, args: string[], opts: { cwd: string; flavor: 'n
   return ok(`Wrote to ${inDir(cwd, '/package.json')}\n\n${JSON.stringify(manifest, null, 2)}\n`)
 }
 
-async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registerLive?: (name: string) => void }): Promise<CommandResult> {
+async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registerLive?: (name: string) => void; progress?: (line: string) => void }): Promise<CommandResult> {
   const { cwd } = opts
   const global = args.includes('-g') || args.includes('--global')
   const saveDev = args.includes('--save-dev') || args.includes('-D')
@@ -191,7 +191,7 @@ async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registe
     })
     // older builds nested one node_modules too deep — heal that in place
     if (vfs.isDir(`${GLOBAL_ROOT}/node_modules`)) vfs.delete(`${GLOBAL_ROOT}/node_modules`)
-    const report = await installPackages(vfs, requests, GLOBAL_ROOT)
+    const report = await installPackages(vfs, requests, GLOBAL_ROOT, opts.progress)
     const freshBins = [...collectBins(vfs, GLOBAL_ROOT).keys()]
     for (const bin of freshBins) opts.registerLive?.(bin)
     const lines = [...report.warnings, `added ${report.added.length} package${report.added.length === 1 ? '' : 's'} globally to ~/.local/lib/node_modules`]
@@ -210,7 +210,7 @@ async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registe
     if (deps.length === 0) {
       return fail(`npm ERR! package.json at ${root} declares no dependencies — nothing to do\n`)
     }
-    const report = await installPackages(vfs, deps, root)
+    const report = await installPackages(vfs, deps, root, opts.progress)
     return finishInstall(report, 'up to date', root)
   }
 
@@ -229,7 +229,7 @@ async function npmInstall(vfs: Vfs, args: string[], opts: { cwd: string; registe
     return fail(`npm ERR! no package.json in ${root} — run \`npm init -y\` first (npm ERR! enoent)\n`)
   }
 
-  const report = await installPackages(vfs, requests, root)
+  const report = await installPackages(vfs, requests, root, opts.progress)
 
   // record the resolved versions in package.json
   for (const { name, range } of requests) {
@@ -362,7 +362,7 @@ function vfsPathBasename(cwd: string): string {
   return n === '' ? 'workspace' : n.slice(n.lastIndexOf('/') + 1)
 }
 
-export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; registerLive?: (name: string) => void }) =>
+export const pnpmCommand = (vfs: Vfs, args: string[], opts: { cwd: string; scriptShell: (cwd: string) => ShellLike; registerLive?: (name: string) => void; progress?: (line: string) => void }) =>
   args[0] === 'dlx'
     ? npx(vfs, args.slice(1), { cwd: opts.cwd })
     : npmCommand(vfs, args, { ...opts, flavor: 'pnpm' })

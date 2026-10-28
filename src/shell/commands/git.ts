@@ -355,18 +355,65 @@ function memfsFingerprint(mod: GitModule, dir: string): string | null {
   return parts.sort().join('|')
 }
 
+/** File + byte counts of an MEMFS subtree for clone progress (missing → null). */
+function memfsCount(mod: GitModule, dir: string): { files: number; bytes: number } | null {
+  if (!isDir(mod, dir)) return null
+  let files = 0
+  let bytes = 0
+  const walk = (p: string) => {
+    let names: string[]
+    try {
+      names = mod.FS.readdir(p)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      if (name === '.' || name === '..') continue
+      const full = p === '/' ? `/${name}` : `${p}/${name}`
+      if (isDir(mod, full)) walk(full)
+      else {
+        try {
+          files++
+          bytes += (mod.FS.stat(full) as { size?: number }).size ?? 0
+        } catch {
+          // vanished mid-walk — counts just shift, polling continues
+        }
+      }
+    }
+  }
+  walk(dir)
+  return { files, bytes }
+}
+
+function formatMiB(bytes: number): string {
+  return (bytes / 1048576).toFixed(bytes < 10485760 ? 2 : 1)
+}
+
 /**
  * lg2's clone returns from callMain while the async https transfer is still
  * running; the repository materializes in the background. Wait until the
  * target subtree stops changing.
  */
-async function waitForCloneSettle(mod: GitModule, target: string, timeoutMs = 120_000): Promise<void> {
+async function waitForCloneSettle(mod: GitModule, target: string, timeoutMs = 120_000, onProgress?: (line: string) => void): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let last = '\u0000'
   let stableTicks = 0
+  let lastReport = 0
+  let lastFiles = -1
+  let lastBytes = -1
   while (Date.now() < deadline) {
     await sleep(250)
     const now = memfsFingerprint(mod, target) ?? ''
+    // the only visible sign of a big clone: what has arrived so far
+    if (onProgress !== undefined && now !== '' && Date.now() - lastReport > 500) {
+      const counts = memfsCount(mod, target)
+      if (counts !== null && (counts.files !== lastFiles || counts.bytes !== lastBytes)) {
+        lastReport = Date.now()
+        lastFiles = counts.files
+        lastBytes = counts.bytes
+        onProgress(`Receiving objects: ${counts.files} files (${formatMiB(counts.bytes)} MiB)`)
+      }
+    }
     if (now === last) {
       stableTicks++
       if (stableTicks >= 6 && now !== '') return
@@ -499,7 +546,7 @@ interface CloneAttempt extends LgRun {
  * One clone attempt. Runs with its own prepared module; on timeout the
  * wedged module is abandoned and the next command loads a fresh one.
  */
-async function attemptClone(vfs: Vfs, url: string, target: string, gitCwd: string, timeoutMs = 150_000): Promise<CloneAttempt> {
+async function attemptClone(vfs: Vfs, url: string, target: string, gitCwd: string, timeoutMs = 150_000, onProgress?: (line: string) => void): Promise<CloneAttempt> {
   let mod: GitModule
   try {
     mod = await prepareGit(vfs, gitCwd)
@@ -534,7 +581,7 @@ async function attemptClone(vfs: Vfs, url: string, target: string, gitCwd: strin
 
   // keep collecting: progress and remote messages flush late (Asyncify)
   outputCollector = { out: run.out, err: run.err }
-  await waitForCloneSettle(mod, target)
+  await waitForCloneSettle(mod, target, 120_000, onProgress)
   outputCollector = null
   const ok = run.exitCode === 0 && run.failure === null && isDir(mod, `${target}/.git`)
   return { ...run, ok, mod }
@@ -557,7 +604,7 @@ function cloneFailureOutput(note: string, attempts: { label: string; run: LgRun 
   }
 }
 
-async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<CommandResult> {
+async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string, onProgress?: (line: string) => void): Promise<CommandResult> {
   const positional = rest.filter((a) => !a.startsWith('-'))
   const url = positional[0]
   const explicitDir = positional[1]
@@ -577,6 +624,7 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<C
   const target = explicitDir
     ? normalizePath(`${gitCwd}/${explicitDir}`)
     : normalizePath(`${gitCwd}/${repoNameFromUrl(url)}`)
+  onProgress?.(`Cloning into '${target.slice(target.lastIndexOf('/') + 1)}'...`)
 
   const relays = relaysFor(vfs)
   const blocked = await originBlocked(url)
@@ -591,7 +639,7 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<C
         ok: false,
         mod: null,
       }
-    : await attemptClone(vfs, url, target, gitCwd)
+    : await attemptClone(vfs, url, target, gitCwd, 150_000, onProgress)
 
   if (direct.ok && direct.mod) {
     syncMemfsToVfs(direct.mod, vfs)
@@ -604,7 +652,8 @@ async function runCloneFlow(vfs: Vfs, rest: string[], gitCwd: string): Promise<C
     const relayUrl = relayedUrl(relay, url)
     if (await originBlocked(relayUrl)) continue // unreachable from this browser
     const note = `cloning via CORS relay ${relay} — ${hostOf(url)} does not allow direct browser access`
-    const relayed = await attemptClone(vfs, relayUrl, target, gitCwd)
+    onProgress?.(note)
+    const relayed = await attemptClone(vfs, relayUrl, target, gitCwd, 150_000, onProgress)
     if (relayed.ok && relayed.mod) {
       syncMemfsToVfs(relayed.mod, vfs)
       // the repo must remember its real origin, not the relay
@@ -633,6 +682,7 @@ async function runNetworkCommand(
   lgArgs: string[],
   gitCwd: string,
   timeoutMs = 60_000,
+  onProgress?: (line: string) => void,
 ): Promise<CommandResult> {
   let mod: GitModule
   try {
@@ -660,7 +710,8 @@ async function runNetworkCommand(
   }
   const note = useRelay
     ? `${lgArgs[0]}ing via CORS relay ${relay} — ${hostOf(remoteUrl!)} does not allow direct browser access`
-    : null
+    : `${lgArgs[0]}ing...`
+  onProgress?.(note)
 
   let run: LgRun
   try {
@@ -687,13 +738,13 @@ async function runNetworkCommand(
   }
   syncMemfsToVfs(mod, vfs)
   pullUserConfig(mod, vfs)
-  if (note) run.out.unshift(note)
+  if (useRelay) run.out.unshift(note)
   return finish(run)
 }
 
 // ---- the command ----------------------------------------------------------
 
-export async function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string }): Promise<CommandResult> {
+export async function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string; progress?: (line: string) => void }): Promise<CommandResult> {
   const { cwd } = opts
   if (args.length === 0) {
     return usage()
@@ -713,7 +764,7 @@ export async function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string }
   }
 
   if (lgArgs[0] === 'clone') {
-    return runCloneFlow(vfs, lgArgs.slice(1), gitCwd)
+    return runCloneFlow(vfs, lgArgs.slice(1), gitCwd, opts.progress)
   }
 
   let mod: GitModule
@@ -729,7 +780,7 @@ export async function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string }
 
   // lg2 ships no `pull` — run it as the fetch+merge real git performs
   if (lgArgs[0] === 'pull') {
-    const fetch = await runNetworkCommand(vfs, ['fetch', ...lgArgs.slice(1)], gitCwd)
+    const fetch = await runNetworkCommand(vfs, ['fetch', ...lgArgs.slice(1)], gitCwd, 60_000, opts.progress)
     if (fetch.exitCode !== 0) return fetch
     const merge = await runLg(mod, ['merge', 'FETCH_HEAD'])
     syncMemfsToVfs(mod, vfs)
@@ -738,7 +789,7 @@ export async function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string }
   }
 
   if (lgArgs[0] === 'fetch' || lgArgs[0] === 'push') {
-    return runNetworkCommand(vfs, lgArgs, gitCwd)
+    return runNetworkCommand(vfs, lgArgs, gitCwd, 60_000, opts.progress)
   }
 
   const run = await runLg(mod, lgArgs)

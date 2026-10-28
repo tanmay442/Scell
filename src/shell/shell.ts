@@ -19,7 +19,7 @@ export interface ShellResult {
 }
 
 export interface Shell {
-  exec(cmd: string, cwd?: string): Promise<ShellResult>
+  exec(cmd: string, cwd?: string, onProgress?: (line: string) => void): Promise<ShellResult>
 }
 
 function toResult(result: CommandResult | ShellResult): { stdout: string; stderr: string; exitCode: number } {
@@ -69,8 +69,17 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
   const hasBashrc = () => v.isFile(BASHRC)
   const bashrcPrefix = () => (hasBashrc() ? `. ${BASHRC} >/dev/null 2>&1; ` : '')
 
+  // Progress sink for long commands (git clone, npm install): the terminal
+  // passes a live-line writer per exec; platform commands report phases
+  // through it while their buffered stdout/stderr still arrive at the end.
+  // Save/restore keeps nested shells and sequential execs from clobbering.
+  let liveProgress: ((line: string) => void) | undefined
+
   const shell: Shell = {
-    async exec(cmd, cwd) {
+    async exec(cmd, cwd, onProgress) {
+      const prev = liveProgress
+      liveProgress = onProgress
+      try {
       const options = { cwd: cwd ?? HOME_DIR, env: sessionEnv }
       // the environment capture runs IN-BAND (a separate exec would already
       // have its env restored): brace the user's command, keep its exit code,
@@ -101,6 +110,9 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
         }
       }
       return { stdout, stderr: result.stderr, exitCode: result.exitCode }
+      } finally {
+        liveProgress = prev
+      }
     },
   }
 
@@ -109,12 +121,12 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
 
   const register = (
     name: string,
-    fn: (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown }) => Promise<CommandResult> | CommandResult,
+    fn: (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown; progress?: (line: string) => void }) => Promise<CommandResult> | CommandResult,
   ) => {
     bash.registerCommand(
       defineCommand(name, async (args: string[], ctx: { cwd?: string; env?: Map<string, string>; stdin?: unknown }) => {
         try {
-          return toResult(await fn(args, { cwd: ctx.cwd ?? HOME_DIR, env: ctx.env ?? new Map(), stdin: ctx.stdin }))
+          return toResult(await fn(args, { cwd: ctx.cwd ?? HOME_DIR, env: ctx.env ?? new Map(), stdin: ctx.stdin, progress: liveProgress }))
         } catch (err) {
           const detail =
             err instanceof Error
@@ -410,14 +422,14 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string> 
 
   register('node', (args, { cwd, env }) => nodeCommand(v, args, { cwd, env: shellEnvOf(env) }))
   register('tsc', (args, { cwd }) => tscCommand(v, args, { cwd }))
-  register('git', (args, { cwd }) => gitCommand(v, args, { cwd }))
+  register('git', (args, { cwd, progress }) => gitCommand(v, args, { cwd, progress }))
   // npm scripts run in their own shell WITH the project's node_modules/.bin
   // on PATH — that is what makes `npm dev` → `vercel dev` work for real
   const scriptShell = (cwd: string): Shell => createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd) })
-  register('npm', (args, { cwd }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive }))
-  register('pnpm', (args, { cwd }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive }))
-  register('npx', (args, { cwd }) => npx(v, args, { cwd }))
-  register('pnpx', (args, { cwd }) => npx(v, args, { cwd }))
+  register('npm', (args, { cwd, progress }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive, progress }))
+  register('pnpm', (args, { cwd, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress }))
+  register('npx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
+  register('pnpx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
   register('cell', (args, { cwd }) => cellCommand(v, args, { cwd, shell: nestedShell() }))
   const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown }) =>
     pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined })
