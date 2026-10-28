@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ExternalLink, RefreshCw, X } from 'lucide-react'
 import { platform } from '../platform'
-import { buildPreviewDocument, collectPublicAssets, type PreviewBuild } from '../preview/document'
+import { buildPreviewDocument, collectPublicAssets, mimeForPath, type PreviewBuild } from '../preview/document'
 import { runApiFunction } from '../preview/run-api'
 
 interface PendingApi {
@@ -56,6 +56,7 @@ export function PreviewPanel() {
         if (previous) for (const url of previous.objectUrls) URL.revokeObjectURL(url)
         setError(null)
         setBuild(result)
+        for (const warning of result.warnings) pushLog(warning, 'error')
         // router apps need a real pathname (/) — about:srcdoc matches no
         // route. The service worker serves the document at
         // /?cellpreview=<token>; fall back to srcDoc when unavailable.
@@ -83,10 +84,17 @@ export function PreviewPanel() {
               new Response(result.html, { headers: { 'content-type': 'text/html; charset=utf-8' } }),
             )
             // seed public/ at root paths — React references these at runtime
-            // (img src="/logo.svg") long after the static rewrite ran
+            // (img src="/logo.svg") long after the static rewrite ran.
+            // content types matter: svg/fonts served typeless break in some
+            // browsers, and the SW network fallback would serve index.html
             for (const asset of collectPublicAssets(vfs, target)) {
               const assetUrl = new URL(asset.url, location.href).href
-              await cache.put(assetUrl, new Response(asset.bytes as unknown as BodyInit))
+              await cache.put(
+                assetUrl,
+                new Response(asset.bytes as unknown as BodyInit, {
+                  headers: { 'content-type': mimeForPath(asset.url) },
+                }),
+              )
             }
             // one live preview: drop older documents — keys() returns
             // ABSOLUTE urls, so compare normalized (the relative comparison

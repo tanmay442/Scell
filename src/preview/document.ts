@@ -1,6 +1,10 @@
 import type { Vfs } from '../vfs/types'
 import { vfsPath } from '../vfs/types'
 import { bundleEntry } from './bundle'
+// the official tailwind-in-browser runtime, resolved through the bundler
+// from the versioned npm dependency — never an untracked public/ file that
+// fresh clones don't have
+import tailwindBrowserUrl from '@tailwindcss/browser?url'
 
 /**
  * Builds the preview document for an iframe:
@@ -111,6 +115,8 @@ export interface PreviewBuild {
   html: string
   /** blob URLs created for this document — revoked on rebuild */
   objectUrls: string[]
+  /** non-fatal problems, surfaced in the preview log (e.g. no tailwind) */
+  warnings: string[]
 }
 
 const MIME: Record<string, string> = {
@@ -127,6 +133,10 @@ const MIME: Record<string, string> = {
   json: 'application/json',
   woff2: 'font/woff2',
   woff: 'font/woff',
+}
+
+export function mimeForPath(path: string): string {
+  return MIME[vfsPath.ext(path)] ?? 'application/octet-stream'
 }
 
 function blobUrlFor(vfs: Vfs, path: string): string | null {
@@ -171,6 +181,7 @@ export async function buildPreviewDocument(
   }
 
   let out = html
+  const warnings: string[] = []
 
   // bundle the module entry (src/main.tsx + node_modules) — before the
   // generic attribute pass so the script src isn't mistaken for a file link
@@ -216,6 +227,8 @@ export async function buildPreviewDocument(
         const runtimeInlined = `<script>${escapeInlineScript(runtime)}</script>`
         out = out.replace(/<\/head>/i, () => `${runtimeInlined}\n<style type="text/tailwindcss">\n${bundledCss.replace(/<\/style/gi, '')}\n</style>\n</head>`)
       } else {
+        // uncompiled utilities would silently leave the app unstyled — say so
+        warnings.push('preview: tailwindcss runtime unavailable, showing uncompiled styles')
         out = out.replace(/<\/head>/i, () => `<style>\n${bundledCss}\n</style>\n</head>`)
       }
     } else {
@@ -229,18 +242,25 @@ export async function buildPreviewDocument(
   } else {
     out = `${API_SHIM}\n${out}`
   }
-  return { html: out, objectUrls }
+  return { html: out, objectUrls, warnings }
 }
 
-/** the official tailwind-in-browser runtime (rust oxide → wasm inside) */
+/** the official tailwind-in-browser runtime (rust oxide → wasm inside),
+ * resolved from the versioned @tailwindcss/browser dependency */
 let tailwindSource: string | null | undefined
 async function tailwindRuntimeSource(): Promise<string | null> {
   if (tailwindSource !== undefined) return tailwindSource
+  tailwindSource = null
   try {
-    const response = await fetch('/vendor/tailwind-browser.js')
-    tailwindSource = response.ok ? await response.text() : null
+    const response = await fetch(tailwindBrowserUrl)
+    if (response.ok) {
+      const text = await response.text()
+      // dev servers answer unknown paths with index.html (HTTP 200): only
+      // accept something shaped like the compiler bundle
+      if (text.length > 10_000 && !/^\s*</.test(text)) tailwindSource = text
+    }
   } catch {
-    tailwindSource = null
+    // offline or unavailable — the caller falls back to plain css
   }
   return tailwindSource
 }
