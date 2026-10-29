@@ -44,6 +44,8 @@ export interface AgentConfig {
   provider: ProviderKind
   apiKey: string
   model: string
+  /** 'full' (default): ask-tools run ungated; 'ask': per-call approval */
+  permission?: 'full' | 'ask'
   maxOutputTokens?: number
   /** compat provider only: API root, e.g. https://api.x.ai/v1 */
   baseURL?: string

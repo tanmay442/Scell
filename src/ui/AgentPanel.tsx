@@ -15,9 +15,10 @@ interface AgentConfigForm {
   model: string
   apiKey: string
   baseURL: string
+  permission: string
 }
 
-const EMPTY_FORM: AgentConfigForm = { provider: 'meta', model: 'muse-spark-1.3-contributor', apiKey: '', baseURL: '' }
+const EMPTY_FORM: AgentConfigForm = { provider: 'meta', model: 'muse-spark-1.3-contributor', apiKey: '', baseURL: '', permission: 'full' }
 
 function loadForm(): AgentConfigForm {
   try {
@@ -29,6 +30,7 @@ function loadForm(): AgentConfigForm {
       model: parsed.model ?? '',
       apiKey: parsed.apiKey ?? '',
       baseURL: parsed.baseURL ?? '',
+      permission: parsed.permission ?? 'full',
     }
   } catch {
     return EMPTY_FORM
@@ -123,7 +125,7 @@ export function AgentPanel() {
   }
 
   const saveConfig = () => {
-    const data: Record<string, string> = { provider: form.provider }
+    const data: Record<string, string> = { provider: form.provider, permission: form.permission }
     if (form.model.trim() !== '') data.model = form.model.trim()
     if (form.apiKey.trim() !== '') data.apiKey = form.apiKey.trim()
     if (form.provider === 'compat' && form.baseURL.trim() !== '') data.baseURL = form.baseURL.trim()
@@ -177,6 +179,11 @@ export function AgentPanel() {
             <input className="agent-input" value={form.baseURL} onChange={(e) => setForm({ ...form, baseURL: e.target.value })} placeholder="https://api.x.ai/v1" />
           </>
         ) : null}
+        <label className="agent-label">Permission</label>
+        <select className="agent-input" value={form.permission} onChange={(e) => setForm({ ...form, permission: e.target.value })}>
+          <option value="full">Full permissions — tools run without asking (default)</option>
+          <option value="ask">Ask before each tool call</option>
+        </select>
         <label className="agent-label">API key {form.provider === 'meta' ? '(required in the browser — no host auth file here)' : ''}</label>
         <input className="agent-input" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-…" />
         <button className="agent-btn" onClick={saveConfig}><Save size={13} /> Save config</button>
@@ -205,7 +212,7 @@ export function AgentPanel() {
         </div>
       ) : null}
 
-      <pre className="agent-log" ref={logRef}>{log.length === 0 ? 'Agent output streams here. Ask tools (bash, edit, write, custom) pause for your approval above.' : log.join('\n')}</pre>
+      <pre className="agent-log" ref={logRef}>{log.length === 0 ? 'Agent output streams here. Set Permission to Ask and tool calls (bash, edit, write, custom) pause for your approval above.' : log.join('\n')}</pre>
 
       <div className="agent-section">
         <label className="agent-label">Sessions (resume)</label>

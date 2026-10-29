@@ -131,7 +131,7 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
       model?: string
       baseURL?: string
       max_output_tokens?: number
-      approval?: string
+      permission?: string
     }
     if (parsed.provider !== undefined && !(KNOWN_PROVIDERS as readonly string[]).includes(parsed.provider)) {
       return { error: `cell agent: unknown provider '${parsed.provider}' (use meta, anthropic, openai or compat)\n` }
@@ -164,6 +164,9 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
         provider,
         apiKey,
         model: parsed.model ?? DEFAULT_MODELS[provider],
+        // permission defaults to full: 'ask' tools run without a gate
+        // unless the user explicitly chose per-call approval
+        permission: parsed.permission === 'ask' ? 'ask' : 'full',
         ...(parsed.baseURL !== undefined ? { baseURL: parsed.baseURL } : {}),
         ...(maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {}),
       },
@@ -185,6 +188,8 @@ function toolSummary(call: ToolCall): string {
   if (call.input.cwd !== undefined) return String(call.input.cwd)
   return JSON.stringify(call.input).slice(0, 120)
 }
+
+export type PermissionMode = 'full' | 'ask'
 
 export interface RunAgentOpts {
   cwd: string
@@ -222,7 +227,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
             '  --resume <id>         continue a session in ~/.cell/sessions/',
             '  --steps N             step budget (default 30)',
             '',
-            'config: ~/.cell/agent.json { provider: meta|anthropic|openai|compat, model, apiKey?, baseURL? }',
+            'config: ~/.cell/agent.json { provider: meta|anthropic|openai|compat, model, apiKey?, baseURL?, permission: full|ask }',
             'tools: bash/read/edit/write/ls/load_skill + ~/.cell/tools/*.json',
             'skills: ~/.cell/skills/<name>/SKILL.md (+ <project>/.cell/skills/ override)',
           ].join('\n') + '\n',
@@ -405,7 +410,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
       // a clear prompt line first (non-interactive shells auto-proceed —
       // the line is the audit trail for what the agent touched)
       const approval = approvalFor(entries, call.name)
-      if (approval === 'ask' && opts.approve !== undefined) {
+      if (approval === 'ask' && config.permission === 'ask' && opts.approve !== undefined) {
         // interactive gate (Agent panel): the user decides per call.
         // Bounded: an abandoned prompt (closed panel, walked away)
         // auto-denies instead of hanging the run forever.
@@ -418,7 +423,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
           continue
         }
       } else if (approval === 'ask') {
-        transcript.push(redactSecrets(`❓ approval: ${call.name} ${summary} — auto-approved (non-interactive run)`))
+        transcript.push(redactSecrets(`❓ approval: ${call.name} ${summary} — auto-approved (${config.permission === 'full' ? 'full permission' : 'non-interactive run'})`))
       }
       transcript.push(redactSecrets(`⏺ ${call.name} ${summary}`))
       opts.onProgress?.(redactSecrets(`⏺ ${call.name} ${summary}`))

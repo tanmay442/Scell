@@ -524,6 +524,7 @@ describe('agent harness review tests (runAgent-level, stubbed fetch)', () => {
 describe('approval timeout', () => {
   it('an abandoned approval auto-denies instead of hanging the run', async () => {
     const vfs = agentVfs()
+    vfs.write('/home/user/.cell/agent.json', JSON.stringify({ provider: 'anthropic', apiKey: 'test-key', permission: 'ask' }))
     scriptStub([
       anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
       anthropicText('understood, moving on'),
@@ -537,4 +538,45 @@ describe('approval timeout', () => {
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toContain('DENIED by user')
   }, 5000)
+})
+
+describe('permission modes', () => {
+  function permissionVfs(permission?: string) {
+    const vfs = createVfs()
+    vfs.mkdir('/home/user/.cell')
+    vfs.write('/home/user/.cell/agent.json', JSON.stringify({ provider: 'anthropic', apiKey: 'k', ...(permission ? { permission } : {}) }))
+    return vfs
+  }
+
+  it('full (default): approve hook is never consulted', async () => {
+    const vfs = permissionVfs()
+    scriptStub([
+      anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
+      anthropicText('done'),
+    ])
+    let approveCalls = 0
+    const result = await runAgent(vfs, ['go'], {
+      cwd: '/home/user',
+      shell: okShell as never,
+      approve: async () => { approveCalls++; return false },
+    })
+    expect(approveCalls).toBe(0)
+    expect(result.stdout).toContain('full permission')
+  })
+
+  it('ask: approve hook gates the call', async () => {
+    const vfs = permissionVfs('ask')
+    scriptStub([
+      anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
+      anthropicText('done'),
+    ])
+    let approveCalls = 0
+    const result = await runAgent(vfs, ['go'], {
+      cwd: '/home/user',
+      shell: okShell as never,
+      approve: async () => { approveCalls++; return false },
+    })
+    expect(approveCalls).toBe(1)
+    expect(result.stdout).toContain('DENIED by user')
+  })
 })
