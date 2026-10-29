@@ -382,7 +382,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
   opts.onSession?.(id)
 
-  const persist = (steps: number) => {
+  const persist = (steps: number, runFinished = false) => {
     try {
       // merge sidebar metadata from disk at save time: a run must never
       // wipe a title/pin/archive/lock the user set (or a title the
@@ -394,7 +394,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
         ...(existing.session.archived !== undefined ? { archived: existing.session.archived } : {}),
         ...(existing.session.locked !== undefined ? { locked: existing.session.locked } : {}),
       }
-      saveSession(vfs, { id, startedAt, provider: config.provider, model: config.model, prompt: sessionPrompt, transcript, turns, steps, ...meta })
+      saveSession(vfs, { id, startedAt, provider: config.provider, model: config.model, prompt: sessionPrompt, transcript, turns, steps, ...meta, ...(runFinished ? {} : { liveRun: true }) })
     } catch {
       // sessions are best-effort — the transcript still returns
     }
@@ -404,7 +404,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   for (let step = 1; step <= maxSteps; step++) {
     if (opts.signal?.aborted) {
       transcript.push('agent: stopped by user')
-      persist(step)
+      persist(step, true)
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
     }
     // compaction: when the live context passes the threshold, summarize
@@ -424,7 +424,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns, opts.signal)
     if ('error' in model) {
       transcript.push(`agent ✗ ${redactSecrets(model.error)}`)
-      persist(step)
+      persist(step, true)
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 1 }
     }
 
@@ -440,7 +440,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
       recordAssistantMessage(state, config.provider, model.text, model.calls)
       capLiveState(state)
       transcript.push(`session ${id} — resume with \`cell agent --resume ${id} "…"\``)
-      persist(step)
+      persist(step, true)
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
     }
     if (model.text.trim().length > 0) transcript.push(`⏺ ${clip(redactSecrets(model.text.trim()), 4)}`)
@@ -468,7 +468,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
     if (model.calls.length === 0) {
       transcript.push('agent: model returned nothing runnable — stopping')
-      persist(step)
+      persist(step, true)
       return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
     }
 
@@ -488,7 +488,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     for (const call of model.calls) {
       if (opts.signal?.aborted) {
         transcript.push('agent: stopped by user')
-        persist(step)
+        persist(step, true)
         return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
       }
       const summary = toolSummary(call)
@@ -547,10 +547,14 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     capLiveState(state)
     if (turns.length > 60) turns = truncateTurns(turns)
     if (transcript.length > 300) transcript = transcript.slice(-300)
+    // persist every step (flagged live): a closed or crashed tab can
+    // resume this session from exactly here, and boot can tell the run
+    // was interrupted instead of finding a silent half-conversation
+    persist(step)
   }
 
   transcript.push(`agent: reached the ${maxSteps}-step limit — continue with \`cell agent --resume ${id} "keep going"\``)
-  persist(maxSteps)
+  persist(maxSteps, true)
   return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
 }
 

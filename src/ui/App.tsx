@@ -10,8 +10,22 @@ const CodeShell = lazy(() => import('./CodeShell').then((module) => ({ default: 
  * The agent is the front door; the full IDE lives one click away
  * behind "Workspace" and loads on demand.
  */
+const APP_MODE_KEY = 'cell.appMode'
+
 export function App() {
-  const [appMode, setAppMode] = useState<'agent' | 'code'>('agent')
+  const [appMode, setMode] = useState<'agent' | 'code'>(() => {
+    try {
+      return localStorage.getItem(APP_MODE_KEY) === 'code' ? 'code' : 'agent'
+    } catch {
+      return 'agent'
+    }
+  })
+  const setAppMode = (mode: 'agent' | 'code') => {
+    try {
+      localStorage.setItem(APP_MODE_KEY, mode)
+    } catch { /* private mode */ }
+    setMode(mode)
+  }
 
   if (appMode === 'agent') {
     return (

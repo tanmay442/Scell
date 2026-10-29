@@ -30,6 +30,12 @@ export interface AgentSession {
   pinned?: boolean
   archived?: boolean
   locked?: boolean
+  /** true while a run is live in some tab; still true at boot = the
+   * previous run was interrupted (tab closed/reloaded mid-run) */
+  liveRun?: boolean
+  /** set when a dead tab's liveRun is first noticed; cleared when the
+   * user actually opens the session and sees the interruption note */
+  interrupted?: boolean
   startedAt: string
   provider: string
   model: string

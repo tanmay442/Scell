@@ -20,9 +20,27 @@ interface WorkspaceState {
   version: number
 }
 
+const WORKSPACE_KEY = 'cell.workspace'
+
+function restoredTabs(): { openPaths: string[]; activePath: string | null } {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(WORKSPACE_KEY) ?? 'null') as { openPaths?: unknown; activePath?: unknown } | null
+    if (parsed === null) return { openPaths: [], activePath: null }
+    // paths are validated against the VFS on first read (CodeShell
+    // prunes missing ones) — storage may outlive the files it names
+    const openPaths = Array.isArray(parsed.openPaths) ? parsed.openPaths.filter((path): path is string => typeof path === 'string') : []
+    const activePath = typeof parsed.activePath === 'string' && openPaths.includes(parsed.activePath) ? parsed.activePath : (openPaths[0] ?? null)
+    return { openPaths, activePath }
+  } catch {
+    return { openPaths: [], activePath: null }
+  }
+}
+
+const restored = restoredTabs()
+
 const state: WorkspaceState = {
-  openPaths: [],
-  activePath: null,
+  openPaths: restored.openPaths,
+  activePath: restored.activePath,
   drafts: new Map(),
   resetTokens: new Map(),
   reveal: null,
@@ -56,6 +74,9 @@ function rebuild(): WorkspaceSnapshot {
 function commit(mutate: () => void) {
   mutate()
   state.version++
+  try {
+    localStorage.setItem(WORKSPACE_KEY, JSON.stringify({ openPaths: state.openPaths, activePath: state.activePath }))
+  } catch { /* private mode — tabs stay in memory */ }
   rebuild()
   for (const notify of subscribers) notify()
 }
@@ -76,6 +97,20 @@ export function getActivePath(): string | null {
 }
 
 export const workspaceActions = {
+  /** Drop restored tabs whose files no longer exist (workspace wiped
+   * or file deleted while the tab was closed). Called on IDE mount. */
+  pruneMissing(): void {
+    const { vfs } = platform()
+    const kept = state.openPaths.filter((path) => vfs.isFile(path))
+    if (kept.length === state.openPaths.length) return
+    commit(() => {
+      state.openPaths = kept
+      if (state.activePath !== null && !kept.includes(state.activePath)) {
+        state.activePath = kept[kept.length - 1] ?? null
+      }
+    })
+  },
+
   openFile(path: string, line?: number) {
     commit(() => {
       if (!state.openPaths.includes(path)) state.openPaths.push(path)

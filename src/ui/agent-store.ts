@@ -40,7 +40,11 @@ export interface SessionInfo {
   pinned?: boolean
   archived?: boolean
   locked?: boolean
+  /** previous run was interrupted (tab died mid-run); cleared on open */
+  interrupted?: boolean
 }
+
+
 
 interface AgentSnapshot {
   entries: readonly ChatEntry[]
@@ -145,7 +149,7 @@ let snapshot: AgentSnapshot = {
   sessionId: null,
   config: EMPTY_FORM,
   savedNote: '',
-  draft: '',
+  draft: readStoredDraft(null),
   version: 0,
 }
 const subscribers = new Set<() => void>()
@@ -351,11 +355,23 @@ function sessionInfo(vfs: ReturnType<typeof platform>['vfs'], id: string): Sessi
     ...(loaded.session.archived ? { archived: true } : {}),
     ...(loaded.session.locked ? { locked: true } : {}),
   }
+  if (loaded.session.liveRun === true && !snapshot.runningIds.includes(id)) {
+    // a run was live when its tab went away: convert liveRun into a
+    // persistent interrupted marker. It stays in the file until the
+    // user actually opens the session — noticing it on a refresh must
+    // not silently consume it
+    try {
+      const { liveRun: _cleared, ...rest } = loaded.session
+      saveSession(vfs, { ...rest, interrupted: true })
+      loaded.session = { ...rest, interrupted: true }
+    } catch { /* best-effort */ }
+  }
+  const interruptedFlag = loaded.session.interrupted === true ? { interrupted: true } : {}
   const title = loaded.session.title?.trim()
-  if (title !== undefined && title !== '') return { id, label: title, title, ...flags }
+  if (title !== undefined && title !== '') return { id, label: title, title, ...flags, ...interruptedFlag }
   const prompt = loaded.session.prompt.trim()
-  if (prompt !== '') return { id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt, ...flags }
-  return { id, label: id, ...flags }
+  if (prompt !== '') return { id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt, ...flags, ...interruptedFlag }
+  return { id, label: id, ...flags, ...interruptedFlag }
 }
 
 /** Patch flags/title on a stored session, preserving its history. */
@@ -418,6 +434,27 @@ function seedHistoryEntries(thread: ThreadState, vfs: ReturnType<typeof platform
 
 // ---- actions --------------------------------------------------------------------
 
+const DRAFT_PREFIX = 'cell.draft:'
+
+function draftKey(threadId: string | null): string {
+  return `${DRAFT_PREFIX}${threadId ?? 'new'}`
+}
+
+function readStoredDraft(threadId: string | null): string {
+  try {
+    return localStorage.getItem(draftKey(threadId)) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function storeDraft(threadId: string | null, text: string): void {
+  try {
+    if (text === '') localStorage.removeItem(draftKey(threadId))
+    else localStorage.setItem(draftKey(threadId), text)
+  } catch { /* private mode — drafts stay in memory */ }
+}
+
 export const agentActions = {
   refresh(): void {
     const { vfs } = platform()
@@ -462,12 +499,15 @@ export const agentActions = {
   },
 
   setDraft(text: string): void {
+    storeDraft(visibleThreadId, text)
     set({ draft: text })
   },
 
   appendDraft(text: string): void {
     const current = snapshot.draft
-    set({ draft: current === '' ? text : `${current}${current.endsWith(' ') ? '' : ' '}${text}` })
+    const next = current === '' ? text : `${current}${current.endsWith(' ') ? '' : ' '}${text}`
+    storeDraft(visibleThreadId, next)
+    set({ draft: next })
   },
 
   /** Open a past session as the current thread. Any run already going
@@ -484,7 +524,17 @@ export const agentActions = {
       thread.contextChars = 'error' in loaded ? 0 : loaded.session.turns.reduce((sum, turn) => sum + turn.text.length, 0)
       seedHistoryEntries(thread, vfs, id)
     }
-    set({ draft: '' })
+    set({ draft: readStoredDraft(id) })
+    const opened = loadSession(vfs, id)
+    if (!('error' in opened) && opened.session.interrupted === true) {
+      // consumed on view: clear the marker, tell the user once
+      try {
+        const { interrupted: _seen, ...rest } = opened.session
+        saveSession(vfs, rest)
+      } catch { /* best-effort */ }
+      pushEntry(thread, 'note', '⚠ the previous run was interrupted — the tab closed or reloaded mid-run. Everything up to the last finished step is here; send a message to continue.')
+      agentActions.refresh()
+    }
     publish()
   },
 
@@ -561,7 +611,7 @@ export const agentActions = {
   /** New chat: just change the view. Nothing is stopped. */
   clearChat(): void {
     visibleThreadId = null
-    set({ draft: '' })
+    set({ draft: readStoredDraft(null) })
     publish()
   },
 
@@ -600,6 +650,11 @@ export const agentActions = {
     const approve = makeApprove(thread)
     thread.abort = new AbortController()
     thread.running = true
+    // the draft being sent may live under the fresh-chat key (the
+    // thread only gets its id now) — clear both, or a reload would
+    // resurrect the already-sent prompt in the composer
+    storeDraft(thread.id, '')
+    storeDraft(null, '')
     set({ draft: '' })
     publish()
     pushEntry(thread, 'user', text)

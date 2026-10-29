@@ -76,6 +76,8 @@ const runningDot: CSSProperties = {
   flexShrink: 0,
 }
 
+const interruptedDot: CSSProperties = { ...runningDot, background: '#E0A458' }
+
 const CONTENT_WIDTH = 800
 const fill: CSSProperties = { height: '100%', minHeight: 0 }
 const heroWrap: CSSProperties = { position: 'relative', height: '100%', overflow: 'hidden' }
@@ -659,6 +661,7 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
  */
 export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
+  const [storageLine, setStorageLine] = useState('Storage: checking…')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<AgentConfigForm | null>(null)
   const [renameTarget, setRenameTarget] = useState<{ id: string; value: string } | null>(null)
@@ -674,6 +677,26 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   const openSettings = () => {
     setSettingsDraft({ ...state.config })
     setSettingsOpen(true)
+    // storage health: is this browser keeping the workspace for good?
+    void (async () => {
+      try {
+        const storage = navigator.storage
+        if (!storage) {
+          setStorageLine('Storage: browser API unavailable')
+          return
+        }
+        const [persisted, estimate] = await Promise.all([
+          storage.persisted ? storage.persisted() : Promise.resolve(false),
+          storage.estimate ? storage.estimate() : Promise.resolve(null),
+        ])
+        const used = estimate?.usage !== undefined ? `${Math.max(1, Math.round(estimate.usage / 1_048_576))} MB used` : 'size unknown'
+        setStorageLine(persisted
+          ? `Storage: persistent — ${used}. Files, threads and settings auto-save here after every change.`
+          : `Storage: best-effort — ${used}. The browser may evict this workspace under disk pressure; export backups with cell save.`)
+      } catch {
+        setStorageLine('Storage: status unavailable')
+      }
+    })()
   }
 
   const isEmpty = state.entries.length === 0
@@ -736,7 +759,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                 icon={session.pinned ? BookmarkIcon : ClockIcon}
                 size="sm"
                 isSelected={state.sessionId === session.id}
-                {...(state.runningIds.includes(session.id) ? { endContent: <span style={runningDot} /> } : {})}
+                {...(state.runningIds.includes(session.id) ? { endContent: <span style={runningDot} /> } : session.interrupted ? { endContent: <span style={interruptedDot} /> } : {})}
                 onClick={() => agentActions.openSession(session.id)}
                 actions={
                   <MoreMenu
@@ -772,7 +795,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                       label={session.label}
                       size="sm"
                       isSelected={state.sessionId === session.id}
-                      {...(state.runningIds.includes(session.id) ? { endContent: <span style={runningDot} /> } : {})}
+                      {...(state.runningIds.includes(session.id) ? { endContent: <span style={runningDot} /> } : session.interrupted ? { endContent: <span style={interruptedDot} /> } : {})}
                       onClick={() => agentActions.openSession(session.id)}
                       actions={
                         <MoreMenu
@@ -937,6 +960,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                       { value: 'ask', label: 'Ask before each tool call' },
                     ]}
                   />
+                  <Text type="supporting" color="secondary">{storageLine}</Text>
                   <HStack gap={2}>
                     <Button
                       label="Save config"

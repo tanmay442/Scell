@@ -21,6 +21,7 @@ export function CodeShell({ onHome }: { onHome: () => void }) {
   const [sidebarView, setSidebarView] = useState<SidebarView>('explorer')
 
   useEffect(() => {
+    workspaceActions.pruneMissing()
     const { bus } = platform()
     const detachKeys = attachGlobalKeys({ togglePanel: () => setPanelVisible((v) => !v) })
     const unwatch = bus.on('vfs:changed', (e) => {
