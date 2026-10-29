@@ -214,6 +214,15 @@ export const agentActions = {
     set({ resumeTarget: id })
   },
 
+  /** Open a past session as the current thread: its history loads
+   * into the chat and the next message continues it. */
+  openSession(id: string): void {
+    if (snapshot.running) return
+    const { vfs } = platform()
+    set({ entries: [], contextChars: 0, resumeTarget: id, sessionId: id, draft: '' })
+    seedHistoryEntries(vfs, id)
+  },
+
   clearChat(): void {
     if (snapshot.running) return
     set({ entries: [], contextChars: 0, sessionId: null, resumeTarget: null, draft: '' })
@@ -235,7 +244,6 @@ export const agentActions = {
     const { vfs, bus } = platform()
     abortController = new AbortController()
     set({ running: true, resumeTarget: null, draft: '' })
-    if (resumeId !== null) seedHistoryEntries(vfs, resumeId)
     pushEntry('user', text)
     bus.emit('app:status', { message: resumeId !== null ? `agent resuming ${resumeId}…` : 'agent running…', tone: 'info' })
     const cwd = getActivePath() ?? HOME

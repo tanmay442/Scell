@@ -26,7 +26,6 @@ import { DropdownMenu } from '@astryxdesign/core/DropdownMenu'
 import { TextInput } from '@astryxdesign/core/TextInput'
 import { Selector } from '@astryxdesign/core/Selector'
 import { ProgressBar } from '@astryxdesign/core/ProgressBar'
-import { Token } from '@astryxdesign/core/Token'
 import {
   MicrophoneIcon,
   PaperClipIcon,
@@ -365,7 +364,7 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
           </HStack>
         }
         footerActions={
-          <HStack gap={1} vAlign="center">
+          <HStack gap={1} vAlign="center" wrap="wrap">
             <DropdownMenu
               button={{ label: modelLabel, variant: 'ghost', size: 'sm', icon: <Logo size={14} /> }}
               items={[
@@ -397,9 +396,6 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
                 { label: 'Ask first', onClick: () => { agentActions.setConfig({ permission: 'ask' }); agentActions.saveConfig() } },
               ]}
             />
-            {state.resumeTarget !== null ? (
-              <Token label={`resuming ${state.resumeTarget}`} onRemove={() => agentActions.setResumeTarget(null)} />
-            ) : null}
           </HStack>
         }
       />
@@ -491,7 +487,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                   icon={ClockIcon}
                   size="sm"
                   isSelected={state.resumeTarget === session.id}
-                  onClick={() => agentActions.setResumeTarget(state.resumeTarget === session.id ? null : session.id)}
+                  onClick={() => agentActions.openSession(session.id)}
                 />
               ))
             )}
@@ -517,7 +513,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                     </Text>
                   </VStack>
                   {composer}
-                  <HStack gap={2} wrap="wrap">
+                  <HStack gap={2} wrap="wrap" style={{ width: '90%', marginInline: 'auto' }}>
                     {SUGGESTIONS.map((suggestion) => (
                       <StackItem key={suggestion.title} style={{ flexBasis: '46%', minWidth: 'min(240px, 100%)', flexGrow: 1 }}>
                         <ClickableCard label={suggestion.title} variant="muted" padding={2} onClick={() => agentActions.setDraft(suggestion.prompt)}>
