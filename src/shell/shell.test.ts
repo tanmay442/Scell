@@ -180,12 +180,51 @@ describe('.bashrc guard (P1-1)', () => {
     const shell = createShell(vfs)
     const first = await shell.exec('echo still-alive')
     expect(first.stdout).toContain('still-alive')
-    expect(first.stderr).toContain('~/.bashrc failed — skipped until it changes')
+    expect(first.stderr).toContain('~/.bashrc failed its probe — skipped until it changes')
     const second = await shell.exec('echo alive-again')
     expect(second.stdout).toContain('alive-again')
     // fixing .bashrc re-enables it (hash changed)
     vfs.write(`${HOME}/.bashrc`, 'export CELL_GUARD_OK=yes\n')
     const third = await shell.exec('echo $CELL_GUARD_OK')
     expect(third.stdout).toContain('yes')
+  })
+})
+
+describe('.bashrc guard regressions', () => {
+  it('a user command using exit runs exactly once under a good .bashrc', async () => {
+    const vfs = createVfs()
+    vfs.write(`${HOME}/.bashrc`, 'export FROM_RC=1\n')
+    const shell = createShell(vfs)
+    const result = await shell.exec('echo once >> count.txt; exit 5')
+    expect(result.exitCode).toBe(5)
+    expect(vfs.read(`${HOME}/count.txt`)).toBe('once\n')
+  })
+
+  it('a .bashrc ending in exit 0 keeps its exports', async () => {
+    const vfs = createVfs()
+    vfs.write(`${HOME}/.bashrc`, 'export FROM_RC=yes\nexit 0\n')
+    const shell = createShell(vfs)
+    const result = await shell.exec('echo $FROM_RC')
+    expect(result.stdout).toContain('yes')
+  })
+
+  it('bad .bashrc + user exit keeps the user exit code and output', async () => {
+    const vfs = createVfs()
+    vfs.write(`${HOME}/.bashrc`, 'exit 3\n')
+    const shell = createShell(vfs)
+    const result = await shell.exec('echo before; exit 5')
+    expect(result.exitCode).toBe(5)
+    expect(result.stdout).toContain('before')
+  })
+
+  it('compound cd reports the final cwd', async () => {
+    const vfs = createVfs()
+    vfs.mkdir(`${HOME}/project/sub`)
+    const shell = createShell(vfs)
+    const result = await shell.exec('cd ~/project && cd sub && pwd')
+    expect(result.stdout).toContain('/home/user/project/sub')
+    expect(result.cwd).toBe('/home/user/project/sub')
+    const sub = await shell.exec('(cd /); pwd')
+    expect(sub.cwd).toBe(HOME)
   })
 })

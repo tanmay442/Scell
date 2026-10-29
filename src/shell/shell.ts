@@ -88,8 +88,11 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // process), then accumulate their own exports from there
   const sessionEnv: Record<string, string> = { ...(opts?.seedEnv ?? {}) }
   const hasBashrc = () => v.isFile(BASHRC)
-  /** hash of the .bashrc content last seen to break an exec (P1-1 guard) */
-  let badBashrcHash: string | null = null
+  /** .bashrc probe verdicts keyed by (content hash, cwd): a .bashrc that
+   * fails its probe is skipped for that pair until the file changes.
+   * Keyed by cwd because a .bashrc may legitimately behave differently
+   * per directory; a bare hash would poison it everywhere (P1-1). */
+  const bashrcVerdicts = new Map<string, boolean>()
   const bashrcHash = (): string | null => {
     try {
       const text = v.read(BASHRC)
@@ -146,6 +149,44 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
     },
   } as Shell
 
+  /** Write a sourceable copy of .bashrc with `exit` rewritten to
+   * `return` (line-start / after ; && || only). just-bash's `exit`
+   * cannot be shadowed or subshell-contained for env capture — it
+   * aborts the whole exec — so an `exit` idiom in .bashrc would
+   * otherwise lose every export above it and the user command with
+   * it. The user's real file is untouched; only the copy is sourced.
+   * Quoted/comment `exit` words in those positions can false-positive;
+   * rare in rc files, and the failure mode is a stopped source, not
+   * corruption. */
+  const prepareBashrc = async (nonce: string): Promise<string | null> => {
+    try {
+      const text = v.read(BASHRC)
+      if (text === null) return null
+      const rewritten = text.replace(/(^|[;]|&&|\|\|)\s*exit\b/gm, '$1return')
+      const path = `/tmp/.cell-bashrc-${nonce}.sh`
+      await fs.writeFile(path, rewritten)
+      return path
+    } catch {
+      return null
+    }
+  }
+
+  /** Source .bashrc in a subshell and report whether it exited 0.
+   * The subshell contains `exit`; the RC line is echoed outside it, so
+   * even a parse failure is distinguishable (marker absent = bad). */
+  const probeBashrc = async (probeCwd: string): Promise<boolean> => {
+    try {
+      const rcPath = await prepareBashrc(randomHex())
+      if (rcPath === null) return false
+      const probe = `( . '${rcPath}' >/dev/null 2>&1; echo __CELL_BASHRC_RC__$? ); __cell_env_dump ${randomHex()} 0`
+      const result = await bash.exec(probe, { cwd: probeCwd, env: { ...sessionEnv } })
+      const match = /__CELL_BASHRC_RC__(\d+)/.exec(result.stdout)
+      return match !== null && match[1] === '0'
+    } catch {
+      return false
+    }
+  }
+
   async function doExec(
     cmd: string,
     cwd?: string,
@@ -161,28 +202,47 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
       const rcVar = `__cell_${nonce}_rc`
       const tmpPath = `/tmp/.cell-exec-${nonce}.sh`
       const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS
-      // .bashrc guard (P1-1): a hash marked bad (an exec died with it
-      // sourced) is skipped until the file changes again
+      // .bashrc guard (P1-1): probe .bashrc ALONE (subshell, so its
+      // `exit` cannot kill anything) before trusting it in the real
+      // exec. A blind retry on a missing marker double-executed user
+      // commands that themselves used `exit` — the probe is what tells
+      // the two apart. Verdicts cache per (hash, cwd); a failed .bashrc
+      // is skipped with a visible note until the file changes.
       const currentBashrcHash = hasBashrc() ? bashrcHash() : null
-      const includeBashrc = hasBashrc() && currentBashrcHash !== badBashrcHash
+      const bashrcKey = currentBashrcHash !== null ? `${currentBashrcHash}@${cwd ?? HOME_DIR}` : null
+      let includeBashrc = hasBashrc()
+      if (bashrcKey !== null) {
+        const cached = bashrcVerdicts.get(bashrcKey)
+        if (cached !== undefined) includeBashrc = cached
+        else {
+          const ok = await probeBashrc(cwd ?? HOME_DIR)
+          bashrcVerdicts.set(bashrcKey, ok)
+          includeBashrc = ok
+        }
+      }
 
       const runOnce = async (withBashrc: boolean): Promise<{ shellResult: ShellResult; markerMissing: boolean }> => {
         // the user command rides a temp file, never raw interpolation:
         // unclosed quotes/syntax in the file fail the `source` alone, so
         // the epilogue below still runs (P0-3). `exit` is shadowed by a
         // function whose `return` stops the sourced file with that code
-        // instead of killing the long-lived session shell. The shadow is
-        // defined BEFORE the .bashrc source line: an `exit` inside
-        // .bashrc must return into the wrapper, not kill the exec
-        // before the user command runs (P1-1).
+        // instead of killing the long-lived session shell. (.bashrc is
+        // probe-verified before inclusion — see probeBashrc; the shadow
+        // alone cannot save an exec from a .bashrc `exit`, because the
+        // shadow is defined inside the same script the exit aborts.)
         await fs.writeFile(tmpPath, cmd)
+        const rcPath = withBashrc ? await prepareBashrc(nonce) : null
         const options = { cwd: cwd ?? HOME_DIR, env: { ...sessionEnv } }
         // always-run epilogue (`;`-chained, never `&&`): captures the exit
         // code, dumps the env in-band, then cleans the temp file. The dump
         // command exits with the user's code, so the step's exitCode is his.
-        const sourceLine = withBashrc ? `. ${BASHRC} >/dev/null 2>&1; ` : ''
+        const sourceLine = withBashrc && rcPath !== null ? `. '${rcPath}' >/dev/null 2>&1; ` : ''
+        // `exit` in the user file aborts the exec in just-bash (it
+        // cannot be shadowed) — commands after it do not run and the
+        // exit code propagates, which matches bash closely enough;
+        // the env dump is skipped on that path (envStale semantics).
         const wrapped =
-          `exit() { return \${1:-0}; } 2>/dev/null; ${sourceLine}${rcVar}=0; source '${tmpPath}' || ${rcVar}=$?; rm -f '${tmpPath}' >/dev/null 2>&1; __cell_env_dump ${nonce} $${rcVar}`
+          `${sourceLine}${rcVar}=0; source '${tmpPath}' || ${rcVar}=$?; rm -f '${tmpPath}'${rcPath !== null ? ` '${rcPath}'` : ''} >/dev/null 2>&1; __cell_env_dump ${nonce} $${rcVar}`
         const underlying = bash.exec(wrapped, options)
         let timer: ReturnType<typeof setTimeout> | null = null
         try {
@@ -246,6 +306,15 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
               markerMissing: false,
             }
           }
+          // a protected-path write inside the command (echo > ~/.cell/x)
+          // throws EACCES out of the fs layer: fail THIS command with a
+          // clear line instead of rejecting the whole exec
+          if ((err as { code?: string })?.code === 'EACCES' || (err instanceof Error && err.message.startsWith('EACCES'))) {
+            return {
+              shellResult: { stdout: '', stderr: `cell: ${err instanceof Error ? err.message : String(err)}\n`, exitCode: 1 },
+              markerMissing: false,
+            }
+          }
           throw err
         } finally {
           if (timer !== null) clearTimeout(timer)
@@ -253,17 +322,9 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
       }
 
       try {
-        let attempt = await runOnce(includeBashrc)
-        if (attempt.markerMissing && includeBashrc) {
-          // .bashrc killed the wrapper (exit/syntax): retry once without
-          // it. If the epilogue then runs, mark this hash bad so later
-          // execs skip .bashrc until the file changes (P1-1).
-          const retry = await runOnce(false)
-          if (!retry.markerMissing) {
-            badBashrcHash = currentBashrcHash
-            retry.shellResult.stderr = `cell: ~/.bashrc failed — skipped until it changes\n${retry.shellResult.stderr}`
-            attempt = retry
-          }
+        const attempt = await runOnce(includeBashrc)
+        if (!includeBashrc && hasBashrc()) {
+          attempt.shellResult.stderr = `cell: ~/.bashrc failed its probe — skipped until it changes\n${attempt.shellResult.stderr}`
         }
         return attempt.shellResult
       } finally {
