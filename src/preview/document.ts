@@ -68,7 +68,7 @@ const API_SHIM = `
 /** neutralize the HTML parser traps for inline <script> text; each escape
  * is string-preserving in JS ('<' after a backslash keeps its value in
  * strings and legacy regexes) */
-export function escapeInlineScript(js: string): string {
+function escapeInlineScript(js: string): string {
   return js
     .replace(/<\/script/gi, '<\\/script')
     .replace(/<script/gi, '<\\script')

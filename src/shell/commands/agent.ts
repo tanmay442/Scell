@@ -580,4 +580,3 @@ function rebuildState(state: ProviderState, provider: ProviderKind, turns: Sessi
   }
 }
 
-export type { ToolInfo }

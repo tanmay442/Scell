@@ -194,13 +194,13 @@ export function parseMetaSseEvents(raw: string): { deltas: string[]; final: unkn
 }
 
 /** Cap for live-streamed text before a truncation mark (P1-2). */
-export const META_STREAM_MAX = 20_000
+const META_STREAM_MAX = 20_000
 
 /** Incremental SSE reader: parses chunks as they arrive, forwards each
  * redacted delta to onProgress live, and marks truncation instead of
  * silently slicing (P1-2). Falls back to buffered parsing when the
  * body stream is unavailable (tests, non-browser transports). */
-export async function readMetaStream(
+async function readMetaStream(
   response: Response,
   onProgress: (line: string) => void,
   maxChars = META_STREAM_MAX,
@@ -637,7 +637,7 @@ function metaInput(state: ProviderState, systemPrompt: string): Record<string, u
 
 /** Cap for live provider message logs (P1-4). Meta needs none — it chains
  * through previous_response_id instead of a local log. */
-export const MAX_LIVE_MESSAGES = 100
+const MAX_LIVE_MESSAGES = 100
 
 /** Drop a prefix of the log, then repair the new head: the tail must not
  * start with a continuation (tool_result/tool message) whose opener was
@@ -666,4 +666,3 @@ export function capLiveState(state: ProviderState): void {
   )
 }
 
-export { META_URL }

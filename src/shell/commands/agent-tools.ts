@@ -52,7 +52,7 @@ export interface ToolResult {
 /** default budget for one agent bash step: no step wedges the tab forever */
 export const AGENT_BASH_TIMEOUT_MS = 120_000
 export const AGENT_BASH_MAX = 20_000
-export const AGENT_READ_MAX = 30_000
+const AGENT_READ_MAX = 30_000
 
 /** head+tail truncation with an explicit receipt — never silent (P0-6). */
 export function truncateWithReceipt(text: string, max: number): string {
@@ -64,7 +64,7 @@ export function truncateWithReceipt(text: string, max: number): string {
 }
 
 /** Untruncatable trailer appended AFTER truncation (P0-5). */
-export function exitTrailer(result: { exitCode: number; timedOut?: boolean; oomSuspected?: boolean }, timeoutMs?: number): string {
+function exitTrailer(result: { exitCode: number; timedOut?: boolean; oomSuspected?: boolean }, timeoutMs?: number): string {
   const parts: string[] = []
   if (result.timedOut) {
     const secs = timeoutMs !== undefined ? Math.round(timeoutMs / 1000) : 120

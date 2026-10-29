@@ -16,11 +16,11 @@ const COMMANDS_DIR = '/home/user/.cell/commands'
 /** Slash names are bare stems — never paths, never traversal (P1-7). */
 const SLASH_NAME = /^[A-Za-z0-9_-]+$/
 
-export function isSafeCommandName(name: string): boolean {
+function isSafeCommandName(name: string): boolean {
   return SLASH_NAME.test(name)
 }
 
-export const BUILTIN_COMMANDS: Record<string, string> = {
+const BUILTIN_COMMANDS: Record<string, string> = {
   commit: 'Review `git status` and `git diff`, stage the files that belong together, and commit with a clear imperative message. Verify with `git log --oneline -3`.',
   preview: 'Run `cell preview` for this project and verify it bundles and renders. Report bundler errors and fix missing installs.',
 }
@@ -33,7 +33,7 @@ function readDirSafe(vfs: Vfs, dir: string): string[] {
   }
 }
 
-export function loadCommand(vfs: Vfs, cwd: string, name: string): string | null {
+function loadCommand(vfs: Vfs, cwd: string, name: string): string | null {
   if (!isSafeCommandName(name)) return null
   const root = projectRoot(vfs, cwd)
   if (root !== null) {
@@ -45,20 +45,6 @@ export function loadCommand(vfs: Vfs, cwd: string, name: string): string | null 
   const raw = vfs.read(homeFile)
   if (raw !== null) return raw
   return BUILTIN_COMMANDS[name] ?? null
-}
-
-export function listCommands(vfs: Vfs, cwd: string): string[] {
-  const names = new Set<string>(Object.keys(BUILTIN_COMMANDS))
-  for (const name of readDirSafe(vfs, COMMANDS_DIR)) {
-    if (name.endsWith('.md')) names.add(name.slice(0, -3))
-  }
-  const root = projectRoot(vfs, cwd)
-  if (root !== null) {
-    for (const name of readDirSafe(vfs, `${root}/.cell/commands`)) {
-      if (name.endsWith('.md')) names.add(name.slice(0, -3))
-    }
-  }
-  return [...names].sort()
 }
 
 /** Expand a leading /command into its full prompt. Non-slash prompts pass through. */

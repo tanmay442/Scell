@@ -11,7 +11,7 @@ import { redactJson } from './agent-redact'
  * truncation — the cap below discards the middle, which is fine for now.
  */
 
-export const SESSIONS_DIR = '/home/user/.cell/sessions'
+const SESSIONS_DIR = '/home/user/.cell/sessions'
 
 /** Provider-agnostic turn history: enough for anthropic/openai/meta to resume. */
 export interface SessionTurn {
@@ -35,9 +35,6 @@ export interface AgentSession {
 }
 
 const MAX_TURNS = 40
-
-/** Live-state cap: drop oldest whole exchanges, newest kept (P1-4). */
-export const MAX_LIVE_MESSAGES = 100
 
 /** Resume ids are bare file stems, never paths: no traversal, no .json games. */
 const RESUME_ID = /^[A-Za-z0-9_.-]+$/
