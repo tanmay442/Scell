@@ -26,6 +26,7 @@ import { DropdownMenu } from '@astryxdesign/core/DropdownMenu'
 import { TextInput } from '@astryxdesign/core/TextInput'
 import { Selector } from '@astryxdesign/core/Selector'
 import { ProgressBar } from '@astryxdesign/core/ProgressBar'
+import { HoverCard } from '@astryxdesign/core/HoverCard'
 import {
   MicrophoneIcon,
   PaperClipIcon,
@@ -220,26 +221,55 @@ const Transcript = memo(function Transcript({ entries, running }: { entries: rea
 })
 
 function ContextRing({ chars }: { chars: number }) {
+  const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
   const ratio = Math.min(1, chars / COMPACT_AT_CHARS)
   const radius = 9
   const circumference = 2 * Math.PI * radius
+  const usedTokens = Math.round(chars / 4)
+  const totalTokens = Math.round(COMPACT_AT_CHARS / 4)
+  const pct = Math.round(ratio * 100)
+  const formatK = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`)
   return (
-    <span title={`~${Math.round(chars / 4).toLocaleString()} tokens of context — auto-compacts at ~${Math.round(COMPACT_AT_CHARS / 4000)}k`} style={{ display: 'inline-flex' }}>
-      <svg width="24" height="24" viewBox="0 0 24 24" role="img" aria-label="Context usage">
-        <circle cx="12" cy="12" r={radius} fill="none" stroke="#2A2A2A" strokeWidth="2.5" />
-        <circle
-          cx="12"
-          cy="12"
-          r={radius}
-          fill="none"
-          stroke="#35805F"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          strokeDasharray={`${circumference * ratio} ${circumference}`}
-          transform="rotate(-90 12 12)"
-        />
-      </svg>
-    </span>
+    <HoverCard
+      placement="above"
+      content={
+        <VStack gap={2} style={{ width: 264, padding: 6 }}>
+          <HStack gap={2} vAlign="center">
+            <Text type="label" weight="semibold">Context Window</Text>
+            <span style={{ flex: 1 }} />
+            <Text type="supporting" color="secondary">{pct}% · {formatK(usedTokens)}/{formatK(totalTokens)}</Text>
+          </HStack>
+          <ProgressBar label="Context used" isLabelHidden value={chars} max={COMPACT_AT_CHARS} />
+          <Text type="supporting" color="secondary">
+            Context for {state.config.model || state.config.provider} compacts automatically when needed.
+          </Text>
+          <Button
+            label="Compact context"
+            variant="secondary"
+            size="sm"
+            isDisabled={!state.running || chars === 0}
+            onClick={() => agentActions.requestCompact()}
+          />
+          {!state.running ? <Text type="supporting" color="secondary">Compacting happens during a run.</Text> : null}
+        </VStack>
+      }>
+      <span style={{ display: 'inline-flex', cursor: 'pointer' }}>
+        <svg width="24" height="24" viewBox="0 0 24 24" role="img" aria-label="Context usage">
+          <circle cx="12" cy="12" r={radius} fill="none" stroke="#2A2A2A" strokeWidth="2.5" />
+          <circle
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            stroke="#35805F"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeDasharray={`${circumference * ratio} ${circumference}`}
+            transform="rotate(-90 12 12)"
+          />
+        </svg>
+      </span>
+    </HoverCard>
   )
 }
 
@@ -427,7 +457,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
 
   const isEmpty = state.entries.length === 0
   const composer = (
-    <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', padding: '0 16px 14px' }}>
+    <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', padding: '0 16px 14px', opacity: 0.94 }}>
       <AgentComposer onOpenSettings={openSettings} />
     </Stack>
   )
@@ -513,7 +543,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                     </Text>
                   </VStack>
                   {composer}
-                  <HStack gap={2} wrap="wrap" style={{ width: '90%', marginInline: 'auto' }}>
+                  <HStack gap={2} wrap="wrap" style={{ width: '100%', opacity: 0.85 }}>
                     {SUGGESTIONS.map((suggestion) => (
                       <StackItem key={suggestion.title} style={{ flexBasis: '46%', minWidth: 'min(240px, 100%)', flexGrow: 1 }}>
                         <ClickableCard label={suggestion.title} variant="muted" padding={2} onClick={() => agentActions.setDraft(suggestion.prompt)}>

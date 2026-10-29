@@ -166,6 +166,7 @@ async function ensureSessionTitles(vfs: ReturnType<typeof platform>['vfs']): Pro
 }
 
 let abortController: AbortController | null = null
+let compactRequested = false
 
 export const agentActions = {
   refresh(): void {
@@ -237,6 +238,11 @@ export const agentActions = {
     cancelApprovals()
   },
 
+  /** Ask the running loop to compact context at the next step. */
+  requestCompact(): void {
+    compactRequested = true
+  },
+
   async run(prompt: string): Promise<void> {
     const text = prompt.trim()
     if (snapshot.running || text === '') return
@@ -258,6 +264,11 @@ export const agentActions = {
         approve,
         signal: abortController.signal,
         maxSteps: Number.POSITIVE_INFINITY,
+        shouldCompact: () => {
+          const requested = compactRequested
+          compactRequested = false
+          return requested
+        },
         onSession: (id) => set({ sessionId: id }),
         onContext: (chars) => set({ contextChars: chars }),
         onToolResult: (call, toolResult) => {

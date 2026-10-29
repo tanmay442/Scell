@@ -207,6 +207,8 @@ export interface RunAgentOpts {
   signal?: AbortSignal
   /** step budget override (UI passes Infinity — no upper limit) */
   maxSteps?: number
+  /** UI manual-compact request, consumed once per check */
+  shouldCompact?: () => boolean
   /** UI hooks (Agent chat): structured events alongside the text transcript */
   onToolResult?: (call: ToolCall, result: ToolResult) => void
   onContext?: (chars: number) => void
@@ -374,7 +376,8 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     // compaction: when the live context passes the threshold, summarize
     // the turns into one user message and continue from it (instead of
     // the old middle-drop, which lost decisions silently)
-    if (step > 1 && step - lastCompactStep >= 3 && contextSize(state, turns, config.provider) > COMPACT_AT_CHARS) {
+    const manualCompact = opts.shouldCompact?.() === true
+    if (step > 1 && step - lastCompactStep >= 3 && (manualCompact || contextSize(state, turns, config.provider) > COMPACT_AT_CHARS)) {
       const summary = await summarizeTurns(config, turns, entries)
       if (summary !== null) {
         applyCompaction(state, config.provider, summary)

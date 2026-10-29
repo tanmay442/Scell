@@ -25,12 +25,14 @@ const dockStyle: CSSProperties = {
   top: 64,
   width: 252,
   zIndex: 60,
+  opacity: 0.92,
 }
 const pillStyle: CSSProperties = {
   position: 'fixed',
   right: 14,
   top: 64,
   zIndex: 60,
+  opacity: 0.92,
 }
 
 interface DockData {
