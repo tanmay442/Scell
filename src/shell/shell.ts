@@ -1,4 +1,6 @@
 import { Bash, defineCommand } from 'just-bash'
+import { wrapProtectedVfs } from './protected-vfs'
+import type { ToolCall } from './commands/agent-tools'
 import { platform } from '../platform'
 import type { Vfs } from '../vfs/types'
 import { VfsBackedFs } from './vfs-fs'
@@ -59,8 +61,11 @@ const ENV_BLOCKLIST = new Set([
  * .bashrc variables and aliases apply everywhere, and child processes
  * (node) inherit what the session exported.
  */
-export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>; seedEnv?: Record<string, string> }): Shell {
-  const v = vfs ?? platform().vfs
+export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>; seedEnv?: Record<string, string>; protected?: boolean; approve?: (call: ToolCall) => Promise<boolean> }): Shell {
+  const rawV = vfs ?? platform().vfs
+  // protected shells (agent panel, `cell agent` nested shells) see a VFS
+  // that cannot read or write ~/.cell — enforcement below every consumer
+  const v = opts?.protected ? wrapProtectedVfs(rawV) : rawV
   const fs = new VfsBackedFs(v)
   const baseEnv: Record<string, string> = {
     HOME: HOME_DIR,
@@ -225,10 +230,14 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // A fresh shell for nested calls (npm run <script> runs its own bash).
   // Nested shells seed from the caller's live session env like a real
   // child process (P0-4); without a caller env they snapshot this shell's.
+  // nested shells exist only to serve `cell agent`: always protected,
+  // and they inherit the caller's approval gate (terminal/panel) if any
   const nestedShellFrom = (callerEnv?: Map<string, string>): Shell =>
-    createShell(vfs, {
+    createShell(rawV, {
       extraBins: opts?.extraBins,
       seedEnv: callerEnv !== undefined ? shellEnvOf(callerEnv) : { ...sessionEnv },
+      protected: true,
+      ...(opts?.approve ? { approve: opts.approve } : {}),
     })
 
   const register = (
@@ -558,12 +567,12 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // on PATH — that is what makes `npm dev` → `vercel dev` work for real.
   // The script shell seeds from the caller's session env like a real child.
   const scriptShell = (cwd: string, seed?: Map<string, string>): ShellLike =>
-    createShell(v, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : { ...sessionEnv } })
+    createShell(rawV, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : { ...sessionEnv }, ...(opts?.protected ? { protected: true } : {}) })
   register('npm', (args, { cwd, env, progress }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive, progress, env }))
   register('pnpm', (args, { cwd, env, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress, env }))
   register('npx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
   register('pnpx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))
-  register('cell', (args, { cwd, env, progress }) => cellCommand(v, args, { cwd, shell: nestedShellFrom(env), jobShell: nestedShellFrom(env), onProgress: progress }))
+  register('cell', (args, { cwd, env, progress }) => cellCommand(rawV, args, { cwd, shell: nestedShellFrom(env), jobShell: nestedShellFrom(env), onProgress: progress, protectedCaller: opts?.protected === true, ...(opts?.approve ? { approve: opts.approve } : {}) }))
   const pythonRegister = (args: string[], ctx: { cwd: string; env: Map<string, string>; stdin?: unknown; progress?: (line: string) => void }) =>
     pythonCommand(v, args, { cwd: ctx.cwd, env: ctx.env, stdin: typeof ctx.stdin === 'string' ? ctx.stdin : undefined, progress: ctx.progress })
   register('curl', (args, { cwd }) => curlCommand(v, args, { cwd }))

@@ -1,0 +1,82 @@
+import { describe, expect, it } from 'vitest'
+import { createVfs } from '../vfs'
+import { createShell } from './shell'
+import { runTool, type RunToolDeps } from './commands/agent-tools'
+
+const SECRET = 'sk-testsecret123'
+
+function seededVfs() {
+  const vfs = createVfs()
+  vfs.write('/home/user/.cell/agent.json', `{"apiKey":"${SECRET}"}`)
+  vfs.write('/home/user/.cell/auth.json', `{"meta":{"key":"${SECRET}"}}`)
+  vfs.write('/home/user/project/hello.txt', 'hello world')
+  return vfs
+}
+
+function depsFor(vfs: ReturnType<typeof createVfs>, protectedShell: boolean): RunToolDeps {
+  const shell = createShell(vfs, protectedShell ? { protected: true } : {})
+  return { vfs, shell, cwd: '/home/user' }
+}
+
+async function bash(deps: RunToolDeps, command: string, cwd?: string): Promise<string> {
+  const result = await runTool(deps, { id: 'c1', name: 'bash', input: { command, ...(cwd ? { cwd } : {}) } })
+  return result.content
+}
+
+describe('agent bash under a protected shell', () => {
+  it('cannot read keys by any spelling the text scan missed', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    for (const command of [
+      'cat $HOME/.cell/agent.json',
+      'cat ~/.cell/agent.*',
+      'cat ~/.cell/agent.jso?',
+      'cat ${HOME}/.cell/auth.json',
+      'ls -la ~/.cell',
+      'find ~/.cell -type f',
+    ]) {
+      expect(await bash(deps, command), command).not.toContain(SECRET)
+    }
+    expect(await bash(deps, 'cat agent.json', '/home/user/.cell')).not.toContain(SECRET)
+  })
+
+  it('symlinks and two-step scripts cannot launder a read', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    expect(await bash(deps, 'ln -s $HOME/.cell/agent.json ~/leak && cat ~/leak')).not.toContain(SECRET)
+    await bash(deps, "printf 'cat $HOME/.cell/agent.json\\n' > ~/x.sh")
+    expect(await bash(deps, 'bash ~/x.sh')).not.toContain(SECRET)
+  })
+
+  it('cannot mutate protected files; file unchanged after sed attempt', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    await bash(deps, 'sed -i s/testsecret/PWNED/ $HOME/.cell/agent.json')
+    expect(vfs.read('/home/user/.cell/agent.json')).toContain(SECRET)
+    await bash(deps, "echo '{\"name\":\"evil\"}' > $HOME/.cell/tools_evil.json".replace('tools_evil', 'tools/evil'))
+    expect(vfs.exists('/home/user/.cell/tools/evil.json')).toBe(false)
+  })
+
+  it('tar enumeration contains no .cell entries', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    const listing = await bash(deps, 'tar -cf /tmp/c.tar -C /home/user . 2>/dev/null; tar -tf /tmp/c.tar')
+    expect(listing).not.toContain('.cell')
+    expect(listing).toContain('hello.txt')
+  })
+
+  it('legit workspace work still runs', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    expect(await bash(deps, 'cat ~/project/hello.txt')).toContain('hello world')
+    await bash(deps, 'echo made > ~/project/out.txt')
+    expect(vfs.read('/home/user/project/out.txt')).toContain('made')
+  })
+
+  it('the same corpus succeeds on an unprotected shell (human regression guard)', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, false)
+    expect(await bash(deps, 'cat $HOME/.cell/agent.json')).toContain(SECRET)
+    expect(await bash(deps, 'cat ~/project/hello.txt')).toContain('hello world')
+  })
+})

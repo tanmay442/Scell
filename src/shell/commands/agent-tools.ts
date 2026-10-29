@@ -1,5 +1,7 @@
 import type { Vfs } from '../../vfs/types'
 import { vfsPath } from '../../vfs/types'
+import { isProtectedPath } from '../../vfs/protected-paths'
+import { redactSecrets } from './agent-redact'
 import type { ShellLike } from './npm'
 
 /**
@@ -76,21 +78,11 @@ export function exitTrailer(result: { exitCode: number; timedOut?: boolean; oomS
 
 const TOOLS_DIR = '/home/user/.cell/tools'
 
-/** Paths the agent must never read/write through file tools (P0-3/P0-4):
- * its own key material, live sessions, and the registries it could use
- * to shadow tools, override skills, or rewrite its own instructions. */
-const DENIED_PREFIXES = [
-  '/home/user/.cell/agent.json',
-  '/home/user/.cell/auth.json',
-  '/home/user/.cell/sessions',
-  '/home/user/.cell/tools',
-  '/home/user/.cell/skills',
-]
-
-/** true when an expanded absolute path touches agent key/config/registry state. */
+/** Paths the agent must never read/write through file tools: the whole
+ * ~/.cell prefix (keys, sessions, registries, secrets) — see
+ * src/vfs/protected-paths.ts for the policy. */
 export function isDeniedPath(absPath: string): boolean {
-  const normalized = absPath.replace(/\/+$/, '')
-  return DENIED_PREFIXES.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`))
+  return isProtectedPath(vfsPath.normalize(absPath))
 }
 
 /** Bash patterns that error instead of running (P0-4): destructive or
@@ -374,7 +366,9 @@ export class JobManager {
     this.jobs.set(id, record)
     const logPath = `${JOBS_DIR}/${id}.log`
     const append = (text: string) => {
-      record.output = truncateWithReceipt(`${record.output}${text}`, JOB_MAX_OUTPUT)
+      // redact before the log file: it is a plain VFS file that ships in
+      // cell save snapshots, unlike transcript lines it is not re-redacted
+      record.output = truncateWithReceipt(`${record.output}${redactSecrets(text)}`, JOB_MAX_OUTPUT)
       try { this.vfs.write(logPath, record.output) } catch { /* log is best-effort */ }
     }
     append(`$ ${command}\n`)

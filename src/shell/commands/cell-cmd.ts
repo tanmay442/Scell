@@ -122,12 +122,12 @@ async function safeText(response: Response): Promise<string> {
   }
 }
 
-export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike; jobShell?: ShellLike; onProgress?: (line: string) => void }): Promise<CommandResult> {
+export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string; shell?: ShellLike; jobShell?: ShellLike; onProgress?: (line: string) => void; protectedCaller?: boolean; approve?: (call: import('./agent-tools').ToolCall) => Promise<boolean> }): Promise<CommandResult> {
   const sub = args[0] ?? 'help'
 
   if (sub === 'agent') {
     if (!opts.shell) return { stdout: '', stderr: 'cell agent: no shell available in this context\n', exitCode: 1 }
-    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell, ...(opts.jobShell ? { jobShell: opts.jobShell } : {}), onProgress: opts.onProgress })
+    return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell, ...(opts.jobShell ? { jobShell: opts.jobShell } : {}), onProgress: opts.onProgress, ...(opts.approve ? { approve: opts.approve } : {}) })
   }
 
   if (sub === 'preview') {
@@ -156,6 +156,10 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
       'persistence: IndexedDB (this browser) + snapshots above',
     ]
     return { stdout: `${lines.join('\n')}\n`, stderr: '', exitCode: 0 }
+  }
+
+  if ((sub === 'save' || sub === 'push' || sub === 'load' || sub === 'pull' || sub === 'restore') && opts.protectedCaller) {
+    return { stdout: '', stderr: 'cell: save/load are refused from agent shells — snapshots are a human action\n', exitCode: 1 }
   }
 
   if (sub === 'save' || sub === 'push') {

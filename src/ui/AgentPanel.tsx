@@ -103,8 +103,8 @@ export function AgentPanel() {
     const { vfs } = platform()
     const cwd = getActivePath() ?? HOME
     try {
-      const shell = createShell(vfs)
-      const jobShell = createShell(vfs)
+      const shell = createShell(vfs, { protected: true })
+      const jobShell = createShell(vfs, { protected: true })
       const args = resumeId !== null
         ? ['--resume', resumeId, '--steps', String(steps), text]
         : ['--steps', String(steps), text]
