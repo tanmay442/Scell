@@ -66,6 +66,89 @@ type Zone = { zone: 'vfs'; vpath: string } | { zone: 'sys'; spath: string } | { 
  * VFS; /tmp & friends are volatile sidecar state). Symlinks and mode bits
  * live in sidecar maps — the Vfs itself stays content-only.
  */
+const FS_META_PATH = '/home/user/.cell/fs-meta.json'
+
+interface SharedSidecar {
+  symlinks: Map<string, string>
+  modes: Map<string, number>
+  save(): void
+  prune(path: string): void
+  remap(from: string, to: string): void
+}
+
+const sidecarStores = new WeakMap<Vfs, SharedSidecar>()
+
+const isSysPath = (p: string): boolean => SYS_PREFIXES.some((prefix) => p === prefix || p.startsWith(`${prefix}/`))
+
+/**
+ * One sidecar per raw Vfs, shared by every VfsBackedFs built on it,
+ * persisted as an ordinary file (~/.cell/fs-meta.json) so autosave and
+ * cell save carry it with no schema change. Absent/corrupt file = empty
+ * sidecar = today's defaults. Only non-sys entries persist (sys zone is
+ * per-boot). VFS delete/rename events prune/remap entries so editor-side
+ * changes cannot leave stale modes on recreated files.
+ */
+function sidecarFor(metaVfs: Vfs): SharedSidecar {
+  const existing = sidecarStores.get(metaVfs)
+  if (existing) return existing
+  const symlinks = new Map<string, string>()
+  const modes = new Map<string, number>()
+  try {
+    const raw = metaVfs.read(FS_META_PATH)
+    if (raw !== null) {
+      const parsed = JSON.parse(raw) as { symlinks?: Record<string, string>; modes?: Record<string, number> }
+      for (const [path, target] of Object.entries(parsed.symlinks ?? {})) symlinks.set(path, target)
+      for (const [path, mode] of Object.entries(parsed.modes ?? {})) if (typeof mode === 'number') modes.set(path, mode)
+    }
+  } catch {
+    // corrupt meta file: fail soft to an empty sidecar
+  }
+  const store: SharedSidecar = {
+    symlinks,
+    modes,
+    save() {
+      try {
+        const keptLinks = Object.fromEntries([...symlinks].filter(([path]) => !isSysPath(path)))
+        const keptModes = Object.fromEntries([...modes].filter(([path]) => !isSysPath(path)))
+        metaVfs.write(FS_META_PATH, `${JSON.stringify({ symlinks: keptLinks, modes: keptModes }, null, 2)}\n`)
+      } catch {
+        // persistence is best-effort; in-memory state still shared
+      }
+    },
+    prune(path: string) {
+      let changed = false
+      for (const key of [...symlinks.keys()]) if (key === path || key.startsWith(`${path}/`)) { symlinks.delete(key); changed = true }
+      for (const key of [...modes.keys()]) if (key === path || key.startsWith(`${path}/`)) { modes.delete(key); changed = true }
+      if (changed) store.save()
+    },
+    remap(from: string, to: string) {
+      let changed = false
+      for (const [key, target] of [...symlinks]) {
+        if (key === from || key.startsWith(`${from}/`)) {
+          symlinks.delete(key)
+          symlinks.set(to + key.slice(from.length), target)
+          changed = true
+        }
+      }
+      for (const [key, mode] of [...modes]) {
+        if (key === from || key.startsWith(`${from}/`)) {
+          modes.delete(key)
+          modes.set(to + key.slice(from.length), mode)
+          changed = true
+        }
+      }
+      if (changed) store.save()
+    },
+  }
+  metaVfs.watch((event) => {
+    if (event.path === FS_META_PATH) return
+    if (event.kind === 'delete') store.prune(event.path)
+    if (event.kind === 'rename' && event.to !== undefined) store.remap(event.path, event.to)
+  })
+  sidecarStores.set(metaVfs, store)
+  return store
+}
+
 export class VfsBackedFs implements IFileSystem {
   private sysDirs = new Set<string>(['/', '/tmp', '/dev', '/dev/null', '/proc', '/etc', '/home'])
   private sysFiles = new Map<string, string>([
@@ -122,11 +205,25 @@ export class VfsBackedFs implements IFileSystem {
       '',
     ].join('\n')],
   ])
-  private symlinks = new Map<string, string>()
-  private modes = new Map<string, number>()
   private mtimes = new Map<string, Date>()
+  private sidecar: SharedSidecar
 
-  constructor(private vfs: Vfs) {}
+  constructor(private vfs: Vfs, metaVfs?: Vfs) {
+    // symlink/mode state is shared by every shell on the same Vfs and
+    // persisted to ~/.cell/fs-meta.json (see sidecarFor) — a chmod in
+    // the terminal is visible to an agent-panel run, and both survive
+    // reload. metaVfs is the raw Vfs for that persistence file (a
+    // protected shell's wrapped Vfs cannot write under ~/.cell).
+    this.sidecar = sidecarFor(metaVfs ?? vfs)
+  }
+
+  private get symlinks(): Map<string, string> {
+    return this.sidecar.symlinks
+  }
+
+  private get modes(): Map<string, number> {
+    return this.sidecar.modes
+  }
 
   private locate(rawPath: string): Zone {
     const p = normalize(rawPath)
@@ -422,6 +519,8 @@ export class VfsBackedFs implements IFileSystem {
         throw new Error(`ENOTEMPTY: directory not empty '${path}'`)
       }
       this.vfs.delete(z.vpath)
+      // sidecar entries at/under the deleted path die with it (leak fix)
+      this.sidecar.prune(normalize(z.vpath))
       return
     }
     const p = normalize(z.spath)
@@ -432,6 +531,7 @@ export class VfsBackedFs implements IFileSystem {
       for (const path2 of [...this.sysDirs]) if (path2.startsWith(prefix)) this.sysDirs.delete(path2)
       for (const path2 of [...this.sysFiles.keys()]) if (path2.startsWith(prefix)) this.sysFiles.delete(path2)
       for (const path2 of [...this.symlinks.keys()]) if (path2.startsWith(prefix)) this.symlinks.delete(path2)
+      this.sidecar.save()
     }
   }
 
@@ -454,7 +554,13 @@ export class VfsBackedFs implements IFileSystem {
     const zSrc = this.locate(src)
     const zDest = this.locate(dest)
     if (zSrc.zone === 'vfs' && zDest.zone === 'vfs') {
+      // a symlink has no VFS file to rename — move its sidecar entry
+      if (this.symlinks.has(normalize(src))) {
+        this.sidecar.remap(normalize(zSrc.vpath), normalize(zDest.vpath))
+        return
+      }
       this.vfs.rename(zSrc.vpath, zDest.vpath)
+      this.sidecar.remap(normalize(zSrc.vpath), normalize(zDest.vpath))
       return
     }
     await this.cp(src, dest, { recursive: true })
@@ -477,12 +583,14 @@ export class VfsBackedFs implements IFileSystem {
   async chmod(path: string, mode: number): Promise<void> {
     if (!(await this.exists(path))) throw new Error(`ENOENT: no such file or directory '${path}'`)
     this.modes.set(normalize(path), mode)
+    this.sidecar.save()
   }
 
   async symlink(target: string, linkPath: string): Promise<void> {
     if (await this.exists(linkPath)) throw new Error(`EEXIST: '${linkPath}' already exists`)
     this.sysEnsureParents(linkPath)
     this.symlinks.set(normalize(linkPath), target)
+    this.sidecar.save()
   }
 
   async link(existingPath: string, newPath: string): Promise<void> {

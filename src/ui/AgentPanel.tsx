@@ -56,7 +56,7 @@ export function AgentPanel() {
   const [log, setLog] = useState<string[]>([])
   const [sessions, setSessions] = useState<string[]>([])
   const [pending, setPending] = useState<{ summary: string } | null>(null)
-  const resolverRef = useRef<((allowed: boolean) => void) | null>(null)
+  const approvalQueueRef = useRef<{ summary: string; resolve: (allowed: boolean) => void }[]>([])
   const logRef = useRef<HTMLPreElement>(null)
 
   const refreshSessions = useCallback(() => {
@@ -72,16 +72,25 @@ export function AgentPanel() {
     setLog((prev) => [...prev.slice(-499), line])
   }, [])
 
+  // FIFO: parallel runs/jobs can queue approvals; a single-slot
+  // resolver would drop all but the last
   const approve = useCallback((call: ToolCall): Promise<boolean> => {
     return new Promise<boolean>((resolve) => {
-      resolverRef.current = resolve
-      setPending({ summary: `${call.name} ${summarizeCall(call)}` })
+      const entry = { summary: `${call.name} ${summarizeCall(call)}`, resolve }
+      approvalQueueRef.current.push(entry)
+      if (approvalQueueRef.current.length === 1) setPending({ summary: entry.summary })
     })
   }, [])
 
   const decide = (allowed: boolean) => {
-    resolverRef.current?.(allowed)
-    resolverRef.current = null
+    const head = approvalQueueRef.current.shift()
+    head?.resolve(allowed)
+    const next = approvalQueueRef.current[0]
+    setPending(next ? { summary: next.summary } : null)
+  }
+
+  const cancelApprovals = () => {
+    for (const entry of approvalQueueRef.current.splice(0)) entry.resolve(false)
     setPending(null)
   }
 
@@ -115,7 +124,7 @@ export function AgentPanel() {
       appendLog(`agent ✗ ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       setRunning(false)
-      decide(false)
+      cancelApprovals()
       refreshSessions()
     }
   }

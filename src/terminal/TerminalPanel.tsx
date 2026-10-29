@@ -5,6 +5,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import '@xterm/xterm/css/xterm.css'
 import { platform } from '../platform'
 import { createShell, type Shell } from '../shell/shell'
+import type { ToolCall } from '../shell/commands/agent-tools'
 import { vfsPath } from '../vfs/types'
 
 const MAX_HISTORY = 200
@@ -48,13 +49,13 @@ export default function TerminalPanel() {
 
     function runTerminal(host: HTMLDivElement) {
       const { vfs, bus } = platform()
-      const shell: Shell = createShell(vfs)
 
     const term = new Terminal({
       fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, ui-monospace, monospace",
       fontSize: 13,
       lineHeight: 1.2,
       cursorBlink: true,
+      scrollback: 10000,
       theme: {
         background: '#1e1e1e',
         foreground: '#cccccc',
@@ -68,11 +69,50 @@ export default function TerminalPanel() {
     term.open(host)
     fit.fit()
 
+    // --- agent approval gate -------------------------------------------------
+    // `cell agent` in this terminal pauses on every 'ask' tool call and
+    // asks HERE, as a line prompt, so Enter is the confirmation (one stray
+    // keystroke cannot approve). Approvals queue FIFO; jobs do not come
+    // through this handler (their job_start was already gated).
+    let liveSuspended = false
+    let approvalAnswer = ''
+    const approvalQueue: { summary: string; resolve: (allowed: boolean) => void }[] = []
+    const summarizeCall = (call: ToolCall): string => {
+      if (call.name === 'bash' || call.name === 'job_start') return String(call.input.command ?? '')
+      if (call.input.path !== undefined) return String(call.input.path)
+      return JSON.stringify(call.input).slice(0, 140)
+    }
+    const showApproval = () => {
+      const head = approvalQueue[0]
+      if (!head) return
+      liveSuspended = true
+      approvalAnswer = ''
+      typeahead = ''
+      term.write(`\r\x1b[K\x1b[33mApprove ${head.summary}? [y/N] \x1b[0m`)
+    }
+    const settleApproval = (allowed: boolean) => {
+      const head = approvalQueue.shift()
+      head?.resolve(allowed)
+      if (approvalQueue.length > 0) showApproval()
+      else {
+        liveSuspended = false
+        term.write('\r\n')
+      }
+    }
+    const askApproval = (call: ToolCall): Promise<boolean> =>
+      new Promise<boolean>((resolve) => {
+        approvalQueue.push({ summary: `${call.name} ${summarizeCall(call)}`, resolve })
+        if (approvalQueue.length === 1) showApproval()
+      })
+
+    const shell: Shell = createShell(vfs, { approve: askApproval })
+
     let cwd = HOME
     let line = ''
     let history: string[] = []
     let histIdx = -1
     let running = false
+    let typeahead = ''
 
     const promptText = () => `\x1b[36m${cwdLabel(cwd)}\x1b[0m $ `
     const printPrompt = () => term.write(promptText())
@@ -105,10 +145,11 @@ export default function TerminalPanel() {
     const runLine = async (cmd: string, fromHeredoc = false) => {
       if (heredoc !== null) {
         if (cmd.trim() === heredoc.delim) {
-          // just-bash's heredoc parser cannot handle quoted delimiters —
-          // normalize the head to the bare delimiter when assembling
-          const head = heredoc.matched !== '' ? heredoc.head.replace(heredoc.matched, `<<${heredoc.delim}`) : heredoc.head
-          const script = [head, ...heredoc.lines].join('\n')
+          // keep the head exactly as typed: a quoted delimiter (<<'EOF')
+          // means NO expansion in the body, and stripping the quotes
+          // corrupted $ in written files. just-bash parses quoted
+          // heredocs fine (bash-audit pins it); close with the delimiter.
+          const script = [heredoc.head, ...heredoc.lines, heredoc.delim].join('\n')
           heredoc = null
           await runLine(script, true)
         } else {
@@ -207,6 +248,7 @@ export default function TerminalPanel() {
       let liveShown = false
       let finished = false
       const renderLive = () => {
+        if (liveSuspended) return
         const elapsed = Math.floor((Date.now() - startedAt) / 1000)
         term.write(`\r\x1b[K\x1b[90m${frames[frame++ % frames.length]} ${liveLabel ?? `running ${shortCmd}`} (${elapsed}s)\x1b[0m`)
         liveShown = true
@@ -227,8 +269,15 @@ export default function TerminalPanel() {
           if (finished) return
           liveLabel = line
           renderLive()
-        })
+        }, trimmed.startsWith('cell agent') ? { timeoutMs: 600_000 } : undefined)
         clearLive()
+        // compound commands can move the shell (cd x && build): the dump
+        // epilogue reports the final cwd — sync the prompt from it
+        if (result.cwd !== undefined && result.cwd !== cwd && vfs.isDir(result.cwd)) {
+          previousCwd = cwd
+          cwd = result.cwd
+          bus.emit('terminal:cwd', { cwd })
+        }
         if (result.stdout) writeOut(result.stdout)
         if (result.stderr) writeErr(result.stderr)
         if (!result.stdout && !result.stderr && result.exitCode !== 0) {
@@ -240,6 +289,11 @@ export default function TerminalPanel() {
       } finally {
         running = false
         printPrompt()
+        if (typeahead !== '') {
+          const pendingInput = typeahead
+          typeahead = ''
+          handleData(pendingInput)
+        }
       }
     }
 
@@ -248,8 +302,37 @@ export default function TerminalPanel() {
       term.write(`\r\x1b[K${promptText()}${line}`)
     }
 
-    term.onData((data) => {
-      if (running) return
+    const handleData = (data: string) => {
+      // approval prompt owns the keyboard while it is open
+      if (approvalQueue.length > 0) {
+        for (const ch of data) {
+          if (ch === '\r' || ch === '\n') {
+            const answer = approvalAnswer.trim().toLowerCase()
+            settleApproval(answer === 'y' || answer === 'yes')
+          } else if (ch === '\x03') {
+            settleApproval(false)
+          } else if (ch === '\x7f') {
+            if (approvalAnswer.length > 0) {
+              approvalAnswer = approvalAnswer.slice(0, -1)
+              term.write('\b \b')
+            }
+          } else if (ch >= ' ') {
+            approvalAnswer += ch
+            term.write(ch)
+          }
+        }
+        return
+      }
+      // while a command runs, keystrokes are buffered (capped) and
+      // replayed at the next prompt instead of being dropped; Ctrl-C
+      // clears the buffer. Approvals wipe it on open (see showApproval).
+      if (running) {
+        for (const ch of data) {
+          if (ch === '\x03') typeahead = ''
+          else if (typeahead.length < 4096) typeahead += ch
+        }
+        return
+      }
       for (let i = 0; i < data.length; i++) {
         const ch = data[i]
         // Arrow keys and similar escapes arrive as ESC [ letter
@@ -313,7 +396,8 @@ export default function TerminalPanel() {
           term.write(ch)
         }
       }
-    })
+    }
+    term.onData(handleData)
 
     term.write(
       '\x1b[90mCell shell — just-bash on the Cell VFS. You are in ~ (a full home directory).\x1b[0m\r\n\x1b[90mTry: ls, cd project, node src/index.ts, git init, npm install ms\x1b[0m\r\n\r\n',

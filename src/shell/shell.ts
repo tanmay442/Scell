@@ -23,6 +23,9 @@ export interface ShellResult {
   /** the env-dump marker was absent (exit/syntax killed the epilogue, or a
    *  timed-out step finished late) — session env may be stale */
   envStale?: boolean
+  /** working directory when the command finished (compound `cd x && …`
+   *  moves it even though the terminal only intercepts bare cd) */
+  cwd?: string
 }
 
 export interface Shell {
@@ -66,7 +69,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // protected shells (agent panel, `cell agent` nested shells) see a VFS
   // that cannot read or write ~/.cell — enforcement below every consumer
   const v = opts?.protected ? wrapProtectedVfs(rawV) : rawV
-  const fs = new VfsBackedFs(v)
+  const fs = new VfsBackedFs(v, rawV)
   const baseEnv: Record<string, string> = {
     HOME: HOME_DIR,
     USER: 'user',
@@ -216,8 +219,10 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
           const lineEnd = stdout.indexOf('\n', markerAt)
           const dumpText = lineEnd === -1 ? stdout.slice(markerAt) : stdout.slice(markerAt, lineEnd)
           stdout = lineEnd === -1 ? stdout.slice(0, markerAt) : stdout.slice(0, markerAt) + stdout.slice(lineEnd + 1)
+          let dumpedCwd: string | undefined
           try {
             const parsed = JSON.parse(dumpText.slice(marker.length)) as Record<string, unknown>
+            if (typeof parsed.__cell_cwd === 'string' && parsed.__cell_cwd !== '') dumpedCwd = parsed.__cell_cwd
             for (const [key, value] of Object.entries(parsed)) {
               if (typeof value !== 'string' || ENV_BLOCKLIST.has(key)) continue
               if (key.startsWith('BASH_ALIAS_') || key.startsWith('__cell_') || key === '?') continue
@@ -227,7 +232,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
           } catch {
             // env capture is best-effort
           }
-          return { shellResult: { stdout, stderr: result.stderr, exitCode: result.exitCode }, markerMissing: false }
+          return { shellResult: { stdout, stderr: result.stderr, exitCode: result.exitCode, ...(dumpedCwd !== undefined ? { cwd: dumpedCwd } : {}) }, markerMissing: false }
         } catch (err) {
           if ((err as { code?: string })?.code === 'CELL_TIMEOUT') {
             return {
@@ -306,6 +311,9 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
     defineCommand('__cell_env_dump', async (args, ctx) => {
       const entries: Record<string, string> = {}
       for (const [key, value] of ctx.env ?? new Map<string, string>()) entries[key] = value
+      // final cwd rides the same in-band dump (filtered from the env merge
+      // by the __cell_ prefix rule); the terminal syncs its prompt from it
+      entries.__cell_cwd = (ctx as { cwd?: string }).cwd ?? ''
       // args: <nonce> <rc> — the nonce binds this dump to its exec so
       // forged markers in command output are never honored
       const nonce = args[0] ?? ''
