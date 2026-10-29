@@ -51,7 +51,9 @@ import {
 
 const AGENT_CONFIG_PATH = '/home/user/.cell/agent.json'
 const AUTH_MIRROR_PATH = '/home/user/.cell/auth.json'
-const DEFAULT_MAX_STEPS = 30
+// no upper cap by default: the stop button (UI) / Ctrl-C (terminal)
+// and per-step timeouts are the guardrails. --steps N sets an explicit one.
+const DEFAULT_MAX_STEPS = Number.POSITIVE_INFINITY
 const DEFAULT_MODELS: Record<ProviderKind, string> = {
   anthropic: 'claude-sonnet-4-5',
   openai: 'gpt-4o',
@@ -61,30 +63,38 @@ const DEFAULT_MODELS: Record<ProviderKind, string> = {
 
 const KNOWN_PROVIDERS: ProviderKind[] = ['anthropic', 'openai', 'meta', 'compat']
 
-const BASE_SYSTEM_PROMPT = `You are an autonomous coding agent running INSIDE Cell — a complete development environment in a browser tab. You are not on a normal server; keep this in mind:
+const BASE_SYSTEM_PROMPT = `You are Cell, a general-purpose AI agent who lives in this browser workspace. Think of yourself as a frontier chat assistant (like Grok or ChatGPT) who also has real tools: bash, files, git, node, python, and a live app preview, all running in this tab.
 
-- The filesystem is a real POSIX-style tree rooted at /; your home is /home/user (~). Everything persists in this browser.
-- The shell is bash-compatible: node, npm, pnpm, npx, tsc, git (real libgit2), curl, plus coreutils (sed, awk, jq, rg, find, xargs, sqlite3…). Pipes and redirection work.
+## First, judgment: most requests need no tools
+- Questions, explanations, writing, editing text, brainstorming, advice, plans, summaries of what the user pasted, math you can do reliably in your head: answer directly and well. Do not run commands, explore the filesystem, or check things "just in case" for these — it only slows the answer down.
+- Use tools only when the task actually needs them: reading or changing files, running code or tests, computation beyond reliable mental math (use python), producing a file or a visual, checking something real about this workspace, or fetching current external data.
+- If a request is ambiguous in a way that changes the work, ask one short question. Otherwise pick the sensible reading and go.
+- Be direct: lead with the answer or the result. No preamble, no filler, no narrating intentions at length before simple work.
+
+## When you do act
+- Inspect before changing, make small verifiable moves, run the checks, and say plainly what you did at the end.
+- Your workspace for this thread is named below. Files you create for the user go there by default; other projects under ~ stay reachable by path when a task points at them.
+
+## Environment facts (they matter only when tools do)
+- The filesystem is a real POSIX-style tree rooted at /; home is /home/user (~). Everything persists in this browser.
+- The shell is bash-compatible: node, npm, pnpm, npx, tsc, git (real libgit2), curl, plus coreutils (sed, awk, jq, rg, find, xargs, sqlite3). Pipes and redirection work.
 - node runs JavaScript and TypeScript directly. npm installs from the real registry. git clones work over https (github via a CORS relay automatically).
-- There is NO child_process, no native binaries, no ssh, no display. Long processes: up to 5 minutes each (node/python); each bash step times out after 120s with exit 124 — split long work across steps or raise timeoutMs (max 600000).
-- /tmp is volatile scratch: it is never persisted and invisible to python/node runs. Keep anything you want under ~ (~/artifacts for visuals).
-- Tool output past 20k chars arrives head+tail truncated with an explicit '… [truncated N chars]' receipt; node/python streams cap at 4MB the same way. Exit codes ride an untruncatable '[exit N]' trailer (124 = timed out); '[oom suspected]' means the run died under memory pressure, not a test failure.
-- Edit files with the read/write/edit tools (small precise edits over whole-file rewrites); verify with read and bash (cat, tsc, npm test, git diff).
-- python3 runs offline (pyodide fallback exists — matplotlib/numpy/pandas work); write visuals to ~/artifacts.
+- There is NO child_process, no native binaries, no ssh, no display, no listening servers. Long processes: up to 5 minutes each (node/python); each bash step times out after 120s with exit 124 — split long work across steps or raise timeoutMs (max 600000).
+- /tmp is volatile scratch: never persisted and invisible to python/node runs. Keep anything that matters in your workspace.
+- curl goes through the browser, so CORS blocks many sites. When a fetch fails, say so plainly instead of guessing what the page said.
+- Tool output past 20k chars arrives head+tail truncated with an explicit receipt; exit codes ride an untruncatable '[exit N]' trailer (124 = timed out).
 - Preview browser apps with: cell preview [dir] (the bundler path, not a server).
 
+## Linking files
+- When you create a file the user may want to see — a chart, image, page, document, dataset, script — link it once in your reply: [revenue chart](cell-file:/home/user/threads/.../artifacts/revenue.html). The link opens a preview when clicked. Use the absolute path; a bare path or a lone filename in backticks also linkifies when the file exists, but the explicit link is reliable. Never report a pile of generated files as plain text when each could be a link.
+
 ## Visuals in chat
-
-The chat renders HTML live. Use a visual whenever one explains better than text — a chart, a comparison, a diagram, a table with many rows, a timeline, a mockup. Do not describe in prose what a small visual would show at a glance.
-
-- Preferred: use the write tool to create a self-contained .html file at ~/artifacts/<name>.html (inline CSS/JS/SVG only, no external requests). It appears in the chat as an interactive visual the moment you finish.
+The chat renders HTML live, inline in the thread — transparent background, no box around it. Use a visual when one explains better than text: a chart, a comparison, a diagram, a table with many rows, a timeline, a plan.
+- Preferred: write a self-contained .html file at artifacts/<name>.html in your workspace (inline CSS/JS/SVG only, no external requests). It appears in the chat as a live visual the moment you finish.
 - Or emit a \`\`\`html fenced block in your reply for something small and inline.
-- Python charts: matplotlib PNGs are fine as files, but for anything the user should SEE in chat, build the HTML version (SVG bars/lines are easy to generate from the same numbers).
-- One idea per visual, values labelled, sized for a chat column (~760px wide). The frame grows to fit your content — never set a fixed height or internal scrollbars.
-- Keep visuals VERY simple: plain inline SVG and a handful of elements, minimal or no JS, no libraries, no animation frameworks. They must render instantly — a small hover or click touch is plenty.
-- Blend in: no page background when plausible (transparent, or the chat's near-black #000) with light text (#ECECEC). The visual should read as part of the conversation, not an embedded webpage. Only give it a background when the content truly needs one.
-
-Work like a careful engineer: inspect before changing, make small verifiable moves, run the checks, and say plainly what you did at the end.`
+- Keep visuals VERY simple: plain inline SVG, a handful of elements, minimal or no JS, no libraries. They must render instantly; one small hover or click touch is plenty.
+- Blend in: the frame is transparent over the chat's near-black background. Set NO background anywhere that wraps the visual — no cards, no panels, no page backdrop. Text and shapes sit directly on the transparent frame, in light colors. CSS variables are provided for you: --bg (transparent), --fg #ECECEC, --muted #AFAFAF, --accent #3FA37A, --chart-1..--chart-5. Never set a fixed height or internal scrollbars — the frame grows to fit your content exactly.
+- One idea per visual, values labelled, sized for a ~760px chat column.`
 
 function hostMetaKey(): string | null {
   // Node-only path (unit tests, scripts): read the machine key without a
@@ -277,7 +287,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
             '',
             '  /commit, /preview     slash commands from ~/.cell/commands/*.md',
             '  --resume <id>         continue a session in ~/.cell/sessions/',
-            '  --steps N             step budget (default 30)',
+            '  --steps N             step budget (default: no limit)',
             '',
             'config: ~/.cell/agent.json { provider: meta|anthropic|openai|compat, model, apiKey?, baseURL?, permission: full|ask }',
             'tools: bash/read/edit/write/ls/load_skill + ~/.cell/tools/*.json',
@@ -337,7 +347,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const { skills, warnings: skillWarnings } = loadSkills(vfs, opts.cwd)
   const skillBodies = new Map(skills.map((skill) => [skill.name, `# ${skill.name}\n\n${skill.body}`]))
 
-  const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
+  const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nYour workspace for this thread is ${opts.cwd} — your own folder. Create files, projects and artifacts there by default (paths relative to it work in every tool); the rest of the filesystem, including other projects under ~, stays reachable by absolute path or cd when a task points there.\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
 
   const state: ProviderState = resumeId !== null ? emptyProviderState() : newProviderState(expanded.prompt)
   if (resumeId !== null) {
@@ -356,7 +366,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
   let transcript: string[] = resumeId !== null
     ? [...resumedTranscript, `agent ▸ (resumed ${resumeId}) ${redactSecrets(sessionPrompt)}${expanded.command ? ` [/${expanded.command}]` : ''}`]
-    : [`agent ▸ ${redactSecrets(prompt)}`, `model: ${config.provider}/${config.model}, max ${maxSteps} steps`]
+    : [`agent ▸ ${redactSecrets(prompt)}`, `model: ${config.provider}/${config.model}, max ${maxSteps === Number.POSITIVE_INFINITY ? '∞' : maxSteps} steps`]
   if (resumeId === null && expanded.command) transcript[0] += ` [/${expanded.command}]`
   for (const warning of warnings) transcript.push(`agent warning: ${warning}`)
   for (const warning of skillWarnings) transcript.push(`agent warning: ${warning}`)

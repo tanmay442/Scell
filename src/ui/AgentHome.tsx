@@ -48,19 +48,33 @@ import {
   ArchiveBoxIcon,
   TrashIcon,
   DocumentDuplicateIcon,
+  PhotoIcon,
+  DocumentTextIcon,
+  DocumentIcon,
+  ArrowsPointingOutIcon,
 } from '@heroicons/react/24/outline'
-import { agentActions, agentStore, COMPACT_AT_CHARS, type AgentConfigForm, type ChatEntry, type SessionInfo } from './agent-store'
+import { agentActions, agentStore, COMPACT_AT_CHARS, threadWorkspace, type AgentConfigForm, type ChatEntry, type SessionInfo } from './agent-store'
 import { platform } from '../platform'
 import { groupItems, splitHtmlBlocks } from './agent-entries'
+import { splitFileRefs, fileKind } from './agent-files'
+import { workspaceActions } from './workspace-store'
 import { Logo } from './Logo'
 import SlicedWaves from './SlicedWaves'
 
 const SUGGESTIONS: { title: string; detail: string; prompt: string }[] = [
-  { title: 'Fix the build', detail: 'Run the checks, find what fails, fix it', prompt: 'Run the project checks (typecheck/tests) in ~/project, fix what fails, and verify.' },
-  { title: 'Make a chart', detail: 'Python + matplotlib into ~/artifacts', prompt: 'Look at the data files in ~/project, pick the most interesting one, and save a matplotlib chart of it to ~/artifacts.' },
-  { title: 'Build a page', detail: 'A small web app, verified with the preview', prompt: 'Create a small useful web page in ~/project, then verify it with cell preview and report any bundler errors.' },
-  { title: 'Explain this workspace', detail: 'What is here and what can be built', prompt: 'Explore this workspace and tell me what is here, what state it is in, and what could be built or fixed next.' },
+  { title: 'Explain it visually', detail: 'A hard topic, made obvious with a diagram', prompt: 'Explain how a transformer neural network works like I am a smart 15-year-old, with one simple visual in the chat.' },
+  { title: 'Plan my week', detail: 'Priorities, schedule, and a visual plan', prompt: 'Help me plan a productive week: ask me what I have on, then build a day-by-day plan and show it as a visual.' },
+  { title: 'Chart some data', detail: 'Python analysis, rendered in the thread', prompt: 'Generate an interesting dataset with python (e.g. simulated coffee shop sales for a year), analyze it, and show the key chart as a visual in this chat.' },
+  { title: 'Fix the build', detail: 'Run the checks, find what fails, fix it', prompt: 'Run the project checks (typecheck/tests) in the current project, fix what fails, and verify.' },
 ]
+
+const runningDot: CSSProperties = {
+  width: 7,
+  height: 7,
+  borderRadius: '50%',
+  background: '#3FA37A',
+  flexShrink: 0,
+}
 
 const CONTENT_WIDTH = 800
 const fill: CSSProperties = { height: '100%', minHeight: 0 }
@@ -99,19 +113,64 @@ function HtmlVisual({ path, html }: { path?: string; html?: string }) {
   const frameRef = useRef<HTMLIFrameElement>(null)
   const [height, setHeight] = useState(200)
 
+  // Height comes from the parent side: the frame runs same-origin
+  // (allow-same-origin) so the parent measures the child body directly
+  // on load, on a short settle schedule, and on child resizes. Frame ->
+  // parent postMessage height reporting proved unreliable here (the
+  // reporter's load-time measurement races layout inside scrollable,
+  // remounting message lists), so it stays only as a fallback below.
   useEffect(() => {
+    const frame = frameRef.current
+    if (frame === null) return
+    let observer: ResizeObserver | null = null
+    const timers: ReturnType<typeof setTimeout>[] = []
+    const measure = () => {
+      try {
+        const doc = frame.contentDocument
+        if (doc?.body) {
+          const measured = Math.max(doc.body.offsetHeight, doc.body.scrollHeight)
+          if (measured > 0) setHeight(Math.min(2400, Math.ceil(measured)))
+        }
+      } catch { /* cross-origin during navigation — next tick retries */ }
+    }
+    const onLoad = () => {
+      measure()
+      timers.push(setTimeout(measure, 250), setTimeout(measure, 900))
+      try {
+        const doc = frame.contentDocument
+        if (doc?.body && typeof ResizeObserver !== 'undefined') {
+          observer = new ResizeObserver(measure)
+          observer.observe(doc.body)
+          observer.observe(doc.documentElement)
+        }
+      } catch { /* measurement stays on the settle schedule */ }
+    }
     const onMessage = (event: MessageEvent) => {
-      if (event.source !== frameRef.current?.contentWindow) return
+      if (event.source !== frame.contentWindow) return
       const reported = (event.data as { __cellVisualHeight?: unknown })?.__cellVisualHeight
       if (typeof reported === 'number' && reported > 0) setHeight(Math.min(2400, Math.ceil(reported)))
     }
+    frame.addEventListener('load', onLoad)
     window.addEventListener('message', onMessage)
-    return () => window.removeEventListener('message', onMessage)
-  }, [])
+    return () => {
+      frame.removeEventListener('load', onLoad)
+      window.removeEventListener('message', onMessage)
+      observer?.disconnect()
+      timers.forEach(clearTimeout)
+    }
+  }, [content])
 
   if (content === '') return null
-  const baseStyle = '<style>html,body{background:transparent!important;margin:0;padding:0;height:auto!important;min-height:0!important;color:#ECECEC;font-family:system-ui,sans-serif}::-webkit-scrollbar{width:0;height:0}</style>'
-  const reporter = '<script>function __cellMeasure(){var b=document.body,d=document.documentElement;return Math.max(b?b.scrollHeight:0,b?b.offsetHeight:0,d.scrollHeight,d.offsetHeight)}function __cellReport(){try{parent.postMessage({__cellVisualHeight:__cellMeasure()},"*")}catch(e){}}window.addEventListener("load",function(){__cellReport();setTimeout(__cellReport,300);setTimeout(__cellReport,1200)});if(window.ResizeObserver){new ResizeObserver(__cellReport).observe(document.documentElement);if(document.body)new ResizeObserver(__cellReport).observe(document.body)}</' + '<' + '/script>'
+  // T3-style theme bridge: the frame is transparent over the chat, the
+  // document gets the chat's palette as CSS variables, scrollbars are
+  // hidden, and the document reports its own height (see reporter).
+  const baseStyle = '<style>:root{color-scheme:dark;--bg:transparent;--fg:#ECECEC;--muted:#AFAFAF;--accent:#3FA37A;--chart-1:#3FA37A;--chart-2:#E0A458;--chart-3:#7AA2E0;--chart-4:#D97AB0;--chart-5:#9BC53D}html,body{background:transparent!important;margin:0;padding:0;height:auto!important;min-height:0!important;color:#ECECEC;font-family:system-ui,sans-serif;scrollbar-width:none}body>*{background:transparent!important;box-shadow:none!important}::-webkit-scrollbar{width:0;height:0}</style>'
+  // measure the BODY, not the document element: an iframe's
+  // documentElement.scrollHeight is floored at the viewport height,
+  // so short visuals would never shrink below the initial height.
+  // color-scheme:dark (above) is what stops Chrome painting a white
+  // canvas under the transparent document on http pages.
+  const reporter = '<script>function __cellMeasure(){var b=document.body;return b?Math.max(b.offsetHeight,b.scrollHeight):0}function __cellReport(){try{parent.postMessage({__cellVisualHeight:__cellMeasure()},"*")}catch(e){}}window.addEventListener("load",function(){__cellReport();setTimeout(__cellReport,300);setTimeout(__cellReport,1200)});if(window.ResizeObserver){new ResizeObserver(__cellReport).observe(document.documentElement);if(document.body)new ResizeObserver(__cellReport).observe(document.body)}</' + '<' + '/script>'
   const withBase = content.includes('<head>')
     ? content.replace('<head>', `<head>${baseStyle}`)
     : content.includes('<html')
@@ -119,12 +178,7 @@ function HtmlVisual({ path, html }: { path?: string; html?: string }) {
       : `${baseStyle}${content}`
   const srcDoc = withBase.includes('</body>') ? withBase.replace('</body>', `${reporter}</body>`) : `${withBase}${reporter}`
   return (
-    <Stack style={{ width: '100%' }}>
-      {path !== undefined ? (
-        <Text type="supporting" color="secondary" style={{ fontFamily: 'var(--mono, monospace)', fontSize: 11 }}>{path}</Text>
-      ) : null}
-      <iframe ref={frameRef} title={path ?? 'visual'} sandbox="allow-scripts" srcDoc={srcDoc} style={{ ...visualFrame, height }} />
-    </Stack>
+    <iframe ref={frameRef} title={path ?? 'visual'} sandbox="allow-scripts allow-same-origin" srcDoc={srcDoc} style={{ ...visualFrame, height }} />
   )
 }
 
@@ -150,7 +204,139 @@ function shareSession(id: string, label: string): void {
 }
 
 
-const Transcript = memo(function Transcript({ entries, running }: { entries: readonly ChatEntry[]; running: boolean }) {
+
+const walkCache = new Map<string, { at: number; files: string[] }>()
+
+/** Resolve a path the agent mentioned to a real file, or null. */
+function makeFileResolver(workspace: string | null): (candidate: string) => string | null {
+  const { vfs } = platform()
+  return (candidate: string) => {
+    if (candidate.startsWith('~/')) {
+      const absolute = `/home/user${candidate.slice(1)}`
+      return vfs.isFile(absolute) ? absolute : null
+    }
+    if (candidate.startsWith('/')) return vfs.isFile(candidate) ? candidate : null
+    if (workspace === null) return null
+    if (candidate.includes('/')) {
+      const absolute = `${workspace}/${candidate}`
+      return vfs.isFile(absolute) ? absolute : null
+    }
+    // bare filename: search the thread workspace (cached walk, 5s TTL)
+    const now = Date.now()
+    let cached = walkCache.get(workspace)
+    if (cached === undefined || now - cached.at > 5000) {
+      const files: string[] = []
+      const walk = (dir: string, depth: number): void => {
+        if (depth > 4 || files.length > 400) return
+        let names: string[] = []
+        try { names = vfs.readDir(dir) } catch { return }
+        for (const name of names) {
+          if (name === 'node_modules' || name === '.git') continue
+          const child = `${dir}/${name}`
+          if (vfs.isDir(child)) walk(child, depth + 1)
+          else files.push(child)
+        }
+      }
+      walk(workspace, 0)
+      cached = { at: now, files }
+      walkCache.set(workspace, cached)
+    }
+    return cached.files.find((filePath) => filePath.endsWith(`/${candidate}`)) ?? null
+  }
+}
+
+function FileChip({ path, label, onPreview }: { path: string; label: string; onPreview: (path: string) => void }) {
+  const kind = fileKind(path)
+  const Icon = kind === 'image' ? PhotoIcon : kind === 'text' ? DocumentTextIcon : kind === 'html' ? CodeBracketIcon : DocumentIcon
+  return (
+    <HStack gap={1}>
+      <Button label={label} variant="ghost" size="sm" icon={<Icon width={14} />} onClick={() => onPreview(path)} />
+    </HStack>
+  )
+}
+
+const previewScroll: CSSProperties = { maxHeight: '60vh', overflowY: 'auto', width: '100%' }
+const previewPre: CSSProperties = { ...previewScroll, whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--mono, monospace)', fontSize: 'var(--font-size-sm, 12px)', margin: 0 }
+
+function FilePreviewDialog({ path, onClose, onOpenWorkspace }: { path: string | null; onClose: () => void; onOpenWorkspace: () => void }) {
+  const [imageUrl, setImageUrl] = useState<string | null>(null)
+  useEffect(() => {
+    if (path === null || fileKind(path) !== 'image') {
+      setImageUrl(null)
+      return
+    }
+    const bytes = platform().vfs.readBytes(path)
+    if (bytes === null) {
+      setImageUrl(null)
+      return
+    }
+    const ext = path.split('.').pop()?.toLowerCase() ?? 'png'
+    const mime = ext === 'svg' ? 'image/svg+xml' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`
+    const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }))
+    setImageUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [path])
+
+  if (path === null) return null
+  const { vfs } = platform()
+  const kind = fileKind(path)
+  const exists = vfs.isFile(path)
+  const text = kind === 'text' && exists ? (vfs.read(path) ?? '') : ''
+  const canOpenInWorkspace = exists && (kind === 'text' || kind === 'html')
+  const download = () => {
+    const bytes = vfs.readBytes(path)
+    if (bytes === null) return
+    const url = URL.createObjectURL(new Blob([bytes as BlobPart]))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = path.split('/').pop() ?? 'file'
+    anchor.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+  return (
+    <Dialog isOpen onOpenChange={(open) => { if (!open) onClose() }} purpose="form" width={860} padding={4}>
+      <VStack gap={3}>
+        <VStack gap={0.5}>
+          <Text type="label" weight="semibold">{path.split('/').pop()}</Text>
+          <Text type="supporting" color="secondary" style={{ fontFamily: 'var(--mono, monospace)', fontSize: 11 }}>{path}</Text>
+        </VStack>
+        {!exists ? (
+          <Text type="body" color="secondary">This file no longer exists.</Text>
+        ) : kind === 'image' ? (
+          imageUrl !== null
+            ? <img src={imageUrl} alt={path} style={{ maxWidth: '100%', maxHeight: '62vh', objectFit: 'contain', alignSelf: 'flex-start' }} />
+            : <Text type="body" color="secondary">Could not read this image.</Text>
+        ) : kind === 'html' ? (
+          <Stack style={previewScroll}><HtmlVisual path={path} /></Stack>
+        ) : kind === 'text' ? (
+          path.endsWith('.md') || path.endsWith('.markdown')
+            ? <Stack style={previewScroll}><Markdown>{text.slice(0, 30_000)}</Markdown></Stack>
+            : <pre style={previewPre}>{text.slice(0, 30_000)}</pre>
+        ) : (
+          <Text type="body" color="secondary">No inline preview for this file type — download it or open it in the Workspace.</Text>
+        )}
+        <HStack gap={2}>
+          {canOpenInWorkspace ? (
+            <Button
+              label="Open in Workspace"
+              variant="primary"
+              size="sm"
+              onClick={() => {
+                workspaceActions.openFile(path)
+                onOpenWorkspace()
+              }}
+            />
+          ) : null}
+          {exists ? <Button label="Download" variant="ghost" size="sm" onClick={download} /> : null}
+          <Button label="Close" variant="ghost" size="sm" onClick={onClose} />
+        </HStack>
+      </VStack>
+    </Dialog>
+  )
+}
+
+const Transcript = memo(function Transcript({ entries, running, workspace, onPreview }: { entries: readonly ChatEntry[]; running: boolean; workspace: string | null; onPreview: (path: string) => void }) {
+  const resolveFile = makeFileResolver(workspace)
   const items = groupItems(entries)
   return (
     <>
@@ -195,21 +381,32 @@ const Transcript = memo(function Transcript({ entries, running }: { entries: rea
         if (entry.kind === 'visual') {
           return (
             <ChatMessage key={entry.id} sender="assistant">
-              <HtmlVisual path={entry.text} />
+              <Stack style={{ position: 'relative', width: '100%' }}>
+                <HtmlVisual path={entry.text} />
+                <span style={{ position: 'absolute', top: 2, right: 2 }}>
+                  <Button label="Expand visual" variant="ghost" size="sm" isIconOnly icon={<ArrowsPointingOutIcon width={13} />} onClick={() => onPreview(entry.text)} />
+                </span>
+              </Stack>
             </ChatMessage>
           )
         }
         return (
           <ChatMessage key={entry.id} sender="assistant">
-            {splitHtmlBlocks(entry.text).map((part, partIndex) =>
-              part.kind === 'html' ? (
-                <HtmlVisual key={partIndex} html={part.text} />
-              ) : (
-                <ChatMessageBubble key={partIndex} variant="ghost">
-                  <Markdown density="compact">{part.text}</Markdown>
-                </ChatMessageBubble>
-              ),
-            )}
+            <VStack gap={2}>
+              {splitHtmlBlocks(entry.text).flatMap((part, partIndex) =>
+                part.kind === 'html'
+                  ? [<HtmlVisual key={`${partIndex}-html`} html={part.text} />]
+                  : splitFileRefs(part.text, resolveFile).map((ref, refIndex) =>
+                      ref.kind === 'file' ? (
+                        <FileChip key={`${partIndex}-${refIndex}`} path={ref.path} label={ref.label} onPreview={onPreview} />
+                      ) : ref.text.trim() === '' ? null : (
+                        <ChatMessageBubble key={`${partIndex}-${refIndex}`} variant="ghost">
+                          <Markdown density="compact">{ref.text}</Markdown>
+                        </ChatMessageBubble>
+                      ),
+                    ),
+              )}
+            </VStack>
           </ChatMessage>
         )
       })}
@@ -465,6 +662,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<AgentConfigForm | null>(null)
   const [renameTarget, setRenameTarget] = useState<{ id: string; value: string } | null>(null)
+  const [previewPath, setPreviewPath] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null)
   const form = state.config
 
@@ -537,7 +735,8 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                 label={session.label}
                 icon={session.pinned ? BookmarkIcon : ClockIcon}
                 size="sm"
-                isSelected={state.resumeTarget === session.id}
+                isSelected={state.sessionId === session.id}
+                {...(state.runningIds.includes(session.id) ? { endContent: <span style={runningDot} /> } : {})}
                 onClick={() => agentActions.openSession(session.id)}
                 actions={
                   <MoreMenu
@@ -572,7 +771,8 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                       key={session.id}
                       label={session.label}
                       size="sm"
-                      isSelected={state.resumeTarget === session.id}
+                      isSelected={state.sessionId === session.id}
+                      {...(state.runningIds.includes(session.id) ? { endContent: <span style={runningDot} /> } : {})}
                       onClick={() => agentActions.openSession(session.id)}
                       actions={
                         <MoreMenu
@@ -607,7 +807,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                     <Logo size={52} />
                     <Text type="display-2" as="h1">What should the agent do?</Text>
                     <Text type="body" color="secondary">
-                      It works in this workspace: bash, files, git, npm, python charts, live preview.
+                      Ask anything — it answers directly, and when work needs doing it has bash, files, git, python and a live preview, all in its own workspace.
                     </Text>
                   </VStack>
                   {composer}
@@ -629,7 +829,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
               <ChatLayout density="compact" style={fill} composer={composer}>
                 <ChatMessageList isStreaming={state.running}>
                   <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', minWidth: 0, padding: '8px 16px 0' }}>
-                    <Transcript entries={state.entries} running={state.running} />
+                    <Transcript entries={state.entries} running={state.running} workspace={state.sessionId !== null ? threadWorkspace(state.sessionId) : null} onPreview={setPreviewPath} />
                   </Stack>
                   {state.pendingSummary !== null ? (
                     <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', padding: '0 16px' }}>
@@ -676,6 +876,8 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
           </VStack>
         ) : null}
       </Dialog>
+
+      <FilePreviewDialog path={previewPath} onClose={() => setPreviewPath(null)} onOpenWorkspace={onOpenWorkspace} />
 
       <Dialog isOpen={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }} purpose="form" width={420} padding={4}>
         {deleteTarget !== null ? (

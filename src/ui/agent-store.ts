@@ -5,13 +5,15 @@ import type { SessionTurn } from '../shell/commands/agent-sessions'
 import { listSessions, loadSession, saveSession, sessionId } from '../shell/commands/agent-sessions'
 import { loadSkills } from '../shell/commands/agent-skills'
 import { registryEntries, type ToolCall } from '../shell/commands/agent-tools'
-import { getActivePath } from './workspace-store'
 
 /**
- * Shared agent state for the Agent home (front door). One module
- * store, following the diagnostics-store pattern: referentially
- * stable snapshots, subscribe/notify, actions as plain functions.
- * Module-level, so switching to the Workspace and back loses nothing.
+ * Agent state for the Agent home (front door). Module-level store:
+ * referentially stable snapshots, subscribe/notify, plain actions.
+ *
+ * Every thread (session) is independent: it has its own workspace
+ * folder (~/threads/<id>/), its own live entries, and its own run.
+ * Switching threads — or leaving for the Workspace IDE — never stops
+ * a run; runs finish in the background and their sessions persist.
  */
 
 export interface ChatEntry {
@@ -47,12 +49,14 @@ interface AgentSnapshot {
   keyAvailable: boolean
   pendingSummary: string | null
   pendingCount: number
+  /** a thread (maybe not the visible one) is waiting on an approval */
+  pendingGlobal: { threadId: string; summary: string } | null
+  runningIds: readonly string[]
   sessions: readonly SessionInfo[]
   skills: readonly { name: string; description: string }[]
   tools: readonly string[]
   contextChars: number
   sessionId: string | null
-  resumeTarget: string | null
   config: AgentConfigForm
   savedNote: string
   draft: string
@@ -63,6 +67,67 @@ const CONFIG_PATH = '/home/user/.cell/agent.json'
 const HOME = '/home/user'
 const EMPTY_FORM: AgentConfigForm = { provider: 'meta', model: 'muse-spark-1.3-contributor', apiKey: '', baseURL: '', permission: 'full', thinking: 'xhigh' }
 
+/** Each thread works in its own workspace folder. */
+export function threadWorkspace(id: string): string {
+  return `${HOME}/threads/${id}`
+}
+
+// ---- per-thread state ------------------------------------------------------
+
+interface ApprovalEntry {
+  summary: string
+  resolve: (allowed: boolean) => void
+}
+
+interface ThreadState {
+  id: string
+  entries: ChatEntry[]
+  /** artifact path -> entry id of its latest in-thread visual; a
+   * re-written artifact updates that entry in place (it re-reads the
+   * file on render) instead of stacking a new visual per version */
+  visualEntryByPath: Map<string, number>
+  running: boolean
+  abort: AbortController | null
+  approvals: ApprovalEntry[]
+  approvalTimer: ReturnType<typeof setTimeout> | null
+  compactRequested: boolean
+  contextChars: number
+  locked: boolean
+  lastDecisionAt: number
+  lastDecidedSummary: string | null
+}
+
+const threads = new Map<string, ThreadState>()
+let visibleThreadId: string | null = null
+
+function getThread(id: string): ThreadState {
+  let thread = threads.get(id)
+  if (thread === undefined) {
+    thread = {
+      id,
+      entries: [],
+      visualEntryByPath: new Map(),
+      running: false,
+      abort: null,
+      approvals: [],
+      approvalTimer: null,
+      compactRequested: false,
+      contextChars: 0,
+      locked: false,
+      lastDecisionAt: 0,
+      lastDecidedSummary: null,
+    }
+    threads.set(id, thread)
+  }
+  return thread
+}
+
+function visibleThread(): ThreadState | null {
+  return visibleThreadId === null ? null : getThread(visibleThreadId)
+}
+
+// ---- snapshot ---------------------------------------------------------------
+
 let entryId = 0
 let snapshot: AgentSnapshot = {
   entries: [],
@@ -71,12 +136,13 @@ let snapshot: AgentSnapshot = {
   keyAvailable: false,
   pendingSummary: null,
   pendingCount: 0,
+  pendingGlobal: null,
+  runningIds: [],
   sessions: [],
   skills: [],
   tools: [],
   contextChars: 0,
   sessionId: null,
-  resumeTarget: null,
   config: EMPTY_FORM,
   savedNote: '',
   draft: '',
@@ -89,35 +155,27 @@ function set(patch: Partial<AgentSnapshot>): void {
   for (const notify of subscribers) notify()
 }
 
-function pushEntry(kind: ChatEntry['kind'], text: string, name?: string, status?: ChatEntry['status']): void {
-  const entry: ChatEntry = { id: ++entryId, kind, text, ...(name ? { name } : {}), ...(status ? { status } : {}) }
-  const entries = [...snapshot.entries, entry]
-  set({ entries: entries.length > 400 ? entries.slice(-400) : entries })
-}
-
-/** Mark the most recent running tool entry with its outcome. */
-function settleToolEntry(name: string, isError: boolean): void {
-  const entries = [...snapshot.entries]
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].kind === 'tool' && entries[i].status === 'running') {
-      entries[i] = { ...entries[i], status: isError ? 'error' : 'complete' }
-      set({ entries })
-      return
+/** Copy the visible thread's live state into the snapshot. */
+function publish(): void {
+  const thread = visibleThreadId === null ? null : threads.get(visibleThreadId)
+  let pendingGlobal: AgentSnapshot['pendingGlobal'] = null
+  for (const candidate of threads.values()) {
+    if (candidate.approvals.length > 0) {
+      pendingGlobal = { threadId: candidate.id, summary: candidate.approvals[0].summary }
+      break
     }
   }
-  void name
-}
-
-/** Streaming text deltas coalesce into the current assistant entry. */
-function appendAssistantDelta(delta: string): void {
-  const entries = [...snapshot.entries]
-  const last = entries[entries.length - 1]
-  if (last && last.kind === 'assistant') {
-    entries[entries.length - 1] = { ...last, text: last.text + delta }
-    set({ entries })
-  } else {
-    pushEntry('assistant', delta)
-  }
+  set({
+    entries: thread ? thread.entries : [],
+    running: thread?.running ?? false,
+    activeLocked: thread?.locked ?? false,
+    pendingSummary: thread && thread.approvals.length > 0 ? thread.approvals[0].summary : null,
+    pendingCount: thread?.approvals.length ?? 0,
+    contextChars: thread?.contextChars ?? 0,
+    sessionId: visibleThreadId,
+    pendingGlobal,
+    runningIds: [...threads.values()].filter((candidate) => candidate.running).map((candidate) => candidate.id),
+  })
 }
 
 export const agentStore = {
@@ -129,6 +187,143 @@ export const agentStore = {
     return () => subscribers.delete(notify)
   },
 }
+
+// ---- thread-scoped entry helpers ---------------------------------------------
+
+function pushEntry(thread: ThreadState, kind: ChatEntry['kind'], text: string, name?: string, status?: ChatEntry['status']): ChatEntry {
+  const entry: ChatEntry = { id: ++entryId, kind, text, ...(name ? { name } : {}), ...(status ? { status } : {}) }
+  thread.entries = [...thread.entries, entry]
+  if (thread.entries.length > 400) thread.entries = thread.entries.slice(-400)
+  publish()
+  return entry
+}
+
+/** Mark the most recent running tool entry with its outcome. */
+function settleToolEntry(thread: ThreadState, isError: boolean): void {
+  const entries = [...thread.entries]
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].kind === 'tool' && entries[i].status === 'running') {
+      entries[i] = { ...entries[i], status: isError ? 'error' : 'complete' }
+      thread.entries = entries
+      publish()
+      return
+    }
+  }
+}
+
+/** Streaming text deltas coalesce into the current assistant entry. */
+function appendAssistantDelta(thread: ThreadState, delta: string): void {
+  const entries = [...thread.entries]
+  const last = entries[entries.length - 1]
+  if (last && last.kind === 'assistant') {
+    entries[entries.length - 1] = { ...last, text: last.text + delta }
+    thread.entries = entries
+    publish()
+  } else {
+    pushEntry(thread, 'assistant', delta)
+  }
+}
+
+function clipLines(text: string, max: number): string {
+  const lines = text.split('\n')
+  return lines.length <= max ? text : `${lines.slice(0, max).join('\n')}\n… (${lines.length - max} more lines)`
+}
+
+// ---- approvals (per thread FIFO; the loop owns the 300s timeout) ------------
+
+function summarizeCall(call: ToolCall): string {
+  if (call.name === 'bash' || call.name === 'job_start') return String(call.input.command ?? '')
+  if (call.name === 'write') return `${call.input.path} — ${String(call.input.content ?? '').slice(0, 200)}`
+  if (call.name === 'edit') return `${call.input.path} — replace ${String(call.input.oldText ?? '').slice(0, 80)}…`
+  if (call.input.path !== undefined) return String(call.input.path)
+  return JSON.stringify(call.input).slice(0, 140)
+}
+
+function armApprovalTimer(thread: ThreadState): void {
+  if (thread.approvalTimer !== null) clearTimeout(thread.approvalTimer)
+  // aligned with the loop's own 300s approval timeout: whichever fires,
+  // the entry leaves the queue so a late click cannot resolve a dead
+  // promise or absorb a decision meant for the next call
+  thread.approvalTimer = setTimeout(() => decideApproval(thread, false), 300_000)
+}
+
+function makeApprove(thread: ThreadState): (call: ToolCall) => Promise<boolean> {
+  return (call: ToolCall) =>
+    new Promise<boolean>((resolve) => {
+      const entry: ApprovalEntry = { summary: `${call.name} ${summarizeCall(call)}`, resolve }
+      thread.approvals.push(entry)
+      if (thread.approvals.length === 1) armApprovalTimer(thread)
+      publish()
+      platform().bus.emit('app:status', { message: 'agent waiting for approval…', tone: 'info' })
+    })
+}
+
+function decideApproval(thread: ThreadState, allowed: boolean): void {
+  const head = thread.approvals[0]
+  if (head === undefined) return
+  if (thread.approvalTimer !== null) {
+    clearTimeout(thread.approvalTimer)
+    thread.approvalTimer = null
+  }
+  // debounce double-clicks per queue head, not globally
+  const now = Date.now()
+  if (thread.lastDecidedSummary === head.summary && now - thread.lastDecisionAt < 350) return
+  thread.lastDecidedSummary = head.summary
+  thread.lastDecisionAt = now
+  thread.approvals.shift()
+  head.resolve(allowed)
+  if (thread.approvals.length > 0) armApprovalTimer(thread)
+  publish()
+}
+
+function cancelApprovals(thread: ThreadState): void {
+  if (thread.approvalTimer !== null) {
+    clearTimeout(thread.approvalTimer)
+    thread.approvalTimer = null
+  }
+  for (const entry of thread.approvals.splice(0)) entry.resolve(false)
+  publish()
+}
+
+// ---- visuals ------------------------------------------------------------------
+
+
+function resolveAgainst(cwd: string, path: string): string {
+  if (path.startsWith('~')) return `${HOME}${path.slice(1)}`
+  if (path.startsWith('/')) return path
+  return `${cwd}/${path}`
+}
+
+function pushVisualIfNew(thread: ThreadState, vfs: ReturnType<typeof platform>['vfs'], path: string): void {
+  if (!vfs.isFile(path)) return
+  // one visual per artifact per user turn: re-writing or editing the
+  // file mid-turn refreshes the existing entry (HtmlVisual re-reads
+  // the file on render); after a new user message, a fresh visual for
+  // the same path is welcome again
+  const existingEntryId = thread.visualEntryByPath.get(path)
+  if (existingEntryId !== undefined) {
+    let lastUserEntryId = 0
+    for (const entry of thread.entries) if (entry.kind === 'user') lastUserEntryId = entry.id
+    if (existingEntryId > lastUserEntryId) return
+  }
+  const entry = pushEntry(thread, 'visual', path)
+  thread.visualEntryByPath.set(path, entry.id)
+}
+
+/** HTML artifacts in the thread workspace become in-chat visuals. */
+function pushVisualEntries(thread: ThreadState, vfs: ReturnType<typeof platform>['vfs']): void {
+  try {
+    const dir = `${threadWorkspace(thread.id)}/artifacts`
+    if (!vfs.isDir(dir)) return
+    for (const name of vfs.readDir(dir)) {
+      if (name.endsWith('.html')) pushVisualIfNew(thread, vfs, `${dir}/${name}`)
+    }
+  } catch {
+    // artifacts are best-effort
+  }
+}
+
+// ---- config / sessions ---------------------------------------------------------
 
 function loadConfigForm(): AgentConfigForm {
   try {
@@ -174,8 +369,8 @@ function mutateSession(id: string, patch: Partial<{ title: string; pinned: boole
   agentActions.refresh()
 }
 
-/** Sessions without a model title get one lazily (one cheap call each,
- * attempted once per session per page load; old sessions included). */
+/** Sessions without a model title get one lazily (attempted only on
+ * success, max three per sweep; old sessions included). */
 const titleAttempts = new Set<string>()
 async function ensureSessionTitles(vfs: ReturnType<typeof platform>['vfs']): Promise<void> {
   let titled = 0
@@ -183,8 +378,6 @@ async function ensureSessionTitles(vfs: ReturnType<typeof platform>['vfs']): Pro
     if (titled >= 3) break
     if (session.title !== undefined || titleAttempts.has(session.id)) continue
     const title = await generateSessionTitle(vfs, session.id).catch(() => null)
-    // mark attempted only on success: a key-less first launch must not
-    // permanently skip titling every old session
     if (title !== null) {
       titleAttempts.add(session.id)
       titled++
@@ -193,13 +386,42 @@ async function ensureSessionTitles(vfs: ReturnType<typeof platform>['vfs']): Pro
   }
 }
 
-let abortController: AbortController | null = null
-let compactRequested = false
+/** Restore the earlier conversation into the chat on resume, so the
+ * user sees the context the agent is continuing from. */
+function seedHistoryEntries(thread: ThreadState, vfs: ReturnType<typeof platform>['vfs'], id: string): void {
+  const loaded = loadSession(vfs, id)
+  if ('error' in loaded) return
+  const turns: SessionTurn[] = loaded.session.turns.slice(-60)
+  const workspace = threadWorkspace(id)
+  pushEntry(thread, 'note', `↻ resumed “${loaded.session.title ?? loaded.session.prompt.slice(0, 60)}” — earlier messages restored · workspace ${workspace.replace(HOME, '~')}`)
+  const resultsById = new Map<string, { content: string; isError?: boolean }>()
+  for (const turn of turns) {
+    if (turn.role === 'tool') {
+      for (const result of turn.toolResults ?? []) resultsById.set(result.id, result)
+    }
+  }
+  for (const turn of turns) {
+    if (turn.role === 'user') pushEntry(thread, 'user', turn.text)
+    else if (turn.role === 'assistant') {
+      if (turn.text.trim() !== '') pushEntry(thread, 'assistant', turn.text)
+      for (const call of turn.toolCalls ?? []) {
+        pushEntry(thread, 'tool', `${call.name} ${call.input.path ?? call.input.command ?? ''}`.trim(), call.name, 'complete')
+        const result = resultsById.get(call.id)
+        if (result !== undefined) pushEntry(thread, 'result', clipLines(result.content, 12), call.name)
+        // visuals produced in this session render again on revisit
+        const callPath = typeof call.input.path === 'string' ? call.input.path : ''
+        if (callPath.endsWith('.html')) pushVisualIfNew(thread, vfs, resolveAgainst(workspace, callPath))
+      }
+    }
+  }
+}
+
+// ---- actions --------------------------------------------------------------------
 
 export const agentActions = {
   refresh(): void {
     const { vfs } = platform()
-    const cwd = getActivePath() ?? HOME
+    const cwd = visibleThreadId === null ? HOME : threadWorkspace(visibleThreadId)
     const { skills } = loadSkills(vfs, cwd)
     const { entries } = registryEntries(vfs)
     const form = loadConfigForm()
@@ -248,21 +470,22 @@ export const agentActions = {
     set({ draft: current === '' ? text : `${current}${current.endsWith(' ') ? '' : ' '}${text}` })
   },
 
-  setResumeTarget(id: string | null): void {
-    set({ resumeTarget: id })
-  },
-
-  /** Open a past session as the current thread: its history loads
-   * into the chat and the next message continues it. */
+  /** Open a past session as the current thread. Any run already going
+   * on it (or on the thread left behind) keeps working. */
   openSession(id: string): void {
-    if (snapshot.running) return
     const { vfs } = platform()
-    const loaded = loadSession(vfs, id)
-    const estimated = 'error' in loaded ? 0 : loaded.session.turns.reduce((sum, turn) => sum + turn.text.length, 0)
-    set({ contextChars: estimated })
+    const isNew = !threads.has(id)
+    const thread = getThread(id)
+    visibleThreadId = id
     const info = snapshot.sessions.find((s) => s.id === id)
-    set({ entries: [], contextChars: 0, resumeTarget: id, sessionId: id, draft: '', activeLocked: info?.locked === true })
-    seedHistoryEntries(vfs, id)
+    thread.locked = info?.locked === true
+    if (isNew) {
+      const loaded = loadSession(vfs, id)
+      thread.contextChars = 'error' in loaded ? 0 : loaded.session.turns.reduce((sum, turn) => sum + turn.text.length, 0)
+      seedHistoryEntries(thread, vfs, id)
+    }
+    set({ draft: '' })
+    publish()
   },
 
   renameSession(id: string, title: string): void {
@@ -278,14 +501,17 @@ export const agentActions = {
   toggleArchive(id: string): void {
     const session = snapshot.sessions.find((s) => s.id === id)
     mutateSession(id, { archived: session?.archived !== true })
-    if (snapshot.sessionId === id) set({ resumeTarget: null, sessionId: null, entries: [], activeLocked: false })
   },
 
   toggleLock(id: string): void {
     const session = snapshot.sessions.find((s) => s.id === id)
     const locked = session?.locked !== true
     mutateSession(id, { locked })
-    if (snapshot.sessionId === id) set({ activeLocked: locked })
+    const thread = threads.get(id)
+    if (thread !== undefined) {
+      thread.locked = locked
+      publish()
+    }
   },
 
   forkSession(id: string): string | null {
@@ -310,10 +536,15 @@ export const agentActions = {
 
   deleteSession(id: string): void {
     const { vfs } = platform()
+    const thread = threads.get(id)
+    if (thread?.running) thread.abort?.abort()
+    if (thread !== undefined) cancelApprovals(thread)
+    threads.delete(id)
+    if (visibleThreadId === id) visibleThreadId = null
     try {
       vfs.delete(`/home/user/.cell/sessions/${id}.json`)
     } catch { /* best-effort */ }
-    if (snapshot.sessionId === id || snapshot.resumeTarget === id) set({ resumeTarget: null, entries: [], sessionId: null, activeLocked: false })
+    publish()
     agentActions.refresh()
   },
 
@@ -327,224 +558,134 @@ export const agentActions = {
     return lines.join('\n')
   },
 
+  /** New chat: just change the view. Nothing is stopped. */
   clearChat(): void {
-    if (snapshot.running) return
-    set({ entries: [], contextChars: 0, sessionId: null, resumeTarget: null, draft: '', activeLocked: false })
+    visibleThreadId = null
+    set({ draft: '' })
+    publish()
   },
 
   decide(allowed: boolean): void {
-    decideApproval(allowed)
+    const thread = visibleThread()
+    if (thread !== null) decideApproval(thread, allowed)
   },
 
+  decideFor(threadId: string, allowed: boolean): void {
+    const thread = threads.get(threadId)
+    if (thread !== undefined) decideApproval(thread, allowed)
+  },
+
+  /** Stop the visible thread's run. Other threads keep working. */
   stop(): void {
-    abortController?.abort()
-    cancelApprovals()
+    const thread = visibleThread()
+    if (thread === null) return
+    thread.abort?.abort()
+    cancelApprovals(thread)
   },
 
-  /** Ask the running loop to compact context at the next step. */
+  /** Ask the visible thread's loop to compact at the next step. */
   requestCompact(): void {
-    compactRequested = true
+    const thread = visibleThread()
+    if (thread !== null) thread.compactRequested = true
   },
 
   async run(prompt: string): Promise<void> {
     const text = prompt.trim()
-    if (snapshot.running || text === '') return
-    const resumeId = snapshot.resumeTarget
+    if (text === '') return
     const { vfs, bus } = platform()
-    abortController = new AbortController()
-    set({ running: true, resumeTarget: null, draft: '', activeLocked: false })
-    pushEntry('user', text)
-    bus.emit('app:status', { message: resumeId !== null ? `agent resuming ${resumeId}…` : 'agent running…', tone: 'info' })
-    const cwd = getActivePath() ?? HOME
+    // a fresh chat becomes a thread (with its own workspace) on send
+    if (visibleThreadId === null) visibleThreadId = sessionId()
+    const thread = getThread(visibleThreadId)
+    if (thread.running) return
+    const approve = makeApprove(thread)
+    thread.abort = new AbortController()
+    thread.running = true
+    set({ draft: '' })
+    publish()
+    pushEntry(thread, 'user', text)
+    bus.emit('app:status', { message: 'agent running…', tone: 'info' })
+
+    const workspace = threadWorkspace(thread.id)
+    const cwd = workspace
     try {
+      vfs.mkdir(workspace)
+      // pre-create the session file under this thread's id so the run
+      // resumes into it and the workspace/session pairing is stable
+      if ('error' in loadSession(vfs, thread.id)) {
+        const form = snapshot.config
+        saveSession(vfs, {
+          id: thread.id,
+          startedAt: new Date().toISOString(),
+          provider: form.provider,
+          model: form.model,
+          prompt: text,
+          transcript: [],
+          turns: [],
+          steps: 0,
+        })
+      }
       const shell = createShell(vfs, { protected: true, approve })
       const jobShell = createShell(vfs, { protected: true, approve })
-      const args = resumeId !== null ? ['--resume', resumeId, text] : [text]
-      const result = await runAgent(vfs, args, {
+      const result = await runAgent(vfs, ['--resume', thread.id, text], {
         cwd,
         shell,
         jobShell,
         approve,
-        signal: abortController.signal,
+        signal: thread.abort.signal,
+        // no upper cap on agent turns in the UI; the stop button and
+        // per-step timeouts are the guardrails
         maxSteps: Number.POSITIVE_INFINITY,
         shouldCompact: () => {
-          const requested = compactRequested
-          compactRequested = false
+          const requested = thread.compactRequested
+          thread.compactRequested = false
           return requested
         },
-        onSession: (id) => set({ sessionId: id }),
-        onContext: (chars) => set({ contextChars: chars }),
+        onSession: () => publish(),
+        onContext: (chars) => {
+          thread.contextChars = chars
+          publish()
+        },
         onToolResult: (call, toolResult) => {
-          settleToolEntry(call.name, toolResult.isError === true)
-          pushEntry('result', clipLines(toolResult.content, 16), call.name)
+          settleToolEntry(thread, toolResult.isError === true)
+          pushEntry(thread, 'result', clipLines(toolResult.content, 16), call.name)
           // a visual appears when it is written, not after the run
           const writtenPath = typeof call.input.path === 'string' ? call.input.path : ''
           if ((call.name === 'write' || call.name === 'edit') && writtenPath.endsWith('.html') && !toolResult.isError) {
-            pushVisualIfNew(vfs, writtenPath.startsWith('~') ? `/home/user${writtenPath.slice(1)}` : writtenPath)
+            pushVisualIfNew(thread, vfs, resolveAgainst(cwd, writtenPath))
           }
         },
         onProgress: (line) => {
           if (line.startsWith('⏺ ')) {
             const body = line.slice(2)
             const space = body.indexOf(' ')
-            pushEntry('tool', body, space === -1 ? body : body.slice(0, space), 'running')
+            pushEntry(thread, 'tool', body, space === -1 ? body : body.slice(0, space), 'running')
           } else if (line.startsWith('❓')) {
             // approval requests render as the pending card, not a transcript line
           } else {
-            appendAssistantDelta(line)
+            appendAssistantDelta(thread, line)
           }
         },
       })
-      // the transcript tail carries errors and the step-limit line —
-      // surfacing only the exit code hid both from UI users
+      // the transcript tail carries errors — surfacing only the exit
+      // code hid them from UI users
       const tail = result.stdout.trim().split('\n').filter((line) => line.trim() !== '')
       const errorLine = [...tail].reverse().find((line) => line.startsWith('agent ✗') || line.startsWith('agent: reached'))
-      if (result.stderr.trim() !== '') pushEntry('note', result.stderr.trim())
-      if (abortController.signal.aborted) pushEntry('note', '■ stopped')
-      else if (errorLine !== undefined) pushEntry('note', errorLine)
-      else if (result.stderr.trim() === '') pushEntry('note', result.exitCode === 0 ? '✓ done' : `✗ exit ${result.exitCode}`)
+      if (result.stderr.trim() !== '') pushEntry(thread, 'note', result.stderr.trim())
+      if (thread.abort.signal.aborted) pushEntry(thread, 'note', '■ stopped')
+      else if (errorLine !== undefined) pushEntry(thread, 'note', errorLine)
+      else if (result.stderr.trim() === '') pushEntry(thread, 'note', result.exitCode === 0 ? '✓ done' : `✗ exit ${result.exitCode}`)
     } catch (err) {
-      pushEntry('note', `✗ ${err instanceof Error ? err.message : String(err)}`)
+      pushEntry(thread, 'note', `✗ ${err instanceof Error ? err.message : String(err)}`)
     } finally {
-      cancelApprovals()
-      abortController = null
-      set({ running: false })
-      pushVisualEntries(vfs)
+      cancelApprovals(thread)
+      thread.abort = null
+      thread.running = false
+      publish()
+      pushVisualEntries(thread, vfs)
       agentActions.refresh()
       agentActions.ensureTitles()
     }
   },
-}
-
-/** Restore the earlier conversation into the chat on resume, so the
- * user sees the context the agent is continuing from. */
-function seedHistoryEntries(vfs: ReturnType<typeof platform>['vfs'], id: string): void {
-  const loaded = loadSession(vfs, id)
-  if ('error' in loaded) return
-  const turns: SessionTurn[] = loaded.session.turns.slice(-60)
-  pushEntry('note', `↻ resumed “${loaded.session.title ?? loaded.session.prompt.slice(0, 60)}” — earlier messages restored`)
-  const resultsById = new Map<string, { content: string; isError?: boolean }>()
-  for (const turn of turns) {
-    if (turn.role === 'tool') {
-      for (const result of turn.toolResults ?? []) resultsById.set(result.id, result)
-    }
-  }
-  for (const turn of turns) {
-    if (turn.role === 'user') pushEntry('user', turn.text)
-    else if (turn.role === 'assistant') {
-      if (turn.text.trim() !== '') pushEntry('assistant', turn.text)
-      for (const call of turn.toolCalls ?? []) {
-        pushEntry('tool', `${call.name} ${call.input.path ?? call.input.command ?? ''}`.trim(), call.name, 'complete')
-        const result = resultsById.get(call.id)
-        if (result !== undefined) pushEntry('result', clipLines(result.content, 12), call.name)
-        // visuals produced in this session render again on revisit
-        const callPath = typeof call.input.path === 'string' ? call.input.path : ''
-        if (callPath.endsWith('.html')) {
-          const normalized = callPath.startsWith('~') ? `/home/user${callPath.slice(1)}` : callPath
-          if (vfs.isFile(normalized) && !shownVisuals.has(visualKey(vfs, normalized))) {
-            shownVisuals.add(visualKey(vfs, normalized))
-            pushEntry('visual', normalized)
-          }
-        }
-      }
-    }
-  }
-}
-
-const shownVisuals = new Set<string>()
-
-/** Change stamp so an overwritten artifact re-renders as a new visual. */
-function visualKey(vfs: ReturnType<typeof platform>['vfs'], path: string): string {
-  const stat = vfs.stat(path)
-  return `${path}@${stat?.mtime ?? 0}:${stat?.size ?? 0}`
-}
-
-function pushVisualIfNew(vfs: ReturnType<typeof platform>['vfs'], path: string): void {
-  if (!vfs.isFile(path)) return
-  const key = visualKey(vfs, path)
-  if (shownVisuals.has(key)) return
-  shownVisuals.add(key)
-  pushEntry('visual', path)
-}
-
-/** HTML artifacts the agent produced become in-chat visuals. */
-function pushVisualEntries(vfs: ReturnType<typeof platform>['vfs']): void {
-  try {
-    const dir = '/home/user/artifacts'
-    if (!vfs.isDir(dir)) return
-    for (const name of vfs.readDir(dir)) {
-      if (name.endsWith('.html')) pushVisualIfNew(vfs, `${dir}/${name}`)
-    }
-  } catch {
-    // artifacts are best-effort
-  }
-}
-
-function clipLines(text: string, max: number): string {
-  const lines = text.split('\n')
-  return lines.length <= max ? text : `${lines.slice(0, max).join('\n')}\n… (${lines.length - max} more lines)`
-}
-
-// ---- approval FIFO (single-sourced; the loop owns the timeout) ----
-
-const approvalQueue: { summary: string; resolve: (allowed: boolean) => void }[] = []
-let lastDecisionAt = 0
-let lastDecidedSummary: string | null = null
-
-function summarizeCall(call: ToolCall): string {
-  if (call.name === 'bash' || call.name === 'job_start') return String(call.input.command ?? '')
-  if (call.name === 'write') return `${call.input.path} — ${String(call.input.content ?? '').slice(0, 200)}`
-  if (call.name === 'edit') return `${call.input.path} — replace ${String(call.input.oldText ?? '').slice(0, 80)}…`
-  if (call.input.path !== undefined) return String(call.input.path)
-  return JSON.stringify(call.input).slice(0, 140)
-}
-
-let approvalTimer: ReturnType<typeof setTimeout> | null = null
-
-function armApprovalTimer(): void {
-  if (approvalTimer !== null) clearTimeout(approvalTimer)
-  // aligned with the loop's own 300s approval timeout: whichever fires,
-  // the entry leaves the queue so a late click cannot resolve a dead
-  // promise or absorb a decision meant for the next call
-  approvalTimer = setTimeout(() => decideApproval(false), 300_000)
-}
-
-function approve(call: ToolCall): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const entry = { summary: `${call.name} ${summarizeCall(call)}`, resolve }
-    approvalQueue.push(entry)
-    set({ pendingSummary: entry.summary, pendingCount: approvalQueue.length })
-    if (approvalQueue.length === 1) armApprovalTimer()
-    platform().bus.emit('app:status', { message: 'agent waiting for approval…', tone: 'info' })
-  })
-}
-
-function decideApproval(allowed: boolean): void {
-  const head = approvalQueue[0]
-  if (head === undefined) return
-  if (approvalTimer !== null) {
-    clearTimeout(approvalTimer)
-    approvalTimer = null
-  }
-  // debounce double-clicks per queue head, not globally
-  const now = Date.now()
-  if (lastDecidedSummary === head.summary && now - lastDecisionAt < 350) return
-  lastDecidedSummary = head.summary
-  lastDecisionAt = now
-  approvalQueue.shift()
-  head.resolve(allowed)
-  const next = approvalQueue[0]
-  set({ pendingSummary: next ? next.summary : null, pendingCount: approvalQueue.length })
-  if (next) armApprovalTimer()
-}
-
-function cancelApprovals(): void {
-  if (approvalTimer !== null) {
-    clearTimeout(approvalTimer)
-    approvalTimer = null
-  }
-  for (const entry of approvalQueue.splice(0)) entry.resolve(false)
-  if (snapshot.pendingSummary !== null) set({ pendingSummary: null, pendingCount: 0 })
 }
 
 export { COMPACT_AT_CHARS }

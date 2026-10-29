@@ -12,7 +12,7 @@ import {
   DocumentMagnifyingGlassIcon,
 } from '@heroicons/react/24/outline'
 import { platform } from '../platform'
-import { agentStore } from './agent-store'
+import { agentActions, agentStore } from './agent-store'
 import { getActivePath } from './workspace-store'
 import { findGitRepos, gitCommand } from '../shell/commands/git'
 import { parseStatus } from './GitPanel'
@@ -48,7 +48,7 @@ const EMPTY: DockData = { jobsRunning: 0, jobsDone: 0, repoName: null, branch: n
 
 async function pollDock(): Promise<DockData> {
   const { vfs } = platform()
-  const agentBusy = _agentStoreRef.get().running
+  const agentBusy = _agentStoreRef.get().runningIds.length > 0
   let jobsRunning = 0
   let jobsDone = 0
   try {
@@ -120,20 +120,21 @@ export function StatusDock({ onOpenWorkspace }: { onOpenWorkspace?: () => void }
   }, [agent.running])
 
   const lastTool = [...agent.entries].reverse().find((entry) => entry.kind === 'tool')
-  const agentLabel = agent.pendingSummary !== null
+  const runningCount = agent.runningIds.length
+  const agentLabel = agent.pendingGlobal !== null
     ? 'waiting for approval'
-    : agent.running
-      ? (lastTool ? lastTool.text.slice(0, 42) : 'working…')
+    : runningCount > 0
+      ? (runningCount > 1 ? `working in ${runningCount} threads` : (lastTool ? lastTool.text.slice(0, 42) : 'working…'))
       : 'idle'
 
   if (!open) {
     return (
       <div style={pillStyle}>
         <Button
-          label={agent.running ? 'Agent running' : 'Status'}
+          label={runningCount > 0 ? 'Agent running' : 'Status'}
           variant="secondary"
           size="sm"
-          icon={<StatusDot variant={agent.running ? 'accent' : 'neutral'} label={agentLabel} />}
+          icon={<StatusDot variant={runningCount > 0 ? 'accent' : 'neutral'} label={agentLabel} />}
           onClick={() => setOpen(true)}
         />
       </div>
@@ -151,9 +152,20 @@ export function StatusDock({ onOpenWorkspace }: { onOpenWorkspace?: () => void }
             <Button label="Collapse status" variant="ghost" size="sm" isIconOnly icon={<ChevronDownIcon width={14} />} onClick={() => setOpen(false)} />
           </HStack>
           <HStack gap={2} vAlign="center">
-            <StatusDot variant={agent.running ? 'accent' : 'neutral'} label={agentLabel} />
+            <StatusDot variant={runningCount > 0 ? 'accent' : 'neutral'} label={agentLabel} />
             <Text type="supporting" color="secondary">{agentLabel}</Text>
           </HStack>
+          {agent.pendingGlobal !== null ? (
+            <>
+              <Text type="supporting" color="secondary">
+                {agent.pendingGlobal.summary.slice(0, 120)}
+              </Text>
+              <HStack gap={2}>
+                <Button label="Approve" variant="primary" size="sm" onClick={() => agentActions.decideFor(agent.pendingGlobal!.threadId, true)} />
+                <Button label="Deny" variant="ghost" size="sm" onClick={() => agentActions.decideFor(agent.pendingGlobal!.threadId, false)} />
+              </HStack>
+            </>
+          ) : null}
           {data.jobsRunning + data.jobsDone > 0 ? (
             <Text type="supporting" color="secondary">
               Jobs: {data.jobsRunning} running · {data.jobsDone} done
