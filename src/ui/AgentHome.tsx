@@ -1,12 +1,14 @@
 import { memo, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useSyncExternalStore } from 'react'
 import { AppShell } from '@astryxdesign/core/AppShell'
+import { Divider } from '@astryxdesign/core/Divider'
 import { SideNav, SideNavHeading, SideNavItem, SideNavSection } from '@astryxdesign/core/SideNav'
 import { Layout, LayoutContent } from '@astryxdesign/core/Layout'
 import { Stack, VStack, HStack, StackItem } from '@astryxdesign/core/Stack'
 import { Text } from '@astryxdesign/core/Text'
 import {
   ChatComposer,
+  ChatComposerInput,
   ChatLayout,
   ChatMessage,
   ChatMessageBubble,
@@ -27,12 +29,14 @@ import { ProgressBar } from '@astryxdesign/core/ProgressBar'
 import { Token } from '@astryxdesign/core/Token'
 import {
   MicrophoneIcon,
+  PaperClipIcon,
   PlusIcon,
   ChatBubbleLeftRightIcon,
   CodeBracketIcon,
   Cog6ToothIcon,
   SparklesIcon,
   LinkIcon,
+  WrenchScrewdriverIcon,
   ClockIcon,
   CheckIcon,
   XMarkIcon,
@@ -292,52 +296,114 @@ function VoiceButton() {
   )
 }
 
-function AgentComposer({ steps, setSteps, onOpenSettings }: { steps: number; setSteps: (n: number) => void; onOpenSettings: () => void }) {
+const MODEL_PRESETS: { provider: string; model: string; label: string }[] = [
+  { provider: 'meta', model: 'muse-spark-1.3-contributor', label: 'Muse Spark 1.3 Contributor' },
+  { provider: 'meta', model: 'muse-spark-1.3', label: 'Muse Spark 1.3' },
+  { provider: 'anthropic', model: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5' },
+  { provider: 'openai', model: 'gpt-4o', label: 'GPT-4o' },
+]
+const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+
+function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const form = state.config
   const needsKey = form.apiKey.trim() === '' && form.provider !== 'compat'
+  const modelLabel = MODEL_PRESETS.find((preset) => preset.provider === form.provider && preset.model === form.model)?.label ?? (form.model || form.provider)
+
+  const attachFiles = async (files: FileList | null) => {
+    if (files === null) return
+    for (const file of [...files]) {
+      try {
+        const text = await file.text()
+        const clipped = text.length > 12_000 ? `${text.slice(0, 12_000)}\n… (truncated)` : text
+        agentActions.setDraft(`${agentStore.get().draft}\n\n[file: ${file.name}]\n\`\`\`\n${clipped}\n\`\`\``)
+      } catch {
+        agentActions.appendDraft(`[file: ${file.name} — could not read as text]`)
+      }
+    }
+  }
+
   return (
-    <ChatComposer
-      density="compact"
-      value={state.draft}
-      onChange={(value) => agentActions.setDraft(value)}
-      onSubmit={(value) => void agentActions.run(value, steps)}
-      isStopShown={state.running}
-      onStop={() => agentActions.stop()}
-      placeholder="Describe the task…"
-      status={
-        needsKey && !state.running
-          ? { type: 'error', message: 'No API key configured — open Model & settings in the sidebar to add one.' }
-          : undefined
-      }
-      sendActions={
-        <HStack gap={2} vAlign="center">
-          <ContextRing chars={state.contextChars} />
-          <VoiceButton />
-        </HStack>
-      }
-      footerActions={
-        <HStack gap={2} vAlign="center">
-          <DropdownMenu
-            button={{ label: form.permission === 'full' ? 'Full permission' : 'Ask each time', variant: 'ghost', size: 'sm' }}
-            items={[
-              { label: 'Full permission', onClick: () => { agentActions.setConfig({ permission: 'full' }); agentActions.saveConfig() } },
-              { label: 'Ask each time', onClick: () => { agentActions.setConfig({ permission: 'ask' }); agentActions.saveConfig() } },
-            ]}
-          />
-          <DropdownMenu
-            button={{ label: `${steps} steps`, variant: 'ghost', size: 'sm' }}
-            items={[10, 30, 60, 100].map((n) => ({ label: `${n} steps`, onClick: () => setSteps(n) }))}
-          />
-          {state.resumeTarget !== null ? (
-            <Token label={`resuming ${state.resumeTarget}`} onRemove={() => agentActions.setResumeTarget(null)} />
-          ) : null}
-          {needsKey ? (
-            <Button label="Add API key" variant="ghost" size="sm" onClick={onOpenSettings} />
-          ) : null}
-        </HStack>
-      }
-    />
+    <>
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(event) => {
+          void attachFiles(event.target.files)
+          event.target.value = ''
+        }}
+      />
+      <ChatComposer
+        density="compact"
+        value={state.draft}
+        onChange={(value) => agentActions.setDraft(value)}
+        onSubmit={(value) => void agentActions.run(value)}
+        isStopShown={state.running}
+        onStop={() => agentActions.stop()}
+        placeholder="Ask anything. @ files, $ skills, / commands"
+        input={<ChatComposerInput style={{ minHeight: 56 }} />}
+        status={
+          needsKey && !state.running
+            ? { type: 'error', message: 'No API key configured — open Model & settings in the sidebar to add one.' }
+            : undefined
+        }
+        sendActions={
+          <HStack gap={1} vAlign="center">
+            <Button
+              label="Attach files"
+              variant="ghost"
+              size="sm"
+              isIconOnly
+              icon={<PaperClipIcon width={16} />}
+              onClick={() => fileInputRef.current?.click()}
+            />
+            <VoiceButton />
+            <ContextRing chars={state.contextChars} />
+          </HStack>
+        }
+        footerActions={
+          <HStack gap={1} vAlign="center">
+            <DropdownMenu
+              button={{ label: modelLabel, variant: 'ghost', size: 'sm', icon: <Logo size={14} /> }}
+              items={[
+                ...MODEL_PRESETS.map((preset) => ({
+                  label: preset.label,
+                  onClick: () => {
+                    agentActions.setConfig({ provider: preset.provider, model: preset.model })
+                    agentActions.saveConfig()
+                  },
+                })),
+                { type: 'divider' as const },
+                { label: 'Custom endpoint…', onClick: onOpenSettings },
+              ]}
+            />
+            <DropdownMenu
+              button={{ label: `Effort ${form.thinking}`, variant: 'ghost', size: 'sm' }}
+              items={EFFORTS.map((effort) => ({
+                label: effort === 'off' ? 'Off' : effort[0].toUpperCase() + effort.slice(1),
+                onClick: () => {
+                  agentActions.setConfig({ thinking: effort })
+                  agentActions.saveConfig()
+                },
+              }))}
+            />
+            <DropdownMenu
+              button={{ label: form.permission === 'full' ? 'Full access' : 'Ask first', variant: 'ghost', size: 'sm' }}
+              items={[
+                { label: 'Full access', onClick: () => { agentActions.setConfig({ permission: 'full' }); agentActions.saveConfig() } },
+                { label: 'Ask first', onClick: () => { agentActions.setConfig({ permission: 'ask' }); agentActions.saveConfig() } },
+              ]}
+            />
+            {state.resumeTarget !== null ? (
+              <Token label={`resuming ${state.resumeTarget}`} onRemove={() => agentActions.setResumeTarget(null)} />
+            ) : null}
+          </HStack>
+        }
+      />
+    </>
   )
 }
 
@@ -349,7 +415,6 @@ function AgentComposer({ steps, setSteps, onOpenSettings }: { steps: number; set
  */
 export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
-  const [steps, setSteps] = useState(30)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<AgentConfigForm | null>(null)
   const form = state.config
@@ -367,7 +432,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   const isEmpty = state.entries.length === 0
   const composer = (
     <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', padding: '0 16px 14px' }}>
-      <AgentComposer steps={steps} setSteps={setSteps} onOpenSettings={openSettings} />
+      <AgentComposer onOpenSettings={openSettings} />
     </Stack>
   )
 
@@ -380,10 +445,33 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
           resizable={{ defaultWidth: 252, minWidth: 208, maxWidth: 360 }}
           header={<SideNavHeading heading="Cell" subheading="agent on V8" icon={<Logo size={22} />} />}
           footer={
-            <SideNavSection title="System" isHeaderHidden>
-              <SideNavItem label="Model & settings" icon={Cog6ToothIcon} size="sm" onClick={openSettings} />
-              <SideNavItem label={`${form.provider}/${form.model || 'default'}`} icon={SparklesIcon} size="sm" onClick={openSettings} />
-            </SideNavSection>
+            <VStack gap={1}>
+              <SideNavSection title="Capabilities" isHeaderHidden>
+                <SideNavItem label="Skills" icon={SparklesIcon} size="sm" collapsible={{ defaultIsCollapsed: true }}>
+                  <VStack gap={0.5}>
+                    {state.skills.map((skill) => (
+                      <SideNavItem
+                        key={skill.name}
+                        label={skill.name}
+                        size="sm"
+                        onClick={() => agentActions.appendDraft(`Use the ${skill.name} skill to `)}
+                      />
+                    ))}
+                  </VStack>
+                </SideNavItem>
+                <SideNavItem label="Tools" icon={WrenchScrewdriverIcon} size="sm" collapsible={{ defaultIsCollapsed: true }}>
+                  <VStack gap={0.5}>
+                    {state.tools.map((tool) => (
+                      <SideNavItem key={tool} label={tool} size="sm" />
+                    ))}
+                  </VStack>
+                </SideNavItem>
+              </SideNavSection>
+              <Divider />
+              <SideNavSection title="System" isHeaderHidden>
+                <SideNavItem label="Model settings" icon={Cog6ToothIcon} size="sm" onClick={openSettings} />
+              </SideNavSection>
+            </VStack>
           }>
           <SideNavSection title="Main" isHeaderHidden>
             <SideNavItem label="New chat" icon={PlusIcon} size="sm" onClick={() => agentActions.clearChat()} />
@@ -409,23 +497,6 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
             )}
           </SideNavSection>
 
-          <SideNavSection title="Skills">
-            {state.skills.map((skill) => (
-              <SideNavItem
-                key={skill.name}
-                label={skill.name}
-                icon={SparklesIcon}
-                size="sm"
-                onClick={() => agentActions.appendDraft(`Use the ${skill.name} skill to `)}
-              />
-            ))}
-          </SideNavSection>
-
-          <SideNavSection title="Tools">
-            {state.tools.map((tool) => (
-              <SideNavItem key={tool} label={tool} size="sm" />
-            ))}
-          </SideNavSection>
         </SideNav>
       }>
       <Layout
@@ -515,6 +586,12 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                     <TextInput label="Base URL" value={settingsDraft.baseURL} onChange={(value) => setSettingsDraft({ ...settingsDraft, baseURL: value })} />
                   ) : null}
                   <TextInput label="API key" type="password" value={settingsDraft.apiKey} onChange={(value) => setSettingsDraft({ ...settingsDraft, apiKey: value })} description={settingsDraft.provider === 'meta' ? 'Required in the browser — there is no host auth file here.' : undefined} />
+                  <Selector
+                    label="Reasoning effort (meta)"
+                    value={settingsDraft.thinking}
+                    onChange={(value) => setSettingsDraft({ ...settingsDraft, thinking: value })}
+                    options={EFFORTS.map((effort) => ({ value: effort, label: effort === 'off' ? 'Off' : effort[0].toUpperCase() + effort.slice(1) }))}
+                  />
                   <Selector
                     label="Permission"
                     value={settingsDraft.permission}

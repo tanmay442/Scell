@@ -46,6 +46,8 @@ export interface AgentConfig {
   model: string
   /** 'full' (default): ask-tools run ungated; 'ask': per-call approval */
   permission?: 'full' | 'ask'
+  /** reasoning effort for the meta transport (minimal..xhigh) */
+  thinking?: string
   maxOutputTokens?: number
   /** compat provider only: API root, e.g. https://api.x.ai/v1 */
   baseURL?: string
@@ -405,6 +407,7 @@ async function callMeta(
   if (onProgress !== undefined) {
     return callMetaStream(config, state, tools, systemPrompt, maxOutput, onProgress, history)
   }
+  const reasoning = config.thinking !== undefined && config.thinking !== 'off' ? { reasoning: { effort: config.thinking } } : {}
   const requestBody = state.metaResponseId === null
     ? {
         model: config.model,
@@ -412,6 +415,7 @@ async function callMeta(
         tools,
         tool_choice: 'auto',
         max_output_tokens: maxOutput,
+        ...reasoning,
       }
     : {
         model: config.model,
@@ -420,6 +424,7 @@ async function callMeta(
         tools,
         tool_choice: 'auto',
         max_output_tokens: maxOutput,
+        ...reasoning,
       }
   const response = await fetchWithRetry(META_URL, {
     method: 'POST',
@@ -447,6 +452,7 @@ async function callMetaStream(
   onProgress: (line: string) => void,
   history?: MetaHistoryTurn[],
 ): Promise<ModelTurn | { error: string }> {
+  const reasoning = config.thinking !== undefined && config.thinking !== 'off' ? { reasoning: { effort: config.thinking } } : {}
   const requestBody =
     state.metaResponseId === null
       ? {
@@ -456,6 +462,7 @@ async function callMetaStream(
           tools,
           tool_choice: 'auto',
           max_output_tokens: maxOutput,
+          ...reasoning,
         }
       : {
           model: config.model,
@@ -465,6 +472,7 @@ async function callMetaStream(
           tools,
           tool_choice: 'auto',
           max_output_tokens: maxOutput,
+          ...reasoning,
         }
   const response = await fetchWithRetry(META_URL, {
     method: 'POST',

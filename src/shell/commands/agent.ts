@@ -132,6 +132,7 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
       baseURL?: string
       max_output_tokens?: number
       permission?: string
+      thinking?: string
     }
     if (parsed.provider !== undefined && !(KNOWN_PROVIDERS as readonly string[]).includes(parsed.provider)) {
       return { error: `cell agent: unknown provider '${parsed.provider}' (use meta, anthropic, openai or compat)\n` }
@@ -167,6 +168,7 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
         // permission defaults to full: 'ask' tools run without a gate
         // unless the user explicitly chose per-call approval
         permission: parsed.permission === 'ask' ? 'ask' : 'full',
+        ...(typeof parsed.thinking === 'string' && parsed.thinking !== '' ? { thinking: parsed.thinking } : {}),
         ...(parsed.baseURL !== undefined ? { baseURL: parsed.baseURL } : {}),
         ...(maxOutput !== undefined ? { maxOutputTokens: maxOutput } : {}),
       },
@@ -203,6 +205,8 @@ export interface RunAgentOpts {
   approveTimeoutMs?: number
   /** cooperative stop: checked before every step and every tool call */
   signal?: AbortSignal
+  /** step budget override (UI passes Infinity — no upper limit) */
+  maxSteps?: number
   /** UI hooks (Agent chat): structured events alongside the text transcript */
   onToolResult?: (call: ToolCall, result: ToolResult) => void
   onContext?: (chars: number) => void
@@ -239,7 +243,7 @@ export async function generateSessionTitle(vfs: Vfs, id: string): Promise<string
 export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Promise<CommandResult> {
   const valueFlags = new Set(['--steps', '--max-steps', '-s', '--resume', '--session'])
   const words: string[] = []
-  let maxSteps = DEFAULT_MAX_STEPS
+  let maxSteps = opts.maxSteps ?? DEFAULT_MAX_STEPS
   let resumeId: string | null = null
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]

@@ -28,6 +28,7 @@ export interface AgentConfigForm {
   apiKey: string
   baseURL: string
   permission: string
+  thinking: string
 }
 
 export interface SessionInfo {
@@ -55,7 +56,7 @@ export interface AgentSnapshot {
 
 const CONFIG_PATH = '/home/user/.cell/agent.json'
 const HOME = '/home/user'
-const EMPTY_FORM: AgentConfigForm = { provider: 'meta', model: 'muse-spark-1.3-contributor', apiKey: '', baseURL: '', permission: 'full' }
+const EMPTY_FORM: AgentConfigForm = { provider: 'meta', model: 'muse-spark-1.3-contributor', apiKey: '', baseURL: '', permission: 'full', thinking: 'xhigh' }
 
 let entryId = 0
 let snapshot: AgentSnapshot = {
@@ -133,6 +134,7 @@ function loadConfigForm(): AgentConfigForm {
       apiKey: parsed.apiKey ?? '',
       baseURL: parsed.baseURL ?? '',
       permission: parsed.permission ?? 'full',
+      thinking: parsed.thinking ?? 'xhigh',
     }
   } catch {
     return EMPTY_FORM
@@ -191,7 +193,7 @@ export const agentActions = {
 
   saveConfig(): void {
     const form = snapshot.config
-    const data: Record<string, string> = { provider: form.provider, permission: form.permission }
+    const data: Record<string, string> = { provider: form.provider, permission: form.permission, thinking: form.thinking }
     if (form.model.trim() !== '') data.model = form.model.trim()
     if (form.apiKey.trim() !== '') data.apiKey = form.apiKey.trim()
     if (form.provider === 'compat' && form.baseURL.trim() !== '') data.baseURL = form.baseURL.trim()
@@ -226,7 +228,7 @@ export const agentActions = {
     cancelApprovals()
   },
 
-  async run(prompt: string, steps: number): Promise<void> {
+  async run(prompt: string): Promise<void> {
     const text = prompt.trim()
     if (snapshot.running || text === '') return
     const resumeId = snapshot.resumeTarget
@@ -240,15 +242,14 @@ export const agentActions = {
     try {
       const shell = createShell(vfs, { protected: true, approve })
       const jobShell = createShell(vfs, { protected: true, approve })
-      const args = resumeId !== null
-        ? ['--resume', resumeId, '--steps', String(steps), text]
-        : ['--steps', String(steps), text]
+      const args = resumeId !== null ? ['--resume', resumeId, text] : [text]
       const result = await runAgent(vfs, args, {
         cwd,
         shell,
         jobShell,
         approve,
         signal: abortController.signal,
+        maxSteps: Number.POSITIVE_INFINITY,
         onSession: (id) => set({ sessionId: id }),
         onContext: (chars) => set({ contextChars: chars }),
         onToolResult: (call, toolResult) => {
