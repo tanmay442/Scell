@@ -58,10 +58,10 @@ export default function TerminalPanel() {
       cursorBlink: true,
       scrollback: 10000,
       theme: {
-        background: '#1e1e1e',
-        foreground: '#cccccc',
-        cursor: '#cccccc',
-        selectionBackground: '#264f78',
+        background: '#000000',
+        foreground: '#ECECEC',
+        cursor: '#ECECEC',
+        selectionBackground: '#285A48',
       },
     })
     const fit = new FitAddon()

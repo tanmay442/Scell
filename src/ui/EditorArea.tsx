@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Binary, Hexagon, X } from 'lucide-react'
+import { Binary, X } from 'lucide-react'
+import { Logo } from './Logo'
 import { platform } from '../platform'
 import { workspaceActions, useWorkspace } from './workspace-store'
 import { FileIcon } from './file-icon'
@@ -184,7 +185,7 @@ function Welcome() {
   return (
     <div className="welcome">
       <div className="welcome-mark">
-        <Hexagon size={44} className="cell-mark" strokeWidth={1.6} />
+        <Logo size={48} />
         <h1>Cell</h1>
         <p className="welcome-sub">A dev environment that lives entirely in this browser tab.</p>
       </div>

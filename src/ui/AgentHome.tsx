@@ -26,6 +26,7 @@ import { Selector } from '@astryxdesign/core/Selector'
 import { ProgressBar } from '@astryxdesign/core/ProgressBar'
 import { Token } from '@astryxdesign/core/Token'
 import {
+  MicrophoneIcon,
   PlusIcon,
   ChatBubbleLeftRightIcon,
   CodeBracketIcon,
@@ -163,6 +164,82 @@ const Transcript = memo(function Transcript({ entries, running }: { entries: rea
   )
 })
 
+function ContextRing({ chars }: { chars: number }) {
+  const ratio = Math.min(1, chars / COMPACT_AT_CHARS)
+  const radius = 9
+  const circumference = 2 * Math.PI * radius
+  return (
+    <span title={`~${Math.round(chars / 4).toLocaleString()} tokens of context — auto-compacts at ~${Math.round(COMPACT_AT_CHARS / 4000)}k`} style={{ display: 'inline-flex' }}>
+      <svg width="24" height="24" viewBox="0 0 24 24" role="img" aria-label="Context usage">
+        <circle cx="12" cy="12" r={radius} fill="none" stroke="#2A2A2A" strokeWidth="2.5" />
+        <circle
+          cx="12"
+          cy="12"
+          r={radius}
+          fill="none"
+          stroke="#35805F"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeDasharray={`${circumference * ratio} ${circumference}`}
+          transform="rotate(-90 12 12)"
+        />
+      </svg>
+    </span>
+  )
+}
+
+function VoiceButton() {
+  const [listening, setListening] = useState(false)
+  const recognitionRef = useRef<{ stop: () => void } | null>(null)
+  const supported = typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)
+
+  const toggle = () => {
+    if (!supported) return
+    if (listening) {
+      recognitionRef.current?.stop()
+      setListening(false)
+      return
+    }
+    const Ctor = (window as unknown as { SpeechRecognition?: new () => never; webkitSpeechRecognition?: new () => never }).SpeechRecognition
+      ?? (window as unknown as { webkitSpeechRecognition?: new () => never }).webkitSpeechRecognition
+    if (!Ctor) return
+    const recognition = new Ctor() as unknown as {
+      lang: string
+      interimResults: boolean
+      continuous: boolean
+      onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }> & { isFinal?: boolean }> }) => void) | null
+      onend: (() => void) | null
+      onerror: (() => void) | null
+      start: () => void
+      stop: () => void
+    }
+    recognition.lang = 'en-US'
+    recognition.interimResults = false
+    recognition.continuous = false
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results).map((result) => result[0]?.transcript ?? '').join(' ').trim()
+      if (transcript !== '') agentActions.appendDraft(transcript)
+    }
+    recognition.onend = () => setListening(false)
+    recognition.onerror = () => setListening(false)
+    recognitionRef.current = recognition
+    setListening(true)
+    recognition.start()
+  }
+
+  return (
+    <Button
+      label={listening ? 'Stop voice input' : 'Voice input'}
+      variant="ghost"
+      size="sm"
+      isIconOnly
+      isDisabled={!supported}
+      icon={<MicrophoneIcon width={16} style={listening ? { color: '#E5534B' } : undefined} />}
+      onClick={toggle}
+    />
+  )
+}
+
 function AgentComposer({ steps, setSteps, onOpenSettings }: { steps: number; setSteps: (n: number) => void; onOpenSettings: () => void }) {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
   const form = state.config
@@ -186,12 +263,11 @@ function AgentComposer({ steps, setSteps, onOpenSettings }: { steps: number; set
         state.contextChars > 0 ? (
           <HStack gap={2} vAlign="center">
             <Text type="supporting" color="secondary">~{contextTokens.toLocaleString()} tok</Text>
-            <Stack style={{ width: 90 }}>
-              <ProgressBar label="Context used before auto-compaction" isLabelHidden value={state.contextChars} max={COMPACT_AT_CHARS} />
-            </Stack>
+            <ContextRing chars={state.contextChars} />
           </HStack>
         ) : undefined
       }
+      sendActions={<VoiceButton />}
       footerActions={
         <HStack gap={2} vAlign="center">
           <DropdownMenu
@@ -240,7 +316,11 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   }
 
   const isEmpty = state.entries.length === 0
-  const composer = <AgentComposer steps={steps} setSteps={setSteps} onOpenSettings={openSettings} />
+  const composer = (
+    <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', padding: '0 16px 14px' }}>
+      <AgentComposer steps={steps} setSteps={setSteps} onOpenSettings={openSettings} />
+    </Stack>
+  )
 
   return (
     <AppShell
@@ -333,9 +413,12 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
               </Stack>
             ) : (
               <ChatLayout density="compact" style={fill} composer={composer}>
-                <ChatMessageList isStreaming={state.running} style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%' }}>
-                  <Transcript entries={state.entries} running={state.running} />
+                <ChatMessageList isStreaming={state.running}>
+                  <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', minWidth: 0, padding: '8px 16px 0' }}>
+                    <Transcript entries={state.entries} running={state.running} />
+                  </Stack>
                   {state.pendingSummary !== null ? (
+                    <Stack style={{ maxWidth: CONTENT_WIDTH, marginInline: 'auto', width: '100%', padding: '0 16px' }}>
                     <ChatMessage sender="assistant">
                       <Card variant="muted" padding={3} maxWidth={560}>
                         <VStack gap={2}>
@@ -351,6 +434,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                         </VStack>
                       </Card>
                     </ChatMessage>
+                    </Stack>
                   ) : null}
                 </ChatMessageList>
               </ChatLayout>
@@ -359,7 +443,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
         }
       />
 
-      <Dialog isOpen={settingsOpen} onOpenChange={setSettingsOpen} purpose="form" width={520} padding={0}>
+      <Dialog isOpen={settingsOpen} onOpenChange={setSettingsOpen} purpose="form" width={520}>
         <Layout
           header={<DialogHeader title="Model & settings" subtitle="Saved to ~/.cell/agent.json" hasDivider onOpenChange={setSettingsOpen} />}
           content={
