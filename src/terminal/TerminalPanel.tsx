@@ -6,6 +6,7 @@ import '@xterm/xterm/css/xterm.css'
 import { platform } from '../platform'
 import { createShell, type Shell } from '../shell/shell'
 import type { ToolCall } from '../shell/commands/agent-tools'
+import { SYS_PREFIXES } from '../shell/vfs-fs'
 import { vfsPath } from '../vfs/types'
 
 const MAX_HISTORY = 200
@@ -79,6 +80,8 @@ export default function TerminalPanel() {
     const approvalQueue: { summary: string; resolve: (allowed: boolean) => void }[] = []
     const summarizeCall = (call: ToolCall): string => {
       if (call.name === 'bash' || call.name === 'job_start') return String(call.input.command ?? '')
+      if (call.name === 'write') return `${call.input.path} — ${String(call.input.content ?? '').slice(0, 200)}`
+      if (call.name === 'edit') return `${call.input.path} — replace ${String(call.input.oldText ?? '').slice(0, 80)}…`
       if (call.input.path !== undefined) return String(call.input.path)
       return JSON.stringify(call.input).slice(0, 140)
     }
@@ -96,7 +99,8 @@ export default function TerminalPanel() {
       if (approvalQueue.length > 0) showApproval()
       else {
         liveSuspended = false
-        term.write('\r\n')
+        if (running) term.write('\r\n')
+        else redrawLine(line)
       }
     }
     const askApproval = (call: ToolCall): Promise<boolean> =>
@@ -139,10 +143,16 @@ export default function TerminalPanel() {
     // heredoc continuation (PS2): `cat > f <<EOF` collects lines until the
     // delimiter, then runs the whole thing as one script — like a real
     // terminal, where each interactive line is parsed in order
-    let heredoc: { delim: string; matched: string; head: string; lines: string[] } | null = null
+    let heredoc: { delim: string; head: string; lines: string[] } | null = null
     let previousCwd: string | null = null
 
-    const runLine = async (cmd: string, fromHeredoc = false) => {
+    let runChain: Promise<void> = Promise.resolve()
+    const runLine = (cmd: string, fromHeredoc = false): Promise<void> => {
+      const task = runChain.then(() => runLineInner(cmd, fromHeredoc))
+      runChain = task.catch(() => {})
+      return task
+    }
+    const runLineInner = async (cmd: string, fromHeredoc = false) => {
       if (heredoc !== null) {
         if (cmd.trim() === heredoc.delim) {
           // keep the head exactly as typed: a quoted delimiter (<<'EOF')
@@ -151,7 +161,7 @@ export default function TerminalPanel() {
           // heredocs fine (bash-audit pins it); close with the delimiter.
           const script = [heredoc.head, ...heredoc.lines, heredoc.delim].join('\n')
           heredoc = null
-          await runLine(script, true)
+          await runLineInner(script, true)
         } else {
           heredoc.lines.push(cmd)
           term.write('\r\n')
@@ -228,7 +238,7 @@ export default function TerminalPanel() {
         ? null
         : /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(trimmed.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, (m) => ' '.repeat(m.length)))
       if (heredocMatch !== null && !heredocMatch[0].includes('<<<')) {
-        heredoc = { delim: heredocMatch[2], matched: heredocMatch[0], head: cmd, lines: [] }
+        heredoc = { delim: heredocMatch[2], head: cmd, lines: [] }
         term.write('\r\n')
         printPrompt()
         return
@@ -269,11 +279,11 @@ export default function TerminalPanel() {
           if (finished) return
           liveLabel = line
           renderLive()
-        }, trimmed.startsWith('cell agent') ? { timeoutMs: 600_000 } : undefined)
+        }, /(^|&&|\|\||;)\s*cell\s+agent\b/.test(trimmed) ? { timeoutMs: 600_000 } : undefined)
         clearLive()
         // compound commands can move the shell (cd x && build): the dump
         // epilogue reports the final cwd — sync the prompt from it
-        if (result.cwd !== undefined && result.cwd !== cwd && vfs.isDir(result.cwd)) {
+        if (result.cwd !== undefined && result.cwd !== cwd && (vfs.isDir(result.cwd) || SYS_PREFIXES.some((prefix) => result.cwd === prefix || result.cwd!.startsWith(`${prefix}/`)))) {
           previousCwd = cwd
           cwd = result.cwd
           bus.emit('terminal:cwd', { cwd })
@@ -303,9 +313,13 @@ export default function TerminalPanel() {
     }
 
     const handleData = (data: string) => {
-      // approval prompt owns the keyboard while it is open
+      // approval prompt owns the keyboard while it is open — checked
+      // per character, so a pasted `y\nls\n` settles the approval and
+      // the remainder flows into normal line handling
       if (approvalQueue.length > 0) {
-        for (const ch of data) {
+        let index = 0
+        for (; index < data.length; index++) {
+          const ch = data[index]
           if (ch === '\r' || ch === '\n') {
             const answer = approvalAnswer.trim().toLowerCase()
             settleApproval(answer === 'y' || answer === 'yes')
@@ -320,7 +334,15 @@ export default function TerminalPanel() {
             approvalAnswer += ch
             term.write(ch)
           }
+          if (approvalQueue.length === 0) {
+            index++
+            break
+          }
         }
+        const rest = data.slice(index)
+        if (rest === '') return
+        if (approvalQueue.length > 0) return
+        handleData(rest)
         return
       }
       // while a command runs, keystrokes are buffered (capped) and
@@ -415,6 +437,7 @@ export default function TerminalPanel() {
     observer.observe(host)
 
     teardown = () => {
+      for (const entry of approvalQueue.splice(0)) entry.resolve(false)
       observer.disconnect()
       term.dispose()
     }

@@ -44,3 +44,13 @@ describe('wrapProtectedVfs', () => {
     expect(vfs.read('/home/user/project/new.txt')).toBe('ok')
   })
 })
+
+describe('write-protected (readable) paths', () => {
+  it('.bashrc reads pass, writes throw', () => {
+    const vfs = seeded()
+    vfs.write('/home/user/.bashrc', 'export X=1\n')
+    const wrapped = wrapProtectedVfs(vfs)
+    expect(wrapped.read('/home/user/.bashrc')).toContain('export X=1')
+    expect(() => wrapped.write('/home/user/.bashrc', 'cat /home/user/.cell/agent.json\n')).toThrow(/EACCES/)
+  })
+})

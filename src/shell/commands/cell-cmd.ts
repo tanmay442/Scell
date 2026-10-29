@@ -4,6 +4,7 @@ import { looksLikeText } from './git'
 import { s3Fetch, type S3Config } from './sigv4'
 import { runAgent } from './agent'
 import { vfsPath } from '../../vfs/types'
+import { isProtectedPath } from '../../vfs/protected-paths'
 import { tarFiles, untar } from './untar'
 import type { CommandResult, ShellLike } from './npm'
 import { platform } from '../../platform'
@@ -130,9 +131,18 @@ export async function cellCommand(vfs: Vfs, args: string[], opts: { cwd: string;
     return runAgent(vfs, args.slice(1), { cwd: opts.cwd, shell: opts.shell, ...(opts.jobShell ? { jobShell: opts.jobShell } : {}), onProgress: opts.onProgress, ...(opts.approve ? { approve: opts.approve } : {}) })
   }
 
+  // protected callers: snapshots, storage status, and S3 listing are
+  // human actions; preview stays available for project dirs only
+  if (opts.protectedCaller && (sub === 'status' || sub === 'list' || sub === 'ls')) {
+    return { stdout: '', stderr: `cell ${sub}: refused from agent shells\n`, exitCode: 1 }
+  }
+
   if (sub === 'preview') {
     const positional = args.slice(1).filter((a) => !a.startsWith('-'))
     const dir = positional[0] !== undefined ? vfsPath.normalize(positional[0].replace(/^~/, '/home/user').startsWith('/') ? positional[0].replace(/^~/, '/home/user') : `${opts.cwd}/${positional[0]}`) : opts.cwd
+    if (opts.protectedCaller && isProtectedPath(dir)) {
+      return { stdout: '', stderr: 'cell preview: protected paths are not previewable from agent shells\n', exitCode: 1 }
+    }
     if (!vfs.isFile(vfsPath.join(dir, 'index.html'))) {
       return { stdout: '', stderr: `cell preview: no index.html in ${dir}\n`, exitCode: 1 }
     }

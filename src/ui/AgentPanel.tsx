@@ -36,7 +36,11 @@ function loadForm(): AgentConfigForm {
 }
 
 function summarizeCall(call: ToolCall): string {
+  // the approver must SEE what a call does, not just where: write/edit
+  // carry a content preview, custom tools their interpolated command
   if (call.name === 'bash' || call.name === 'job_start') return String(call.input.command ?? '')
+  if (call.name === 'write') return `${call.input.path} — ${String(call.input.content ?? '').slice(0, 200)}`
+  if (call.name === 'edit') return `${call.input.path} — replace ${String(call.input.oldText ?? '').slice(0, 80)}…`
   if (call.input.path !== undefined) return `${call.input.path}`
   return JSON.stringify(call.input).slice(0, 140)
 }
@@ -64,6 +68,10 @@ export function AgentPanel() {
   }, [])
 
   useEffect(refreshSessions, [refreshSessions])
+  // unmounting mid-approval must not strand the run's promise forever
+  useEffect(() => () => {
+    for (const entry of approvalQueueRef.current.splice(0)) entry.resolve(false)
+  }, [])
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [log])
@@ -82,7 +90,12 @@ export function AgentPanel() {
     })
   }, [])
 
+  const lastDecisionRef = useRef(0)
   const decide = (allowed: boolean) => {
+    // a fast double-click must not approve the NEXT queued call unseen
+    const now = Date.now()
+    if (now - lastDecisionRef.current < 350) return
+    lastDecisionRef.current = now
     const head = approvalQueueRef.current.shift()
     head?.resolve(allowed)
     const next = approvalQueueRef.current[0]
@@ -112,8 +125,10 @@ export function AgentPanel() {
     const { vfs } = platform()
     const cwd = getActivePath() ?? HOME
     try {
-      const shell = createShell(vfs, { protected: true })
-      const jobShell = createShell(vfs, { protected: true })
+      // shells carry the same gate, so a nested `cell agent` or an
+      // npm script invoking one cannot escape per-call review
+      const shell = createShell(vfs, { protected: true, approve })
+      const jobShell = createShell(vfs, { protected: true, approve })
       const args = resumeId !== null
         ? ['--resume', resumeId, '--steps', String(steps), text]
         : ['--steps', String(steps), text]

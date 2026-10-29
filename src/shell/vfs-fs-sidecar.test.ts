@@ -46,3 +46,33 @@ describe('shared symlink/mode sidecar (P1-5)', () => {
     expect((await fs.stat('/home/user/real.txt')).mode).not.toBe(0o755)
   })
 })
+
+describe('sidecar reload + shape', () => {
+  it('an external fs-meta rewrite reloads the store on the same Vfs', async () => {
+    const vfs = createVfs()
+    vfs.write('/home/user/a.txt', 'a')
+    const fs = new VfsBackedFs(vfs)
+    await fs.symlink('/home/user/a.txt', '/home/user/linkA')
+    // external reset (cell load shape): meta names linkB only
+    vfs.write('/home/user/.cell/fs-meta.json', JSON.stringify({ symlinks: { '/home/user/linkB': '/home/user/a.txt' }, modes: {} }))
+    expect(await fs.readlink('/home/user/linkB')).toBe('/home/user/a.txt')
+    await expect(fs.readlink('/home/user/linkA')).rejects.toThrow()
+  })
+
+  it('corrupt-shape meta loads no bogus links', async () => {
+    const vfs = createVfs()
+    vfs.write('/home/user/.cell/fs-meta.json', '{"symlinks": "oops", "modes": {}}')
+    const fs = new VfsBackedFs(vfs)
+    await expect(fs.readlink('/home/user/0')).rejects.toThrow()
+  })
+
+  it('cross-zone mv moves a symlink as a symlink', async () => {
+    const vfs = createVfs()
+    vfs.write('/home/user/real.txt', 'data')
+    const fs = new VfsBackedFs(vfs)
+    await fs.symlink('/home/user/real.txt', '/tmp/lnk')
+    await fs.mv('/tmp/lnk', '/home/user/moved-lnk')
+    expect(await fs.readlink('/home/user/moved-lnk')).toBe('/home/user/real.txt')
+    await expect(fs.readlink('/tmp/lnk')).rejects.toThrow()
+  })
+})

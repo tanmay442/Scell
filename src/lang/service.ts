@@ -1,4 +1,5 @@
 import { platform } from '../platform'
+import { isProtectedPath } from '../vfs/protected-paths'
 import { diagnosticsStore } from '../diagnostics-store'
 import { mapDiagnostics } from './map'
 import type { TsRustDiagnostic } from './types'
@@ -64,6 +65,8 @@ class LanguageService {
     // node_modules and .git are never typechecked — shipping a freshly
     // installed 100MB CLI to the checker on every keystroke kills the tab
     for (const path of this.vfs.listAllFiles()) {
+      // ~/.cell never reaches the checker (keys, sessions, agent config)
+      if (isProtectedPath(path)) continue
       if (path.includes('/node_modules/') || path.includes('/.git/')) continue
       const text = this.vfs.read(path)
       if (text !== null) files[`/project${path}`] = text

@@ -10,6 +10,7 @@ import type {
   RmOptions,
 } from 'just-bash'
 import type { Vfs } from '../vfs/types'
+import { isProtectedPath, isWriteProtectedPath } from '../vfs/protected-paths'
 
 interface ReadFileOptions {
   encoding?: BufferEncoding | null
@@ -26,7 +27,7 @@ const DIR_MODE = 0o755
  * Paths that live in the volatile system zone instead of the VFS: temp
  * files and device nodes have no business surviving a reload.
  */
-const SYS_PREFIXES = ['/tmp', '/dev', '/proc', '/etc', '/var', '/usr', '/bin', '/lib', '/opt', '/srv', '/mnt', '/media', '/run', '/sys', '/root']
+export const SYS_PREFIXES = ['/tmp', '/dev', '/proc', '/etc', '/var', '/usr', '/bin', '/lib', '/opt', '/srv', '/mnt', '/media', '/run', '/sys', '/root']
 
 interface Dirent {
   name: string
@@ -97,7 +98,9 @@ function sidecarFor(metaVfs: Vfs): SharedSidecar {
     const raw = metaVfs.read(FS_META_PATH)
     if (raw !== null) {
       const parsed = JSON.parse(raw) as { symlinks?: Record<string, string>; modes?: Record<string, number> }
-      for (const [path, target] of Object.entries(parsed.symlinks ?? {})) symlinks.set(path, target)
+      for (const [path, target] of Object.entries(parsed.symlinks ?? {})) {
+        if (typeof target === 'string') symlinks.set(path, target)
+      }
       for (const [path, mode] of Object.entries(parsed.modes ?? {})) if (typeof mode === 'number') modes.set(path, mode)
     }
   } catch {
@@ -140,8 +143,40 @@ function sidecarFor(metaVfs: Vfs): SharedSidecar {
       if (changed) store.save()
     },
   }
+  let selfSaving = false
+  const reload = () => {
+    symlinks.clear()
+    modes.clear()
+    try {
+      const raw = metaVfs.read(FS_META_PATH)
+      if (raw !== null) {
+        const parsed = JSON.parse(raw) as { symlinks?: Record<string, string>; modes?: Record<string, number> }
+        for (const [path, target] of Object.entries(parsed.symlinks ?? {})) {
+          if (typeof target === 'string') symlinks.set(path, target)
+        }
+        for (const [path, mode] of Object.entries(parsed.modes ?? {})) if (typeof mode === 'number') modes.set(path, mode)
+      }
+    } catch {
+      // corrupt meta file: empty sidecar
+    }
+  }
+  const innerSave = store.save
+  store.save = () => {
+    selfSaving = true
+    try { innerSave() } finally { selfSaving = false }
+  }
   metaVfs.watch((event) => {
-    if (event.path === FS_META_PATH) return
+    // external rewrite/reset of the meta file (cell load, editor) and
+    // whole-tree restore (single 'write /' event): reload from disk
+    // instead of resurrecting stale links on the next save
+    if (event.path === FS_META_PATH) {
+      if (!selfSaving) reload()
+      return
+    }
+    if (event.kind === 'write' && event.path === '/') {
+      reload()
+      return
+    }
     if (event.kind === 'delete') store.prune(event.path)
     if (event.kind === 'rename' && event.to !== undefined) store.remap(event.path, event.to)
   })
@@ -208,13 +243,27 @@ export class VfsBackedFs implements IFileSystem {
   private mtimes = new Map<string, Date>()
   private sidecar: SharedSidecar
 
+  /** this fs sits on a protected (agent) Vfs: sidecar writes into
+   * protected paths are refused, and protected link names stay hidden */
+  private fsProtected: boolean
+
   constructor(private vfs: Vfs, metaVfs?: Vfs) {
     // symlink/mode state is shared by every shell on the same Vfs and
     // persisted to ~/.cell/fs-meta.json (see sidecarFor) — a chmod in
     // the terminal is visible to an agent-panel run, and both survive
     // reload. metaVfs is the raw Vfs for that persistence file (a
-    // protected shell's wrapped Vfs cannot write under ~/.cell).
-    this.sidecar = sidecarFor(metaVfs ?? vfs)
+    // protected shell's wrapped Vfs cannot write under ~/.cell); when
+    // omitted, a wrapped Vfs is detected via its __cellRawVfs marker.
+    const markedRaw = (vfs as unknown as { __cellRawVfs?: Vfs }).__cellRawVfs
+    this.fsProtected = markedRaw !== undefined
+    this.sidecar = sidecarFor(metaVfs ?? markedRaw ?? vfs)
+  }
+
+  private guardSidecarWrite(path: string): void {
+    const p = normalize(path)
+    if (this.fsProtected && (isProtectedPath(p) || isWriteProtectedPath(p))) {
+      throw Object.assign(new Error(`EACCES: protected path ${p}`), { code: 'EACCES' })
+    }
   }
 
   private get symlinks(): Map<string, string> {
@@ -457,6 +506,7 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async createExclusive(path: string, options: CreateExclusiveOptions): Promise<void> {
+    this.guardSidecarWrite(path)
     if (await this.exists(path)) throw new Error(`EEXIST: '${path}' already exists`)
     if (options.directory) {
       await this.mkdir(path, { recursive: true })
@@ -464,6 +514,7 @@ export class VfsBackedFs implements IFileSystem {
       await this.writeFile(path, '')
     }
     this.modes.set(normalize(path), options.mode)
+    this.sidecar.save()
   }
 
   async readdir(path: string): Promise<string[]> {
@@ -509,6 +560,13 @@ export class VfsBackedFs implements IFileSystem {
   async rm(path: string, options?: RmOptions): Promise<void> {
     const z = this.locate(path)
     if (z.zone === 'devnull') return
+    // a symlink itself is removed even when its target is gone or
+    // protected (exists() follows the link and would lie)
+    if (this.symlinks.has(normalize(path))) {
+      this.symlinks.delete(normalize(path))
+      this.sidecar.save()
+      return
+    }
     if (!(await this.exists(path))) {
       if (options?.force) return
       throw new Error(`ENOENT: no such file or directory '${path}'`)
@@ -549,6 +607,7 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async mv(src: string, dest: string): Promise<void> {
+    this.guardSidecarWrite(dest)
     if (!(await this.exists(src))) throw new Error(`ENOENT: no such file or directory '${src}'`)
     if (await this.exists(dest)) await this.rm(dest, { recursive: true })
     const zSrc = this.locate(src)
@@ -563,7 +622,22 @@ export class VfsBackedFs implements IFileSystem {
       this.sidecar.remap(normalize(zSrc.vpath), normalize(zDest.vpath))
       return
     }
+    // cross-zone: a symlink moves as a symlink (key remap), and a
+    // file keeps its mode — cp+rm alone duplicates links and drops modes
+    this.guardSidecarWrite(dest)
+    const linkTarget = this.symlinks.get(normalize(src))
+    if (linkTarget !== undefined) {
+      this.symlinks.set(normalize(dest), linkTarget)
+      this.sidecar.save()
+      await this.rm(src, { recursive: true })
+      return
+    }
+    const srcMode = this.modes.get(normalize(src))
     await this.cp(src, dest, { recursive: true })
+    if (srcMode !== undefined) {
+      this.modes.set(normalize(dest), srcMode)
+      this.sidecar.save()
+    }
     await this.rm(src, { recursive: true })
   }
 
@@ -588,12 +662,14 @@ export class VfsBackedFs implements IFileSystem {
 
   async symlink(target: string, linkPath: string): Promise<void> {
     if (await this.exists(linkPath)) throw new Error(`EEXIST: '${linkPath}' already exists`)
+    this.guardSidecarWrite(linkPath)
     this.sysEnsureParents(linkPath)
     this.symlinks.set(normalize(linkPath), target)
     this.sidecar.save()
   }
 
   async link(existingPath: string, newPath: string): Promise<void> {
+    this.guardSidecarWrite(newPath)
     if (!(await this.exists(existingPath))) throw new Error(`ENOENT: no such file '${existingPath}'`)
     if (await this.exists(newPath)) throw new Error(`EEXIST: '${newPath}' already exists`)
     // On a text VFS a hard link is a copy; content stays identical on write
@@ -602,6 +678,9 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async readlink(path: string): Promise<string> {
+    if (this.fsProtected && isProtectedPath(normalize(path))) {
+      throw new Error(`EINVAL: not a symlink '${path}'`)
+    }
     const target = this.symlinks.get(normalize(path))
     if (target === undefined) throw new Error(`EINVAL: not a symlink '${path}'`)
     return target

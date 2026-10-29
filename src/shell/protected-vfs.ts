@@ -1,6 +1,6 @@
 import type { Vfs, VfsFileMap } from '../vfs/types'
 import { vfsPath } from '../vfs/types'
-import { PROTECTED_PREFIX, isProtectedPath, isProtectedChild } from '../vfs/protected-paths'
+import { PROTECTED_PREFIX, isProtectedPath, isProtectedChild, isWriteProtectedPath } from '../vfs/protected-paths'
 
 /**
  * Capability wrapper: a Vfs that cannot see or touch ~/.cell.
@@ -30,10 +30,11 @@ export function wrapProtectedVfs(raw: Vfs): Vfs {
   const eacces = (path: string): Error => Object.assign(new Error(`EACCES: protected path ${path}`), { code: 'EACCES' })
 
   const guardWrite = (path: string): void => {
-    if (isProtectedPath(normalized(path))) throw eacces(normalized(path))
+    const p = normalized(path)
+    if (isProtectedPath(p) || isWriteProtectedPath(p)) throw eacces(p)
   }
 
-  return {
+  const wrapped: Vfs = {
     exists: (path) => !isProtectedPath(normalized(path)) && raw.exists(path),
     isFile: (path) => !isProtectedPath(normalized(path)) && raw.isFile(path),
     isDir: (path) => !isProtectedPath(normalized(path)) && raw.isDir(path),
@@ -51,20 +52,24 @@ export function wrapProtectedVfs(raw: Vfs): Vfs {
     mkdir: (path) => { guardWrite(path); raw.mkdir(path) },
     delete: (path) => { guardWrite(path); raw.delete(path) },
     rename: (from, to) => { guardWrite(from); guardWrite(to); raw.rename(from, to) },
-    listAllFiles: () => raw.listAllFiles().filter((path) => !isProtectedPath(path)),
+    listAllFiles: () => raw.listAllFiles().filter((path) => !isProtectedPath(normalized(path))),
     snapshot: () => {
       const all = raw.snapshot()
       const out: VfsFileMap = {}
       for (const [path, content] of Object.entries(all)) {
-        if (!isProtectedPath(path)) out[path] = content
+        if (!isProtectedPath(normalized(path))) out[path] = content
       }
       return out
     },
     restore: () => { throw eacces(PROTECTED_PREFIX) },
     watch: (cb) => raw.watch((event) => {
-      if (isProtectedPath(event.path)) return
-      if (event.to !== undefined && isProtectedPath(event.to)) return
+      if (isProtectedPath(normalized(event.path))) return
+      if (event.to !== undefined && isProtectedPath(normalized(event.to))) return
       cb(event)
     }),
   }
+  // marker so VfsBackedFs can find the raw Vfs (sidecar persistence)
+  // and know this shell is protected, without call-site plumbing
+  ;(wrapped as unknown as { __cellRawVfs: Vfs }).__cellRawVfs = raw
+  return wrapped
 }

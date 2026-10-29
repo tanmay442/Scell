@@ -676,7 +676,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // on PATH — that is what makes `npm dev` → `vercel dev` work for real.
   // The script shell seeds from the caller's session env like a real child.
   const scriptShell = (cwd: string, seed?: Map<string, string>): ShellLike =>
-    createShell(rawV, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : { ...sessionEnv }, ...(opts?.protected ? { protected: true } : {}) })
+    createShell(rawV, { extraBins: collectBins(v, projectRoot(v, cwd) ?? cwd), seedEnv: seed !== undefined ? shellEnvOf(seed) : { ...sessionEnv }, ...(opts?.protected ? { protected: true } : {}), ...(opts?.approve ? { approve: opts.approve } : {}) })
   register('npm', (args, { cwd, env, progress }) => npmCommand(v, args, { cwd, scriptShell, flavor: 'npm', registerLive, progress, env }))
   register('pnpm', (args, { cwd, env, progress }) => pnpmCommand(v, args, { cwd, scriptShell, registerLive, progress, env }))
   register('npx', (args, { cwd, progress }) => npx(v, args, { cwd, progress }))

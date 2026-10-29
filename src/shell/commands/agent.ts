@@ -191,6 +191,8 @@ export interface RunAgentOpts {
   jobShell?: ShellLike
   /** interactive approval gate (Agent panel): resolve true to run an 'ask' tool */
   approve?: (call: ToolCall) => Promise<boolean>
+  /** ms before a pending approval auto-denies (default 300s) */
+  approveTimeoutMs?: number
 }
 
 /** The agent loop. Returns the full transcript for the terminal. */
@@ -401,8 +403,10 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
       // the line is the audit trail for what the agent touched)
       const approval = approvalFor(entries, call.name)
       if (approval === 'ask' && opts.approve !== undefined) {
-        // interactive gate (Agent panel): the user decides per call
-        const allowed = await opts.approve(call)
+        // interactive gate (Agent panel): the user decides per call.
+        // Bounded: an abandoned prompt (closed panel, walked away)
+        // auto-denies instead of hanging the run forever.
+        const allowed = await withApprovalTimeout(opts.approve, call, opts.approveTimeoutMs ?? 300_000)
         transcript.push(redactSecrets(`❓ approval: ${call.name} ${summary} — ${allowed ? 'approved' : 'DENIED by user'}`))
         if (!allowed) {
           const denied: ToolResult = { id: call.id, content: 'denied by user — do not retry this exact call; ask or choose another approach', isError: true }
@@ -452,6 +456,27 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   transcript.push(`agent: reached the ${maxSteps}-step limit — continue with \`cell agent --resume ${id} "keep going"\``)
   persist(maxSteps)
   return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
+}
+
+/** Race an approval against its timeout; timeout resolves false. */
+async function withApprovalTimeout(
+  approve: (call: ToolCall) => Promise<boolean>,
+  call: ToolCall,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      approve(call),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
+  } catch {
+    return false
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
 }
 
 /** Rough context size in chars (~4 chars/token) across provider state. */

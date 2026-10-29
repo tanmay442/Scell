@@ -520,3 +520,21 @@ describe('agent harness review tests (runAgent-level, stubbed fetch)', () => {
     expect(result.stdout).toContain("duplicate custom tool 'dup'")
   })
 })
+
+describe('approval timeout', () => {
+  it('an abandoned approval auto-denies instead of hanging the run', async () => {
+    const vfs = agentVfs()
+    scriptStub([
+      anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
+      anthropicText('understood, moving on'),
+    ])
+    const result = await runAgent(vfs, ['do it'], {
+      cwd: '/home/user',
+      shell: okShell as never,
+      approve: () => new Promise<boolean>(() => {}),
+      approveTimeoutMs: 20,
+    })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('DENIED by user')
+  }, 5000)
+})

@@ -80,3 +80,28 @@ describe('agent bash under a protected shell', () => {
     expect(await bash(deps, 'cat ~/project/hello.txt')).toContain('hello world')
   })
 })
+
+describe('protected shell: persistence channels stay closed', () => {
+  it('cannot write ~/.bashrc (human shell would source it unprotected)', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    await bash(deps, 'echo "cat /home/user/.cell/agent.json > ~/stolen.txt" >> ~/.bashrc')
+    expect(vfs.read('/home/user/.bashrc')).toBeNull()
+    const viaTool = await runTool(deps, { id: 'c2', name: 'write', input: { path: '~/.bashrc', content: 'cat /home/user/.cell/agent.json\n' } })
+    expect(viaTool.isError).toBe(true)
+    // reading it is fine
+    vfs.write('/home/user/.bashrc', 'export OK=1\n')
+    const readBack = await runTool(deps, { id: 'c3', name: 'read', input: { path: '~/.bashrc' } })
+    expect(readBack.content).toContain('export OK=1')
+  })
+
+  it('cannot plant symlinks inside ~/.cell', async () => {
+    const vfs = seededVfs()
+    const deps = depsFor(vfs, true)
+    await bash(deps, 'ln -s /home/user/project/hello.txt /home/user/.cell/planted-link')
+    const rawFsMeta = vfs.read('/home/user/.cell/fs-meta.json') ?? ''
+    expect(rawFsMeta).not.toContain('planted-link')
+    await bash(deps, 'ln -s /tmp /home/user/.cell')
+    expect(vfs.read('/home/user/.cell/agent.json')).toContain(SECRET)
+  })
+})

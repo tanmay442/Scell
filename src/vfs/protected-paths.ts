@@ -14,6 +14,17 @@ export function isProtectedPath(normalizedAbsPath: string): boolean {
   return normalizedAbsPath === PROTECTED_PREFIX || normalizedAbsPath.startsWith(`${PROTECTED_PREFIX}/`)
 }
 
+/** Readable but never writable from agent contexts: files a shell
+ * auto-executes. ~/.bashrc is sourced by EVERY shell (including the
+ * human's unprotected terminal), so an agent-written .bashrc is a
+ * persistence + exfiltration channel even though reads are harmless. */
+export const WRITE_PROTECTED_PATHS = ['/home/user/.bashrc']
+
+/** True when an absolute, normalized path may be read but not written. */
+export function isWriteProtectedPath(normalizedAbsPath: string): boolean {
+  return WRITE_PROTECTED_PATHS.includes(normalizedAbsPath)
+}
+
 /** True when a child name inside a directory listing must be hidden. */
 export function isProtectedChild(parentNormalized: string, childName: string): boolean {
   return isProtectedPath(parentNormalized === '/' ? `/${childName}` : `${parentNormalized}/${childName}`)

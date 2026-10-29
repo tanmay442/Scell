@@ -1,6 +1,6 @@
 import type { Vfs } from '../../vfs/types'
 import { vfsPath } from '../../vfs/types'
-import { isProtectedPath } from '../../vfs/protected-paths'
+import { isProtectedPath, isWriteProtectedPath } from '../../vfs/protected-paths'
 import { redactSecrets } from './agent-redact'
 import type { ShellLike } from './npm'
 
@@ -83,6 +83,13 @@ const TOOLS_DIR = '/home/user/.cell/tools'
  * src/vfs/protected-paths.ts for the policy. */
 export function isDeniedPath(absPath: string): boolean {
   return isProtectedPath(vfsPath.normalize(absPath))
+}
+
+/** Write/edit additionally refuse shell-auto-executed files (~/.bashrc):
+ * readable, never writable by the agent. */
+export function isWriteDeniedPath(absPath: string): boolean {
+  const normalizedPath = vfsPath.normalize(absPath)
+  return isProtectedPath(normalizedPath) || isWriteProtectedPath(normalizedPath)
 }
 
 /** Bash patterns that error instead of running (P0-4): destructive or
@@ -368,7 +375,9 @@ export class JobManager {
     const append = (text: string) => {
       // redact before the log file: it is a plain VFS file that ships in
       // cell save snapshots, unlike transcript lines it is not re-redacted
-      record.output = truncateWithReceipt(`${record.output}${redactSecrets(text)}`, JOB_MAX_OUTPUT)
+      // redact the JOINED buffer: per-chunk redaction lets a secret
+      // split across two progress appends survive in the on-disk log
+      record.output = redactSecrets(truncateWithReceipt(`${record.output}${text}`, JOB_MAX_OUTPUT))
       try { this.vfs.write(logPath, record.output) } catch { /* log is best-effort */ }
     }
     append(`$ ${command}\n`)
@@ -497,7 +506,7 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     if (call.name === 'edit') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
-      if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not writable (${path})`, isError: true }
+      if (isWriteDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not writable (${path})`, isError: true }
       const content = vfs.read(path)
       if (content === null) return { id: call.id, content: `no such file (or binary): ${path}`, isError: true }
       const oldText = String(call.input.oldText ?? '')
@@ -511,7 +520,7 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     if (call.name === 'write') {
       const path = expand(String(call.input.path ?? ''), deps.cwd)
-      if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not writable (${path})`, isError: true }
+      if (isWriteDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not writable (${path})`, isError: true }
       vfs.write(path, String(call.input.content ?? ''))
       return { id: call.id, content: `wrote ${path}` }
     }
