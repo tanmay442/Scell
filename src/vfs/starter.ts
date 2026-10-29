@@ -83,6 +83,7 @@ export { count, shout }
 `,
   [`${HOME}/.cell/commands/commit.md`]: `Review git status and git diff, stage the files that belong together, and commit with a clear imperative message. Verify with git log --oneline -3.\n`,
   [`${HOME}/.cell/commands/preview.md`]: `Run cell preview for this project and verify it bundles and renders. Report bundler errors and fix missing installs.\n`,
+  [`${HOME}/.cell/agent.json`]: `{ "provider": "meta", "model": "muse-spark-1.3-contributor" }\n`,
   [`${HOME}/.gitconfig`]: `[user]
 	name = Cell User
 	email = user@cell.local
@@ -206,6 +207,9 @@ export function migrateStarter(vfs: Vfs): void {
   }
   if (vfs.read(`${HOME}/.profile`) === null) {
     vfs.write(`${HOME}/.profile`, FILES[`${HOME}/.profile`])
+  }
+  if (vfs.read(`${HOME}/.cell/agent.json`) === null) {
+    vfs.write(`${HOME}/.cell/agent.json`, FILES[`${HOME}/.cell/agent.json`])
   }
   if (vfs.read(`${HOME}/.bashrc`) === null) {
     vfs.write(`${HOME}/.bashrc`, FILES[`${HOME}/.bashrc`])

@@ -177,7 +177,7 @@ export function AgentPanel() {
             <input className="agent-input" value={form.baseURL} onChange={(e) => setForm({ ...form, baseURL: e.target.value })} placeholder="https://api.x.ai/v1" />
           </>
         ) : null}
-        <label className="agent-label">API key {form.provider === 'meta' ? '(blank = machine auth file)' : ''}</label>
+        <label className="agent-label">API key {form.provider === 'meta' ? '(required in the browser — no host auth file here)' : ''}</label>
         <input className="agent-input" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-…" />
         <button className="agent-btn" onClick={saveConfig}><Save size={13} /> Save config</button>
         {savedNote !== '' ? <div className="agent-note">{savedNote}</div> : null}

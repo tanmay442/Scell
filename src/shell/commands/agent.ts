@@ -108,16 +108,19 @@ function readConfig(vfs: Vfs): { config: AgentConfig } | { error: string } {
   if (raw === null) {
     return {
       error: [
-        'cell agent: no model configured — create ~/.cell/agent.json:',
+        'cell agent: no model configured — easiest is the Agent panel (sidebar):',
+        'pick a provider, paste your key, Save config. Or create ~/.cell/agent.json:',
         '',
         '  {',
         '    "provider": "meta",',
+        '    "apiKey": "…",',
         '    "model": "muse-spark-1.3-contributor"',
         '  }',
         '',
-        'meta resolves its key from the machine auth file (no apiKey needed);',
-        'anthropic/openai need { "provider": "anthropic", "apiKey": "sk-…", "model": "…" }.',
-        'Anthropic calls send the browser-direct-access header, so no proxy is needed.',
+        'In the browser the key must be in the file (or the panel) — there is',
+        'no host filesystem here. Under Node/vitest, meta also resolves its',
+        'key from ~/.pi/agent/auth.json. anthropic/openai: same shape with',
+        'their provider/model names.',
       ].join('\n'),
     }
   }
