@@ -1,5 +1,6 @@
 import { Suspense, lazy, useState } from 'react'
 import { AgentHome } from './AgentHome'
+import { StatusDock } from './StatusDock'
 
 export type SidebarView = 'explorer' | 'git' | 'agent'
 
@@ -13,11 +14,17 @@ export function App() {
   const [appMode, setAppMode] = useState<'agent' | 'code'>('agent')
 
   if (appMode === 'agent') {
-    return <AgentHome onOpenWorkspace={() => setAppMode('code')} />
+    return (
+      <>
+        <AgentHome onOpenWorkspace={() => setAppMode('code')} />
+        <StatusDock onOpenWorkspace={() => setAppMode('code')} />
+      </>
+    )
   }
   return (
     <Suspense fallback={null}>
       <CodeShell onHome={() => setAppMode('agent')} />
+      <StatusDock />
     </Suspense>
   )
 }

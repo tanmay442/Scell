@@ -38,6 +38,7 @@ import {
   XMarkIcon,
 } from '@heroicons/react/24/outline'
 import { agentActions, agentStore, COMPACT_AT_CHARS, type AgentConfigForm, type ChatEntry } from './agent-store'
+import { platform } from '../platform'
 import { Logo } from './Logo'
 import SlicedWaves from './SlicedWaves'
 
@@ -109,6 +110,44 @@ function groupItems(entries: readonly ChatEntry[]): DisplayItem[] {
   return items
 }
 
+const visualFrame: CSSProperties = {
+  width: '100%',
+  height: 340,
+  border: '1px solid #2A2A2A',
+  borderRadius: 10,
+  background: '#FFFFFF',
+}
+
+/** Minimal interactive HTML visual: sandboxed iframe (scripts only,
+ * no same-origin access), from an artifact file or an html fence. */
+function HtmlVisual({ path, html }: { path?: string; html?: string }) {
+  const content = html ?? (path !== undefined ? (platform().vfs.read(path) ?? '') : '')
+  if (content === '') return null
+  return (
+    <Stack style={{ width: '100%' }}>
+      {path !== undefined ? (
+        <Text type="supporting" color="secondary" style={{ fontFamily: 'var(--mono, monospace)', fontSize: 11 }}>{path}</Text>
+      ) : null}
+      <iframe title={path ?? 'visual'} sandbox="allow-scripts" srcDoc={content} style={visualFrame} />
+    </Stack>
+  )
+}
+
+/** Split assistant text into markdown and ```html fenced parts. */
+function splitHtmlBlocks(text: string): { kind: 'md' | 'html'; text: string }[] {
+  const parts: { kind: 'md' | 'html'; text: string }[] = []
+  const fence = /```html\s*\n([\s\S]*?)```/g
+  let last = 0
+  let match: RegExpExecArray | null
+  while ((match = fence.exec(text)) !== null) {
+    if (match.index > last) parts.push({ kind: 'md', text: text.slice(last, match.index) })
+    parts.push({ kind: 'html', text: match[1] })
+    last = match.index + match[0].length
+  }
+  if (last < text.length) parts.push({ kind: 'md', text: text.slice(last) })
+  return parts.length > 0 ? parts : [{ kind: 'md', text }]
+}
+
 const Transcript = memo(function Transcript({ entries, running }: { entries: readonly ChatEntry[]; running: boolean }) {
   const items = groupItems(entries)
   return (
@@ -151,11 +190,24 @@ const Transcript = memo(function Transcript({ entries, running }: { entries: rea
         if (entry.kind === 'note') {
           return <ChatSystemMessage key={entry.id}>{entry.text}</ChatSystemMessage>
         }
+        if (entry.kind === 'visual') {
+          return (
+            <ChatMessage key={entry.id} sender="assistant">
+              <HtmlVisual path={entry.text} />
+            </ChatMessage>
+          )
+        }
         return (
           <ChatMessage key={entry.id} sender="assistant" avatar={<Avatar name="Cell" size="md" />}>
-            <ChatMessageBubble variant="ghost">
-              <Markdown density="compact">{entry.text}</Markdown>
-            </ChatMessageBubble>
+            {splitHtmlBlocks(entry.text).map((part, partIndex) =>
+              part.kind === 'html' ? (
+                <HtmlVisual key={partIndex} html={part.text} />
+              ) : (
+                <ChatMessageBubble key={partIndex} variant="ghost">
+                  <Markdown density="compact">{part.text}</Markdown>
+                </ChatMessageBubble>
+              ),
+            )}
           </ChatMessage>
         )
       })}
@@ -244,7 +296,6 @@ function AgentComposer({ steps, setSteps, onOpenSettings }: { steps: number; set
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
   const form = state.config
   const needsKey = form.apiKey.trim() === '' && form.provider !== 'compat'
-  const contextTokens = Math.round(state.contextChars / 4)
   return (
     <ChatComposer
       density="compact"
@@ -259,15 +310,12 @@ function AgentComposer({ steps, setSteps, onOpenSettings }: { steps: number; set
           ? { type: 'error', message: 'No API key configured — open Model & settings in the sidebar to add one.' }
           : undefined
       }
-      headerContext={
-        state.contextChars > 0 ? (
-          <HStack gap={2} vAlign="center">
-            <Text type="supporting" color="secondary">~{contextTokens.toLocaleString()} tok</Text>
-            <ContextRing chars={state.contextChars} />
-          </HStack>
-        ) : undefined
+      sendActions={
+        <HStack gap={2} vAlign="center">
+          <ContextRing chars={state.contextChars} />
+          <VoiceButton />
+        </HStack>
       }
-      sendActions={<VoiceButton />}
       footerActions={
         <HStack gap={2} vAlign="center">
           <DropdownMenu
@@ -308,6 +356,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
 
   useEffect(() => {
     agentActions.refresh()
+    agentActions.ensureTitles()
   }, [])
 
   const openSettings = () => {

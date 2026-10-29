@@ -372,6 +372,12 @@ export class JobManager {
     const record: JobRecord = { id, command, status: 'running', output: '' }
     this.jobs.set(id, record)
     const logPath = `${JOBS_DIR}/${id}.log`
+    const writeStatus = () => {
+      try {
+        this.vfs.write(`${JOBS_DIR}/${id}.json`, JSON.stringify({ id, command, status: record.status, ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}) }))
+      } catch { /* status file is best-effort */ }
+    }
+    writeStatus()
     const append = (text: string) => {
       // redact before the log file: it is a plain VFS file that ships in
       // cell save snapshots, unlike transcript lines it is not re-redacted
@@ -386,11 +392,13 @@ export class JobManager {
         record.status = 'done'
         record.exitCode = result.exitCode
         append(`${result.stdout}${result.stderr}${exitTrailer(result, 600_000)}\n`)
+        writeStatus()
       })
       .catch((err) => {
         record.status = 'done'
         record.exitCode = -1
         append(`\n[job error: ${err instanceof Error ? err.message : String(err)}]\n`)
+        writeStatus()
       })
     return record
   }

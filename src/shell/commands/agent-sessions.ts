@@ -25,6 +25,8 @@ export interface SessionTurn {
 
 export interface AgentSession {
   id: string
+  /** model-generated short title for the sidebar (set lazily) */
+  title?: string
   startedAt: string
   provider: string
   model: string

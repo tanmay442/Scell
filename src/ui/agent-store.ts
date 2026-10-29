@@ -1,6 +1,7 @@
 import { platform } from '../platform'
 import { createShell } from '../shell/shell'
-import { runAgent, COMPACT_AT_CHARS } from '../shell/commands/agent'
+import { runAgent, generateSessionTitle, COMPACT_AT_CHARS } from '../shell/commands/agent'
+import type { SessionTurn } from '../shell/commands/agent-sessions'
 import { listSessions, loadSession } from '../shell/commands/agent-sessions'
 import { loadSkills } from '../shell/commands/agent-skills'
 import { registryEntries, type ToolCall } from '../shell/commands/agent-tools'
@@ -15,7 +16,7 @@ import { getActivePath } from './workspace-store'
 
 export interface ChatEntry {
   id: number
-  kind: 'user' | 'assistant' | 'tool' | 'result' | 'note'
+  kind: 'user' | 'assistant' | 'tool' | 'result' | 'note' | 'visual'
   text: string
   name?: string
   status?: 'running' | 'complete' | 'error'
@@ -32,6 +33,7 @@ export interface AgentConfigForm {
 export interface SessionInfo {
   id: string
   label: string
+  title?: string
 }
 
 export interface AgentSnapshot {
@@ -137,12 +139,28 @@ function loadConfigForm(): AgentConfigForm {
   }
 }
 
-function sessionLabel(vfs: ReturnType<typeof platform>['vfs'], id: string): string {
+function sessionInfo(vfs: ReturnType<typeof platform>['vfs'], id: string): SessionInfo {
   const loaded = loadSession(vfs, id)
-  if ('error' in loaded) return id
+  if ('error' in loaded) return { id, label: id }
+  const title = loaded.session.title?.trim()
+  if (title !== undefined && title !== '') return { id, label: title, title }
   const prompt = loaded.session.prompt.trim()
-  if (prompt !== '') return prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt
-  return id
+  if (prompt !== '') return { id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt }
+  return { id, label: id }
+}
+
+/** Sessions without a model title get one lazily (one cheap call each,
+ * attempted once per session per page load; old sessions included). */
+const titleAttempts = new Set<string>()
+async function ensureSessionTitles(vfs: ReturnType<typeof platform>['vfs']): Promise<void> {
+  for (const session of snapshot.sessions) {
+    if (session.title !== undefined || titleAttempts.has(session.id)) continue
+    titleAttempts.add(session.id)
+    const title = await generateSessionTitle(vfs, session.id).catch(() => null)
+    if (title !== null) {
+      set({ sessions: snapshot.sessions.map((s) => (s.id === session.id ? { ...s, label: title, title } : s)) })
+    }
+  }
 }
 
 let abortController: AbortController | null = null
@@ -157,10 +175,14 @@ export const agentActions = {
       config: loadConfigForm(),
       sessions: listSessions(vfs)
         .map((name) => name.replace(/\.json$/, ''))
-        .map((id) => ({ id, label: sessionLabel(vfs, id) })),
+        .map((id) => sessionInfo(vfs, id)),
       skills: skills.map((skill) => ({ name: skill.name, description: skill.description })),
       tools: entries.map((entry) => entry.name),
     })
+  },
+
+  ensureTitles(): void {
+    void ensureSessionTitles(platform().vfs)
   },
 
   setConfig(patch: Partial<AgentConfigForm>): void {
@@ -211,7 +233,8 @@ export const agentActions = {
     const { vfs, bus } = platform()
     abortController = new AbortController()
     set({ running: true, resumeTarget: null, draft: '' })
-    pushEntry('user', resumeId !== null ? `(resume ${resumeId}) ${text}` : text)
+    if (resumeId !== null) seedHistoryEntries(vfs, resumeId)
+    pushEntry('user', text)
     bus.emit('app:status', { message: resumeId !== null ? `agent resuming ${resumeId}…` : 'agent running…', tone: 'info' })
     const cwd = getActivePath() ?? HOME
     try {
@@ -258,9 +281,50 @@ export const agentActions = {
       cancelApprovals()
       abortController = null
       set({ running: false })
+      pushVisualEntries(vfs)
       agentActions.refresh()
+      agentActions.ensureTitles()
     }
   },
+}
+
+/** Restore the earlier conversation into the chat on resume, so the
+ * user sees the context the agent is continuing from. */
+function seedHistoryEntries(vfs: ReturnType<typeof platform>['vfs'], id: string): void {
+  const loaded = loadSession(vfs, id)
+  if ('error' in loaded) return
+  const turns: SessionTurn[] = loaded.session.turns.slice(-60)
+  pushEntry('note', `↻ resumed “${loaded.session.title ?? loaded.session.prompt.slice(0, 60)}” — earlier messages restored`)
+  for (const turn of turns) {
+    if (turn.role === 'user') pushEntry('user', turn.text)
+    else if (turn.role === 'assistant') {
+      if (turn.text.trim() !== '') pushEntry('assistant', turn.text)
+      for (const call of turn.toolCalls ?? []) {
+        pushEntry('tool', `${call.name} ${call.input.path ?? call.input.command ?? ''}`.trim(), call.name, 'complete')
+      }
+    } else if (turn.role === 'tool') {
+      pushEntry('result', clipLines(turn.text, 12))
+    }
+  }
+}
+
+const shownVisuals = new Set<string>()
+
+/** HTML artifacts the agent produced become in-chat visuals. */
+function pushVisualEntries(vfs: ReturnType<typeof platform>['vfs']): void {
+  try {
+    const dir = '/home/user/artifacts'
+    if (!vfs.isDir(dir)) return
+    for (const name of vfs.readDir(dir)) {
+      if (!name.endsWith('.html')) continue
+      const path = `${dir}/${name}`
+      if (shownVisuals.has(path)) continue
+      shownVisuals.add(path)
+      pushEntry('visual', path)
+    }
+  } catch {
+    // artifacts are best-effort
+  }
 }
 
 function clipLines(text: string, max: number): string {

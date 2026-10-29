@@ -209,6 +209,32 @@ export interface RunAgentOpts {
   onSession?: (id: string) => void
 }
 
+/**
+ * Generate a short sidebar title for a session with one cheap model
+ * call (no tools). Returns null when unconfigured or the call fails —
+ * the caller falls back to the raw prompt. Persists session.title.
+ */
+export async function generateSessionTitle(vfs: Vfs, id: string): Promise<string | null> {
+  const configured = readConfig(vfs)
+  if ('error' in configured) return null
+  const loaded = loadSession(vfs, id)
+  if ('error' in loaded) return null
+  if (loaded.session.title !== undefined && loaded.session.title.trim() !== '') return loaded.session.title
+  const lastAssistant = [...loaded.session.turns].reverse().find((turn) => turn.role === 'assistant')?.text ?? ''
+  const ask = `Give this coding-agent session a 3-6 word title (plain words, no quotes, no period). Reply with the title only.\n\nTask: ${loaded.session.prompt.slice(0, 500)}\nOutcome: ${lastAssistant.slice(0, 500)}`
+  const state = newProviderState(ask)
+  const result = await callModel(configured.config, state, [], 'You title sessions.', undefined, undefined)
+  if ('error' in result) return null
+  const title = result.text.trim().replace(/^["']|["']$/g, '').split('\n')[0].slice(0, 60).trim()
+  if (title === '') return null
+  try {
+    saveSession(vfs, { ...loaded.session, title })
+  } catch {
+    // best-effort
+  }
+  return title
+}
+
 /** The agent loop. Returns the full transcript for the terminal. */
 export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Promise<CommandResult> {
   const valueFlags = new Set(['--steps', '--max-steps', '-s', '--resume', '--session'])
