@@ -1,23 +1,24 @@
 import { platform } from '../platform'
 import { createShell } from '../shell/shell'
 import { runAgent, COMPACT_AT_CHARS } from '../shell/commands/agent'
-import { listSessions } from '../shell/commands/agent-sessions'
+import { listSessions, loadSession } from '../shell/commands/agent-sessions'
 import { loadSkills } from '../shell/commands/agent-skills'
 import { registryEntries, type ToolCall } from '../shell/commands/agent-tools'
 import { getActivePath } from './workspace-store'
 
 /**
- * Shared agent state for the Agent chat (main area) and the Agent
- * sidebar (sessions/config/skills/tools). One module store, following
- * the diagnostics-store pattern: referentially stable snapshots,
- * subscribe/notify, all actions as plain functions.
+ * Shared agent state for the Agent home (front door). One module
+ * store, following the diagnostics-store pattern: referentially
+ * stable snapshots, subscribe/notify, actions as plain functions.
+ * Module-level, so switching to the Workspace and back loses nothing.
  */
 
 export interface ChatEntry {
   id: number
-  kind: 'user' | 'assistant' | 'tool' | 'result' | 'note' | 'approval'
+  kind: 'user' | 'assistant' | 'tool' | 'result' | 'note'
   text: string
   name?: string
+  status?: 'running' | 'complete' | 'error'
 }
 
 export interface AgentConfigForm {
@@ -28,11 +29,17 @@ export interface AgentConfigForm {
   permission: string
 }
 
+export interface SessionInfo {
+  id: string
+  label: string
+}
+
 export interface AgentSnapshot {
   entries: readonly ChatEntry[]
   running: boolean
   pendingSummary: string | null
-  sessions: readonly string[]
+  pendingCount: number
+  sessions: readonly SessionInfo[]
   skills: readonly { name: string; description: string }[]
   tools: readonly string[]
   contextChars: number
@@ -40,6 +47,7 @@ export interface AgentSnapshot {
   resumeTarget: string | null
   config: AgentConfigForm
   savedNote: string
+  draft: string
   version: number
 }
 
@@ -52,6 +60,7 @@ let snapshot: AgentSnapshot = {
   entries: [],
   running: false,
   pendingSummary: null,
+  pendingCount: 0,
   sessions: [],
   skills: [],
   tools: [],
@@ -60,6 +69,7 @@ let snapshot: AgentSnapshot = {
   resumeTarget: null,
   config: EMPTY_FORM,
   savedNote: '',
+  draft: '',
   version: 0,
 }
 const subscribers = new Set<() => void>()
@@ -69,9 +79,23 @@ function set(patch: Partial<AgentSnapshot>): void {
   for (const notify of subscribers) notify()
 }
 
-function pushEntry(kind: ChatEntry['kind'], text: string, name?: string): void {
-  const entry: ChatEntry = { id: ++entryId, kind, text, ...(name ? { name } : {}) }
-  set({ entries: [...snapshot.entries.slice(-400), entry] })
+function pushEntry(kind: ChatEntry['kind'], text: string, name?: string, status?: ChatEntry['status']): void {
+  const entry: ChatEntry = { id: ++entryId, kind, text, ...(name ? { name } : {}), ...(status ? { status } : {}) }
+  const entries = [...snapshot.entries, entry]
+  set({ entries: entries.length > 400 ? entries.slice(-400) : entries })
+}
+
+/** Mark the most recent running tool entry with its outcome. */
+function settleToolEntry(name: string, isError: boolean): void {
+  const entries = [...snapshot.entries]
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].kind === 'tool' && entries[i].status === 'running') {
+      entries[i] = { ...entries[i], status: isError ? 'error' : 'complete' }
+      set({ entries })
+      return
+    }
+  }
+  void name
 }
 
 /** Streaming text deltas coalesce into the current assistant entry. */
@@ -113,8 +137,17 @@ function loadConfigForm(): AgentConfigForm {
   }
 }
 
+function sessionLabel(vfs: ReturnType<typeof platform>['vfs'], id: string): string {
+  const loaded = loadSession(vfs, id)
+  if ('error' in loaded) return id
+  const prompt = loaded.session.prompt.trim()
+  if (prompt !== '') return prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt
+  return id
+}
+
+let abortController: AbortController | null = null
+
 export const agentActions = {
-  /** Load config/sessions/skills/tools from the VFS (call on mount). */
   refresh(): void {
     const { vfs } = platform()
     const cwd = getActivePath() ?? HOME
@@ -122,7 +155,9 @@ export const agentActions = {
     const { entries } = registryEntries(vfs)
     set({
       config: loadConfigForm(),
-      sessions: listSessions(vfs).map((name) => name.replace(/\.json$/, '')),
+      sessions: listSessions(vfs)
+        .map((name) => name.replace(/\.json$/, ''))
+        .map((id) => ({ id, label: sessionLabel(vfs, id) })),
       skills: skills.map((skill) => ({ name: skill.name, description: skill.description })),
       tools: entries.map((entry) => entry.name),
     })
@@ -142,25 +177,42 @@ export const agentActions = {
     set({ savedNote: 'saved to ~/.cell/agent.json' })
   },
 
+  setDraft(text: string): void {
+    set({ draft: text })
+  },
+
+  appendDraft(text: string): void {
+    const current = snapshot.draft
+    set({ draft: current === '' ? text : `${current}${current.endsWith(' ') ? '' : ' '}${text}` })
+  },
+
   setResumeTarget(id: string | null): void {
     set({ resumeTarget: id })
   },
 
   clearChat(): void {
-    set({ entries: [], contextChars: 0, sessionId: null })
+    if (snapshot.running) return
+    set({ entries: [], contextChars: 0, sessionId: null, resumeTarget: null, draft: '' })
   },
 
   decide(allowed: boolean): void {
     decideApproval(allowed)
   },
 
+  stop(): void {
+    abortController?.abort()
+    cancelApprovals()
+  },
+
   async run(prompt: string, steps: number): Promise<void> {
     const text = prompt.trim()
     if (snapshot.running || text === '') return
     const resumeId = snapshot.resumeTarget
-    set({ running: true, resumeTarget: null })
+    const { vfs, bus } = platform()
+    abortController = new AbortController()
+    set({ running: true, resumeTarget: null, draft: '' })
     pushEntry('user', resumeId !== null ? `(resume ${resumeId}) ${text}` : text)
-    const { vfs } = platform()
+    bus.emit('app:status', { message: resumeId !== null ? `agent resuming ${resumeId}…` : 'agent running…', tone: 'info' })
     const cwd = getActivePath() ?? HOME
     try {
       const shell = createShell(vfs, { protected: true, approve })
@@ -173,23 +225,38 @@ export const agentActions = {
         shell,
         jobShell,
         approve,
+        signal: abortController.signal,
         onSession: (id) => set({ sessionId: id }),
         onContext: (chars) => set({ contextChars: chars }),
         onToolResult: (call, toolResult) => {
+          settleToolEntry(call.name, toolResult.isError === true)
           pushEntry('result', clipLines(toolResult.content, 16), call.name)
         },
         onProgress: (line) => {
-          if (line.startsWith('⏺ ')) pushEntry('tool', line.slice(2))
-          else if (line.startsWith('❓')) pushEntry('note', line)
-          else appendAssistantDelta(line)
+          if (line.startsWith('⏺ ')) {
+            const body = line.slice(2)
+            const space = body.indexOf(' ')
+            pushEntry('tool', body, space === -1 ? body : body.slice(0, space), 'running')
+          } else if (line.startsWith('❓')) {
+            // approval requests render as the pending card, not a transcript line
+          } else {
+            appendAssistantDelta(line)
+          }
         },
       })
+      // the transcript tail carries errors and the step-limit line —
+      // surfacing only the exit code hid both from UI users
+      const tail = result.stdout.trim().split('\n').filter((line) => line.trim() !== '')
+      const errorLine = [...tail].reverse().find((line) => line.startsWith('agent ✗') || line.startsWith('agent: reached'))
       if (result.stderr.trim() !== '') pushEntry('note', result.stderr.trim())
-      pushEntry('note', result.exitCode === 0 ? '✓ done' : `✗ exit ${result.exitCode}`)
+      if (abortController.signal.aborted) pushEntry('note', '■ stopped')
+      else if (errorLine !== undefined) pushEntry('note', errorLine)
+      else pushEntry('note', result.exitCode === 0 ? '✓ done' : `✗ exit ${result.exitCode}`)
     } catch (err) {
       pushEntry('note', `✗ ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       cancelApprovals()
+      abortController = null
       set({ running: false })
       agentActions.refresh()
     }
@@ -201,11 +268,11 @@ function clipLines(text: string, max: number): string {
   return lines.length <= max ? text : `${lines.slice(0, max).join('\n')}\n… (${lines.length - max} more lines)`
 }
 
-// ---- approval FIFO (shared by chat + any future surface) ----
+// ---- approval FIFO (single-sourced; the loop owns the timeout) ----
 
 const approvalQueue: { summary: string; resolve: (allowed: boolean) => void }[] = []
-let approvalTimer: ReturnType<typeof setTimeout> | null = null
 let lastDecisionAt = 0
+let lastDecidedSummary: string | null = null
 
 function summarizeCall(call: ToolCall): string {
   if (call.name === 'bash' || call.name === 'job_start') return String(call.input.command ?? '')
@@ -215,45 +282,32 @@ function summarizeCall(call: ToolCall): string {
   return JSON.stringify(call.input).slice(0, 140)
 }
 
-function armApprovalTimer(): void {
-  if (approvalTimer !== null) clearTimeout(approvalTimer)
-  approvalTimer = setTimeout(() => decideApproval(false), 300_000)
-}
-
 function approve(call: ToolCall): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const entry = { summary: `${call.name} ${summarizeCall(call)}`, resolve }
     approvalQueue.push(entry)
-    pushEntry('approval', entry.summary, call.name)
-    if (approvalQueue.length === 1) {
-      set({ pendingSummary: entry.summary })
-      armApprovalTimer()
-    }
+    set({ pendingSummary: entry.summary, pendingCount: approvalQueue.length })
+    platform().bus.emit('app:status', { message: 'agent waiting for approval…', tone: 'info' })
   })
 }
 
 function decideApproval(allowed: boolean): void {
+  const head = approvalQueue[0]
+  if (head === undefined) return
+  // debounce double-clicks per queue head, not globally
   const now = Date.now()
-  if (now - lastDecisionAt < 350) return
+  if (lastDecidedSummary === head.summary && now - lastDecisionAt < 350) return
+  lastDecidedSummary = head.summary
   lastDecisionAt = now
-  if (approvalTimer !== null) {
-    clearTimeout(approvalTimer)
-    approvalTimer = null
-  }
-  const head = approvalQueue.shift()
-  head?.resolve(allowed)
+  approvalQueue.shift()
+  head.resolve(allowed)
   const next = approvalQueue[0]
-  set({ pendingSummary: next ? next.summary : null })
-  if (next) armApprovalTimer()
+  set({ pendingSummary: next ? next.summary : null, pendingCount: approvalQueue.length })
 }
 
 function cancelApprovals(): void {
-  if (approvalTimer !== null) {
-    clearTimeout(approvalTimer)
-    approvalTimer = null
-  }
   for (const entry of approvalQueue.splice(0)) entry.resolve(false)
-  if (snapshot.pendingSummary !== null) set({ pendingSummary: null })
+  if (snapshot.pendingSummary !== null) set({ pendingSummary: null, pendingCount: 0 })
 }
 
 export { COMPACT_AT_CHARS }

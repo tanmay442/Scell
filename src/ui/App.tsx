@@ -1,58 +1,23 @@
-import { useEffect, useState } from 'react'
-import { platform } from '../platform'
-import { workspaceActions } from './workspace-store'
-import { attachGlobalKeys } from './keyboard'
-import { TitleBar } from './TitleBar'
-import { ActivityBar } from './ActivityBar'
-import { Sidebar } from './Sidebar'
-import { EditorArea } from './EditorArea'
-import { BottomPanel } from './BottomPanel'
-import { PreviewPanel } from './PreviewPanel'
-import { AgentChat } from './AgentChat'
-import { StatusBar } from './StatusBar'
+import { Suspense, lazy, useState } from 'react'
+import { AgentHome } from './AgentHome'
 
 export type SidebarView = 'explorer' | 'git' | 'agent'
 
+const CodeShell = lazy(() => import('./CodeShell').then((module) => ({ default: module.CodeShell })))
+
+/**
+ * The agent is the front door; the full IDE lives one click away
+ * behind "Workspace" and loads on demand.
+ */
 export function App() {
-  const [panelVisible, setPanelVisible] = useState(true)
-  const [sidebarView, setSidebarView] = useState<SidebarView>('explorer')
+  const [appMode, setAppMode] = useState<'agent' | 'code'>('agent')
 
-  useEffect(() => {
-    const { bus } = platform()
-    const detachKeys = attachGlobalKeys({ togglePanel: () => setPanelVisible((v) => !v) })
-    const unwatch = bus.on('vfs:changed', (e) => {
-      if (e.kind === 'delete') workspaceActions.handleVfsDelete(e.path)
-      if (e.kind === 'rename' && e.to) workspaceActions.handleVfsRename(e.path, e.to)
-    })
-    bus.emit('app:status', { message: 'workspace ready', tone: 'ok' })
-    return () => {
-      detachKeys()
-      unwatch()
-    }
-  }, [])
-
+  if (appMode === 'agent') {
+    return <AgentHome onOpenWorkspace={() => setAppMode('code')} />
+  }
   return (
-    <div className="app-shell">
-      <TitleBar />
-      <div className="app-body">
-        <ActivityBar active={sidebarView} onSelect={(view) => setSidebarView(view)} />
-        <Sidebar view={sidebarView} />
-        <div className="app-main">
-          {sidebarView === 'agent' ? (
-            <AgentChat />
-          ) : (
-            <div className="editor-preview-row">
-              <EditorArea />
-              <PreviewPanel />
-            </div>
-          )}
-          <BottomPanel
-            onToggle={() => setPanelVisible(false)}
-            collapsed={!panelVisible}
-          />
-        </div>
-      </div>
-      <StatusBar onTogglePanel={() => setPanelVisible((v) => !v)} panelVisible={panelVisible} />
-    </div>
+    <Suspense fallback={null}>
+      <CodeShell onHome={() => setAppMode('agent')} />
+    </Suspense>
   )
 }

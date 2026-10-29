@@ -7,7 +7,6 @@ import { workspaceActions } from './workspace-store'
 import { FileIcon } from './file-icon'
 import { ContextMenu, type ContextMenuItem, type ContextMenuState } from './ContextMenu'
 import { GitPanel } from './GitPanel'
-import { AgentPanel } from './AgentPanel'
 
 type TreeFile = { name: string; path: string; dir: false }
 type TreeDir = { name: string; path: string; dir: true; children: TreeEntry[] }
@@ -47,13 +46,6 @@ type Editing =
   | null
 
 export function Sidebar({ view }: { view: 'explorer' | 'git' | 'agent' }) {
-  if (view === 'agent') {
-    return (
-      <aside className="sidebar agent-wide">
-        <AgentPanel />
-      </aside>
-    )
-  }
   if (view === 'git') {
     return (
       <aside className="sidebar">

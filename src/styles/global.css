@@ -1,26 +1,35 @@
 :root {
-  --bg: #1e1e1e;
-  --bg-deep: #181818;
-  --sidebar-bg: #252526;
-  --activity-bg: #333333;
-  --border: #2b2b2b;
-  --border-strong: #3c3c3c;
-  --text: #cccccc;
-  --text-muted: #8b8b8b;
-  --text-bright: #e8e8e8;
-  --accent: #0078d4;
-  --accent-soft: #264f78;
-  --error: #f14c4c;
-  --warning: #cca700;
-  --ok: #4ec9b0;
-  --hover: #2a2d2e;
-  --active-line: #282828;
+  color-scheme: dark;
+  --bg: #000000;
+  --bg-deep: #0A0A0A;
+  --sidebar-bg: #0A0A0A;
+  --activity-bg: #000000;
+  --border: #2A2A2A;
+  --border-strong: #3A3A3A;
+  --text: #D9D9D9;
+  --text-muted: #AFAFAF;
+  --text-bright: #ECECEC;
+  --accent: #285A48;
+  --accent-soft: #12291F;
+  --error: #E5534B;
+  --warning: #D8A13C;
+  --ok: #7FB8A4;
+  --hover: #1F1F1F;
+  --active-line: #171717;
   --mono: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, ui-monospace, monospace;
   --ui: system-ui, 'Segoe UI', Roboto, sans-serif;
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* legacy element resets are scoped to the code shell: unlayered global
+   margin/padding/button rules would beat Astryx's layered component
+   styles in agent mode (buttons rendered as plain text) */
+.app-shell *,
+.app-shell *::before,
+.app-shell *::after {
   margin: 0;
   padding: 0;
 }
@@ -39,7 +48,7 @@ body {
   background: var(--bg);
 }
 
-button {
+.app-shell button {
   font: inherit;
   color: inherit;
   background: none;
@@ -47,8 +56,8 @@ button {
   cursor: pointer;
 }
 
-button:focus-visible,
-input:focus-visible {
+.app-shell button:focus-visible,
+.app-shell input:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
@@ -682,8 +691,8 @@ kbd {
   justify-content: space-between;
   height: 24px;
   padding: 0 8px;
-  background: #0078d4;
-  color: #fff;
+  background: var(--accent-soft);
+  color: var(--text-bright);
   font-size: 12px;
   flex-shrink: 0;
   user-select: none;
@@ -1450,4 +1459,18 @@ kbd {
   font-size: 11px;
   color: var(--text-muted);
   line-height: 1.4;
+}
+
+.title-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+  padding: 3px 8px 3px 4px;
+  color: var(--text-bright);
+  font-size: 12px;
+  font-weight: 600;
+}
+.title-home:hover {
+  background: var(--hover);
 }

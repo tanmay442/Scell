@@ -201,6 +201,8 @@ export interface RunAgentOpts {
   approve?: (call: ToolCall) => Promise<boolean>
   /** ms before a pending approval auto-denies (default 300s) */
   approveTimeoutMs?: number
+  /** cooperative stop: checked before every step and every tool call */
+  signal?: AbortSignal
   /** UI hooks (Agent chat): structured events alongside the text transcript */
   onToolResult?: (call: ToolCall, result: ToolResult) => void
   onContext?: (chars: number) => void
@@ -334,10 +336,15 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
   let lastCompactStep = -10
   for (let step = 1; step <= maxSteps; step++) {
+    if (opts.signal?.aborted) {
+      transcript.push('agent: stopped by user')
+      persist(step)
+      return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
+    }
     // compaction: when the live context passes the threshold, summarize
     // the turns into one user message and continue from it (instead of
     // the old middle-drop, which lost decisions silently)
-    if (step > 1 && step - lastCompactStep >= 3 && contextSize(state, turns) > COMPACT_AT_CHARS) {
+    if (step > 1 && step - lastCompactStep >= 3 && contextSize(state, turns, config.provider) > COMPACT_AT_CHARS) {
       const summary = await summarizeTurns(config, turns, entries)
       if (summary !== null) {
         applyCompaction(state, config.provider, summary)
@@ -346,7 +353,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
         lastCompactStep = step
       }
     }
-    opts.onContext?.(contextSize(state, turns))
+    opts.onContext?.(contextSize(state, turns, config.provider))
     const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns)
     if ('error' in model) {
       transcript.push(`agent ✗ ${redactSecrets(model.error)}`)
@@ -412,6 +419,11 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     const toolResults: ToolResult[] = []
     const metaOutputs: { type: string; call_id: string; output: string }[] = []
     for (const call of model.calls) {
+      if (opts.signal?.aborted) {
+        transcript.push('agent: stopped by user')
+        persist(step)
+        return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
+      }
       const summary = toolSummary(call)
       // per-tool approval: read/ls/load_skill run; everything else prints
       // a clear prompt line first (non-interactive shells auto-proceed —
@@ -499,9 +511,14 @@ async function withApprovalTimeout(
 /** Rough context size in chars (~4 chars/token) across provider state. */
 export const COMPACT_AT_CHARS = 200_000
 
-function contextSize(state: ProviderState, turns: SessionTurn[]): number {
+function contextSize(state: ProviderState, turns: SessionTurn[], provider: ProviderKind): number {
+  // one source per provider: the message log for anthropic/openai-shaped
+  // (turns are derived FROM it — summing both double-counts), the turn
+  // list for meta (which chains server-side and keeps no local log)
   try {
-    return JSON.stringify(state.anthropicMessages).length + JSON.stringify(state.openaiMessages).length + turns.reduce((sum, turn) => sum + turn.text.length, 0)
+    if (provider === 'anthropic') return JSON.stringify(state.anthropicMessages).length
+    if (provider === 'openai' || provider === 'compat') return JSON.stringify(state.openaiMessages).length
+    return turns.reduce((sum, turn) => sum + turn.text.length, 0)
   } catch {
     return 0
   }

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { Hexagon } from 'lucide-react'
+import { Logo } from './Logo'
 import { platform } from '../platform'
 
-export function TitleBar() {
+export function TitleBar({ onHome }: { onHome?: () => void }) {
   const [status, setStatus] = useState<{ message: string; tone: 'info' | 'ok' | 'error' } | null>(null)
 
   useEffect(() => {
@@ -22,7 +22,10 @@ export function TitleBar() {
   return (
     <header className="title-bar">
       <div className="title-bar-left">
-        <Hexagon size={14} className="cell-mark" strokeWidth={2.4} />
+        <button className="title-home" title="Back to Agent" onClick={onHome}>
+          <Logo size={16} />
+          <span>Agent</span>
+        </button>
         <span className="wordmark">CELL</span>
         <span className="title-sep">/</span>
         <span className="project-name">workspace</span>

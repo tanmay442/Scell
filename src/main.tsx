@@ -4,6 +4,11 @@ import { initPlatform } from './platform'
 import { createVfs, createIdbPersistence, loadSeedFlag, saveSeedFlag, seedStarterProject, migrateStarter, ensureStarterProject, startAutoSave } from './vfs'
 import { startLanguageService } from './lang/service'
 import { App } from './ui/App'
+import { Theme } from '@astryxdesign/core/theme'
+import { cellTheme } from './cell-theme'
+import '@astryxdesign/core/reset.css'
+import '@astryxdesign/core/astryx.css'
+import '@astryxdesign/theme-neutral/fonts.css'
 import './styles/global.css'
 
 // No StrictMode: its dev-only double-mounting double-initializes editors
@@ -69,7 +74,11 @@ async function boot() {
   })
 
   const root = createRoot(document.getElementById('root')!)
-  root.render(<App />)
+  root.render(
+    <Theme theme={cellTheme} mode="dark">
+      <App />
+    </Theme>,
+  )
 
   bus.emit('diagnostics:updated', { diagnostics: [], version: 0 })
   startLanguageService()
