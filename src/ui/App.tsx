@@ -8,6 +8,7 @@ import { Sidebar } from './Sidebar'
 import { EditorArea } from './EditorArea'
 import { BottomPanel } from './BottomPanel'
 import { PreviewPanel } from './PreviewPanel'
+import { AgentChat } from './AgentChat'
 import { StatusBar } from './StatusBar'
 
 export type SidebarView = 'explorer' | 'git' | 'agent'
@@ -37,10 +38,14 @@ export function App() {
         <ActivityBar active={sidebarView} onSelect={(view) => setSidebarView(view)} />
         <Sidebar view={sidebarView} />
         <div className="app-main">
-          <div className="editor-preview-row">
-            <EditorArea />
-            <PreviewPanel />
-          </div>
+          {sidebarView === 'agent' ? (
+            <AgentChat />
+          ) : (
+            <div className="editor-preview-row">
+              <EditorArea />
+              <PreviewPanel />
+            </div>
+          )}
           <BottomPanel
             onToggle={() => setPanelVisible(false)}
             collapsed={!panelVisible}

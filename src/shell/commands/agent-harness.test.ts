@@ -580,3 +580,26 @@ describe('permission modes', () => {
     expect(result.stdout).toContain('DENIED by user')
   })
 })
+
+describe('UI hooks', () => {
+  it('onSession/onToolResult/onContext fire during a run', async () => {
+    const vfs = permissionVfs()
+    scriptStub([
+      anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
+      anthropicText('done'),
+    ])
+    let sessionId: string | null = null
+    const results: string[] = []
+    let contextSeen = -1
+    await runAgent(vfs, ['go'], {
+      cwd: '/home/user',
+      shell: okShell as never,
+      onSession: (id) => { sessionId = id },
+      onToolResult: (call) => { results.push(call.name) },
+      onContext: (chars) => { contextSeen = chars },
+    })
+    expect(sessionId).toMatch(/^agent-/)
+    expect(results).toEqual(['bash'])
+    expect(contextSeen).toBeGreaterThanOrEqual(0)
+  })
+})

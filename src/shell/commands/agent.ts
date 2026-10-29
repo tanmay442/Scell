@@ -201,6 +201,10 @@ export interface RunAgentOpts {
   approve?: (call: ToolCall) => Promise<boolean>
   /** ms before a pending approval auto-denies (default 300s) */
   approveTimeoutMs?: number
+  /** UI hooks (Agent chat): structured events alongside the text transcript */
+  onToolResult?: (call: ToolCall, result: ToolResult) => void
+  onContext?: (chars: number) => void
+  onSession?: (id: string) => void
 }
 
 /** The agent loop. Returns the full transcript for the terminal. */
@@ -318,6 +322,8 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const id = resumeId !== null ? resumeId.replace(/\.json$/, '') : sessionId()
   const startedAt = resumedStartedAt ?? new Date().toISOString()
 
+  opts.onSession?.(id)
+
   const persist = (steps: number) => {
     try {
       saveSession(vfs, { id, startedAt, provider: config.provider, model: config.model, prompt: sessionPrompt, transcript, turns, steps })
@@ -340,6 +346,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
         lastCompactStep = step
       }
     }
+    opts.onContext?.(contextSize(state, turns))
     const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns)
     if ('error' in model) {
       transcript.push(`agent ✗ ${redactSecrets(model.error)}`)
@@ -432,7 +439,9 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
       // survive in either half (P2), and raw results never re-enter context (P0-3)
       const safeContent = redactSecrets(result.content)
       transcript.push(clip(safeContent.split('\n').map((line) => `  ${line}`).join('\n'), 12))
-      toolResults.push({ ...result, content: safeContent })
+      const safeResult = { ...result, content: safeContent }
+      toolResults.push(safeResult)
+      opts.onToolResult?.(call, safeResult)
       metaOutputs.push({ type: 'function_call_output', call_id: call.id, output: safeContent })
     }
     turns.push({ role: 'tool', text: toolResults.map((result) => result.content).join('\n'), toolResults: toolResults.map((result) => ({ id: result.id, content: result.content, isError: result.isError })) })
@@ -488,7 +497,7 @@ async function withApprovalTimeout(
 }
 
 /** Rough context size in chars (~4 chars/token) across provider state. */
-const COMPACT_AT_CHARS = 200_000
+export const COMPACT_AT_CHARS = 200_000
 
 function contextSize(state: ProviderState, turns: SessionTurn[]): number {
   try {
