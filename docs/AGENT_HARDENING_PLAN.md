@@ -72,3 +72,14 @@ entry point. Text scanning stays as an early-error layer only.
 Per phase: targeted test files only (listed in phase 1), typecheck, one
 production build for UI phases. Full suite once before merge. Live
 `e2e:agent` once after phases 1–2.
+
+## Status (2026-10-29)
+
+All five phases implemented, reviewed (two read-only reviews + one
+re-review), fixed, and landed. 241 unit tests green; live e2e:agent
+green. Probe trade-off recorded in shell.ts: the .bashrc probe sources
+the rc once extra per uncached (hash, cwd). Remaining known limits:
+exit-to-return rewrite covers line-start / ; / && / || spellings only
+(other positions fail safe: rc skipped, user command runs); EACCES
+mid-compound aborts the line like a thrown fs error; verdict cache is
+keyed by (hash, cwd) only.
