@@ -85,6 +85,19 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   // process), then accumulate their own exports from there
   const sessionEnv: Record<string, string> = { ...(opts?.seedEnv ?? {}) }
   const hasBashrc = () => v.isFile(BASHRC)
+  /** hash of the .bashrc content last seen to break an exec (P1-1 guard) */
+  let badBashrcHash: string | null = null
+  const bashrcHash = (): string | null => {
+    try {
+      const text = v.read(BASHRC)
+      if (text === null) return null
+      let hash = 5381
+      for (let i = 0; i < text.length; i++) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0
+      return hash.toString(16)
+    } catch {
+      return null
+    }
+  }
 
   // Progress sink for long commands (git clone, npm install): the terminal
   // passes a live-line writer per exec; platform commands report phases
@@ -144,21 +157,29 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
       // collision-proof result var for this exec only
       const rcVar = `__cell_${nonce}_rc`
       const tmpPath = `/tmp/.cell-exec-${nonce}.sh`
-      // the user command rides a temp file, never raw interpolation:
-      // unclosed quotes/syntax in the file fail the `source` alone, so
-      // the epilogue below still runs (P0-3). `exit` is shadowed by a
-      // function whose `return` stops the sourced file with that code
-      // instead of killing the long-lived session shell.
       const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS
-      try {
+      // .bashrc guard (P1-1): a hash marked bad (an exec died with it
+      // sourced) is skipped until the file changes again
+      const currentBashrcHash = hasBashrc() ? bashrcHash() : null
+      const includeBashrc = hasBashrc() && currentBashrcHash !== badBashrcHash
+
+      const runOnce = async (withBashrc: boolean): Promise<{ shellResult: ShellResult; markerMissing: boolean }> => {
+        // the user command rides a temp file, never raw interpolation:
+        // unclosed quotes/syntax in the file fail the `source` alone, so
+        // the epilogue below still runs (P0-3). `exit` is shadowed by a
+        // function whose `return` stops the sourced file with that code
+        // instead of killing the long-lived session shell. The shadow is
+        // defined BEFORE the .bashrc source line: an `exit` inside
+        // .bashrc must return into the wrapper, not kill the exec
+        // before the user command runs (P1-1).
         await fs.writeFile(tmpPath, cmd)
         const options = { cwd: cwd ?? HOME_DIR, env: { ...sessionEnv } }
         // always-run epilogue (`;`-chained, never `&&`): captures the exit
         // code, dumps the env in-band, then cleans the temp file. The dump
         // command exits with the user's code, so the step's exitCode is his.
-        const sourceLine = hasBashrc() ? `. ${BASHRC} >/dev/null 2>&1; ` : ''
+        const sourceLine = withBashrc ? `. ${BASHRC} >/dev/null 2>&1; ` : ''
         const wrapped =
-          `${sourceLine}exit() { return \${1:-0}; } 2>/dev/null; ${rcVar}=0; source '${tmpPath}' || ${rcVar}=$?; rm -f '${tmpPath}' >/dev/null 2>&1; __cell_env_dump ${nonce} $${rcVar}`
+          `exit() { return \${1:-0}; } 2>/dev/null; ${sourceLine}${rcVar}=0; source '${tmpPath}' || ${rcVar}=$?; rm -f '${tmpPath}' >/dev/null 2>&1; __cell_env_dump ${nonce} $${rcVar}`
         const underlying = bash.exec(wrapped, options)
         let timer: ReturnType<typeof setTimeout> | null = null
         try {
@@ -190,7 +211,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
             // accurate: return the failure (exit + syntax stderr) as-is.
             // (trap does not exist in just-bash; timeouts below are the
             // only genuinely-stale case and keep envStale: true.)
-            return { stdout, stderr: result.stderr, exitCode: result.exitCode }
+            return { shellResult: { stdout, stderr: result.stderr, exitCode: result.exitCode }, markerMissing: true }
           }
           const lineEnd = stdout.indexOf('\n', markerAt)
           const dumpText = lineEnd === -1 ? stdout.slice(markerAt) : stdout.slice(markerAt, lineEnd)
@@ -206,21 +227,40 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
           } catch {
             // env capture is best-effort
           }
-          return { stdout, stderr: result.stderr, exitCode: result.exitCode }
+          return { shellResult: { stdout, stderr: result.stderr, exitCode: result.exitCode }, markerMissing: false }
         } catch (err) {
           if ((err as { code?: string })?.code === 'CELL_TIMEOUT') {
             return {
-              stdout: '',
-              stderr: `cell: command timed out after ${Math.round(timeoutMs / 1000)}s (exit 124)\n`,
-              exitCode: 124,
-              timedOut: true,
-              envStale: true,
+              shellResult: {
+                stdout: '',
+                stderr: `cell: command timed out after ${Math.round(timeoutMs / 1000)}s (exit 124)\n`,
+                exitCode: 124,
+                timedOut: true,
+                envStale: true,
+              },
+              markerMissing: false,
             }
           }
           throw err
         } finally {
           if (timer !== null) clearTimeout(timer)
         }
+      }
+
+      try {
+        let attempt = await runOnce(includeBashrc)
+        if (attempt.markerMissing && includeBashrc) {
+          // .bashrc killed the wrapper (exit/syntax): retry once without
+          // it. If the epilogue then runs, mark this hash bad so later
+          // execs skip .bashrc until the file changes (P1-1).
+          const retry = await runOnce(false)
+          if (!retry.markerMissing) {
+            badBashrcHash = currentBashrcHash
+            retry.shellResult.stderr = `cell: ~/.bashrc failed — skipped until it changes\n${retry.shellResult.stderr}`
+            attempt = retry
+          }
+        }
+        return attempt.shellResult
       } finally {
         liveProgress = prev
         liveNonce = prevNonce

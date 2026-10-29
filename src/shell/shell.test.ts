@@ -172,3 +172,20 @@ describe('agent-hardening (P0-1..P0-4)', () => {
     expect(vfs.listAllFiles().filter((p) => p.includes('.cell-eval')).join(',')).toBe('')
   })
 })
+
+describe('.bashrc guard (P1-1)', () => {
+  it('an exit in .bashrc cannot brick later commands', async () => {
+    const vfs = createVfs()
+    vfs.write(`${HOME}/.bashrc`, 'exit 1\n')
+    const shell = createShell(vfs)
+    const first = await shell.exec('echo still-alive')
+    expect(first.stdout).toContain('still-alive')
+    expect(first.stderr).toContain('~/.bashrc failed — skipped until it changes')
+    const second = await shell.exec('echo alive-again')
+    expect(second.stdout).toContain('alive-again')
+    // fixing .bashrc re-enables it (hash changed)
+    vfs.write(`${HOME}/.bashrc`, 'export CELL_GUARD_OK=yes\n')
+    const third = await shell.exec('echo $CELL_GUARD_OK')
+    expect(third.stdout).toContain('yes')
+  })
+})
