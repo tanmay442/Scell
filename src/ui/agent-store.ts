@@ -44,6 +44,7 @@ interface AgentSnapshot {
   entries: readonly ChatEntry[]
   running: boolean
   activeLocked: boolean
+  keyAvailable: boolean
   pendingSummary: string | null
   pendingCount: number
   sessions: readonly SessionInfo[]
@@ -67,6 +68,7 @@ let snapshot: AgentSnapshot = {
   entries: [],
   running: false,
   activeLocked: false,
+  keyAvailable: false,
   pendingSummary: null,
   pendingCount: 0,
   sessions: [],
@@ -176,11 +178,16 @@ function mutateSession(id: string, patch: Partial<{ title: string; pinned: boole
  * attempted once per session per page load; old sessions included). */
 const titleAttempts = new Set<string>()
 async function ensureSessionTitles(vfs: ReturnType<typeof platform>['vfs']): Promise<void> {
+  let titled = 0
   for (const session of snapshot.sessions) {
+    if (titled >= 3) break
     if (session.title !== undefined || titleAttempts.has(session.id)) continue
-    titleAttempts.add(session.id)
     const title = await generateSessionTitle(vfs, session.id).catch(() => null)
+    // mark attempted only on success: a key-less first launch must not
+    // permanently skip titling every old session
     if (title !== null) {
+      titleAttempts.add(session.id)
+      titled++
       set({ sessions: snapshot.sessions.map((s) => (s.id === session.id ? { ...s, label: title, title } : s)) })
     }
   }
@@ -195,8 +202,17 @@ export const agentActions = {
     const cwd = getActivePath() ?? HOME
     const { skills } = loadSkills(vfs, cwd)
     const { entries } = registryEntries(vfs)
+    const form = loadConfigForm()
+    let keyAvailable = form.apiKey.trim() !== ''
+    if (!keyAvailable && form.provider === 'meta') {
+      try {
+        const mirror = platform().vfs.read('/home/user/.cell/auth.json')
+        keyAvailable = mirror !== null && (JSON.parse(mirror) as { meta?: { key?: string } }).meta?.key !== undefined
+      } catch { /* no mirror */ }
+    }
     set({
-      config: loadConfigForm(),
+      keyAvailable,
+      config: form,
       sessions: listSessions(vfs)
         .map((name) => name.replace(/\.json$/, ''))
         .map((id) => sessionInfo(vfs, id)),
@@ -241,6 +257,9 @@ export const agentActions = {
   openSession(id: string): void {
     if (snapshot.running) return
     const { vfs } = platform()
+    const loaded = loadSession(vfs, id)
+    const estimated = 'error' in loaded ? 0 : loaded.session.turns.reduce((sum, turn) => sum + turn.text.length, 0)
+    set({ contextChars: estimated })
     const info = snapshot.sessions.find((s) => s.id === id)
     set({ entries: [], contextChars: 0, resumeTarget: id, sessionId: id, draft: '', activeLocked: info?.locked === true })
     seedHistoryEntries(vfs, id)
@@ -259,18 +278,20 @@ export const agentActions = {
   toggleArchive(id: string): void {
     const session = snapshot.sessions.find((s) => s.id === id)
     mutateSession(id, { archived: session?.archived !== true })
-    if (snapshot.resumeTarget === id) set({ resumeTarget: null })
+    if (snapshot.sessionId === id) set({ resumeTarget: null, sessionId: null, entries: [], activeLocked: false })
   },
 
   toggleLock(id: string): void {
     const session = snapshot.sessions.find((s) => s.id === id)
-    mutateSession(id, { locked: session?.locked !== true })
+    const locked = session?.locked !== true
+    mutateSession(id, { locked })
+    if (snapshot.sessionId === id) set({ activeLocked: locked })
   },
 
-  forkSession(id: string): void {
+  forkSession(id: string): string | null {
     const { vfs } = platform()
     const loaded = loadSession(vfs, id)
-    if ('error' in loaded) return
+    if ('error' in loaded) return null
     const newId = sessionId()
     try {
       saveSession(vfs, {
@@ -279,9 +300,12 @@ export const agentActions = {
         title: `${loaded.session.title ?? loaded.session.prompt.slice(0, 40)} (fork)`.slice(0, 80),
         startedAt: new Date().toISOString(),
         archived: false,
+        pinned: false,
+        locked: false,
       })
-    } catch { /* best-effort */ }
+    } catch { return null }
     agentActions.refresh()
+    return newId
   },
 
   deleteSession(id: string): void {
@@ -289,7 +313,7 @@ export const agentActions = {
     try {
       vfs.delete(`/home/user/.cell/sessions/${id}.json`)
     } catch { /* best-effort */ }
-    if (snapshot.resumeTarget === id) set({ resumeTarget: null, entries: [], sessionId: null })
+    if (snapshot.sessionId === id || snapshot.resumeTarget === id) set({ resumeTarget: null, entries: [], sessionId: null, activeLocked: false })
     agentActions.refresh()
   },
 
@@ -353,6 +377,11 @@ export const agentActions = {
         onToolResult: (call, toolResult) => {
           settleToolEntry(call.name, toolResult.isError === true)
           pushEntry('result', clipLines(toolResult.content, 16), call.name)
+          // a visual appears when it is written, not after the run
+          const writtenPath = typeof call.input.path === 'string' ? call.input.path : ''
+          if ((call.name === 'write' || call.name === 'edit') && writtenPath.endsWith('.html') && !toolResult.isError) {
+            pushVisualIfNew(vfs, writtenPath.startsWith('~') ? `/home/user${writtenPath.slice(1)}` : writtenPath)
+          }
         },
         onProgress: (line) => {
           if (line.startsWith('⏺ ')) {
@@ -373,7 +402,7 @@ export const agentActions = {
       if (result.stderr.trim() !== '') pushEntry('note', result.stderr.trim())
       if (abortController.signal.aborted) pushEntry('note', '■ stopped')
       else if (errorLine !== undefined) pushEntry('note', errorLine)
-      else pushEntry('note', result.exitCode === 0 ? '✓ done' : `✗ exit ${result.exitCode}`)
+      else if (result.stderr.trim() === '') pushEntry('note', result.exitCode === 0 ? '✓ done' : `✗ exit ${result.exitCode}`)
     } catch (err) {
       pushEntry('note', `✗ ${err instanceof Error ? err.message : String(err)}`)
     } finally {
@@ -394,26 +423,29 @@ function seedHistoryEntries(vfs: ReturnType<typeof platform>['vfs'], id: string)
   if ('error' in loaded) return
   const turns: SessionTurn[] = loaded.session.turns.slice(-60)
   pushEntry('note', `↻ resumed “${loaded.session.title ?? loaded.session.prompt.slice(0, 60)}” — earlier messages restored`)
-  let pendingVisual: string | null = null
+  const resultsById = new Map<string, { content: string; isError?: boolean }>()
+  for (const turn of turns) {
+    if (turn.role === 'tool') {
+      for (const result of turn.toolResults ?? []) resultsById.set(result.id, result)
+    }
+  }
   for (const turn of turns) {
     if (turn.role === 'user') pushEntry('user', turn.text)
     else if (turn.role === 'assistant') {
       if (turn.text.trim() !== '') pushEntry('assistant', turn.text)
       for (const call of turn.toolCalls ?? []) {
         pushEntry('tool', `${call.name} ${call.input.path ?? call.input.command ?? ''}`.trim(), call.name, 'complete')
+        const result = resultsById.get(call.id)
+        if (result !== undefined) pushEntry('result', clipLines(result.content, 12), call.name)
+        // visuals produced in this session render again on revisit
         const callPath = typeof call.input.path === 'string' ? call.input.path : ''
-        if (callPath.endsWith('.html')) pendingVisual = callPath
-      }
-    } else if (turn.role === 'tool') {
-      pushEntry('result', clipLines(turn.text, 12))
-      // visuals produced in this session render again on revisit
-      if (pendingVisual !== null) {
-        const normalized = pendingVisual.startsWith('~') ? `/home/user${pendingVisual.slice(1)}` : pendingVisual
-        if (vfs.isFile(normalized)) {
-          shownVisuals.add(normalized)
-          pushEntry('visual', normalized)
+        if (callPath.endsWith('.html')) {
+          const normalized = callPath.startsWith('~') ? `/home/user${callPath.slice(1)}` : callPath
+          if (vfs.isFile(normalized) && !shownVisuals.has(visualKey(vfs, normalized))) {
+            shownVisuals.add(visualKey(vfs, normalized))
+            pushEntry('visual', normalized)
+          }
         }
-        pendingVisual = null
       }
     }
   }
@@ -421,17 +453,27 @@ function seedHistoryEntries(vfs: ReturnType<typeof platform>['vfs'], id: string)
 
 const shownVisuals = new Set<string>()
 
+/** Change stamp so an overwritten artifact re-renders as a new visual. */
+function visualKey(vfs: ReturnType<typeof platform>['vfs'], path: string): string {
+  const stat = vfs.stat(path)
+  return `${path}@${stat?.mtime ?? 0}:${stat?.size ?? 0}`
+}
+
+function pushVisualIfNew(vfs: ReturnType<typeof platform>['vfs'], path: string): void {
+  if (!vfs.isFile(path)) return
+  const key = visualKey(vfs, path)
+  if (shownVisuals.has(key)) return
+  shownVisuals.add(key)
+  pushEntry('visual', path)
+}
+
 /** HTML artifacts the agent produced become in-chat visuals. */
 function pushVisualEntries(vfs: ReturnType<typeof platform>['vfs']): void {
   try {
     const dir = '/home/user/artifacts'
     if (!vfs.isDir(dir)) return
     for (const name of vfs.readDir(dir)) {
-      if (!name.endsWith('.html')) continue
-      const path = `${dir}/${name}`
-      if (shownVisuals.has(path)) continue
-      shownVisuals.add(path)
-      pushEntry('visual', path)
+      if (name.endsWith('.html')) pushVisualIfNew(vfs, `${dir}/${name}`)
     }
   } catch {
     // artifacts are best-effort
@@ -457,11 +499,22 @@ function summarizeCall(call: ToolCall): string {
   return JSON.stringify(call.input).slice(0, 140)
 }
 
+let approvalTimer: ReturnType<typeof setTimeout> | null = null
+
+function armApprovalTimer(): void {
+  if (approvalTimer !== null) clearTimeout(approvalTimer)
+  // aligned with the loop's own 300s approval timeout: whichever fires,
+  // the entry leaves the queue so a late click cannot resolve a dead
+  // promise or absorb a decision meant for the next call
+  approvalTimer = setTimeout(() => decideApproval(false), 300_000)
+}
+
 function approve(call: ToolCall): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const entry = { summary: `${call.name} ${summarizeCall(call)}`, resolve }
     approvalQueue.push(entry)
     set({ pendingSummary: entry.summary, pendingCount: approvalQueue.length })
+    if (approvalQueue.length === 1) armApprovalTimer()
     platform().bus.emit('app:status', { message: 'agent waiting for approval…', tone: 'info' })
   })
 }
@@ -469,6 +522,10 @@ function approve(call: ToolCall): Promise<boolean> {
 function decideApproval(allowed: boolean): void {
   const head = approvalQueue[0]
   if (head === undefined) return
+  if (approvalTimer !== null) {
+    clearTimeout(approvalTimer)
+    approvalTimer = null
+  }
   // debounce double-clicks per queue head, not globally
   const now = Date.now()
   if (lastDecidedSummary === head.summary && now - lastDecisionAt < 350) return
@@ -478,9 +535,14 @@ function decideApproval(allowed: boolean): void {
   head.resolve(allowed)
   const next = approvalQueue[0]
   set({ pendingSummary: next ? next.summary : null, pendingCount: approvalQueue.length })
+  if (next) armApprovalTimer()
 }
 
 function cancelApprovals(): void {
+  if (approvalTimer !== null) {
+    clearTimeout(approvalTimer)
+    approvalTimer = null
+  }
   for (const entry of approvalQueue.splice(0)) entry.resolve(false)
   if (snapshot.pendingSummary !== null) set({ pendingSummary: null, pendingCount: 0 })
 }

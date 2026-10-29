@@ -132,6 +132,17 @@ async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Pro
 
 const META_URL = 'https://api.meta.ai/v1/responses'
 
+/** Combine the per-call timeout with the user's stop signal. */
+function mergedSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  if (signal === undefined) return timeout
+  try {
+    return AbortSignal.any([timeout, signal])
+  } catch {
+    return timeout
+  }
+}
+
 function parseMetaResponse(data: {
   id?: string
   status?: string
@@ -301,14 +312,17 @@ export async function callModel(
   onProgress?: (line: string) => void,
   /** full turns for the Meta re-anchor fallback (chained id expiry) */
   history?: MetaHistoryTurn[],
+  /** user stop signal: aborts the in-flight fetch/stream immediately */
+  signal?: AbortSignal,
 ): Promise<ModelTurn | { error: string }> {
   try {
-    if (config.provider === 'meta') return callMeta(config, state, entries, systemPrompt, onProgress, history)
-    if (config.provider === 'anthropic') return callAnthropic(config, state, entries, systemPrompt)
+    if (signal?.aborted) return { error: 'stopped by user' }
+    if (config.provider === 'meta') return callMeta(config, state, entries, systemPrompt, onProgress, history, signal)
+    if (config.provider === 'anthropic') return callAnthropic(config, state, entries, systemPrompt, signal)
     const url = config.provider === 'compat'
       ? `${(config.baseURL ?? '').replace(/\/+$/, '')}/chat/completions`
       : 'https://api.openai.com/v1/chat/completions'
-    return callOpenAI(config, state, entries, systemPrompt, url)
+    return callOpenAI(config, state, entries, systemPrompt, url, signal)
   } catch (err) {
     const hint = err instanceof TypeError ? ' (network/CORS — the browser could not reach the API)' : ''
     return { error: `${err instanceof Error ? err.message : String(err)}${hint}` }
@@ -320,10 +334,11 @@ async function callAnthropic(
   state: ProviderState,
   entries: ToolInfo[],
   systemPrompt: string,
+  signal?: AbortSignal,
 ): Promise<ModelTurn | { error: string }> {
   const response = await fetchWithRetry('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    signal: AbortSignal.timeout(120_000),
+    signal: mergedSignal(120_000, signal),
     headers: {
       'content-type': 'application/json',
       'x-api-key': config.apiKey,
@@ -358,13 +373,14 @@ async function callOpenAI(
   entries: ToolInfo[],
   systemPrompt: string,
   url = 'https://api.openai.com/v1/chat/completions',
+  signal?: AbortSignal,
 ): Promise<ModelTurn | { error: string }> {
   if (url.startsWith('/chat/completions') || url === 'chat/completions') {
     return { error: 'compat provider needs "baseURL" in ~/.cell/agent.json (e.g. https://api.x.ai/v1)' }
   }
   const response = await fetchWithRetry(url, {
     method: 'POST',
-    signal: AbortSignal.timeout(120_000),
+    signal: mergedSignal(120_000, signal),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
     body: JSON.stringify({
       model: config.model,
@@ -398,6 +414,7 @@ async function callMeta(
   systemPrompt: string,
   onProgress?: (line: string) => void,
   history?: MetaHistoryTurn[],
+  signal?: AbortSignal,
 ): Promise<ModelTurn | { error: string }> {
   const maxOutput = config.maxOutputTokens ?? 4096
   const tools = toMetaTools(entries)
@@ -405,7 +422,7 @@ async function callMeta(
   // live through onProgress; the final response still comes from the
   // response.completed event. Non-streaming otherwise (simpler for tests).
   if (onProgress !== undefined) {
-    return callMetaStream(config, state, tools, systemPrompt, maxOutput, onProgress, history)
+    return callMetaStream(config, state, tools, systemPrompt, maxOutput, onProgress, history, signal)
   }
   const reasoning = config.thinking !== undefined && config.thinking !== 'off' ? { reasoning: { effort: config.thinking } } : {}
   const requestBody = state.metaResponseId === null
@@ -428,7 +445,7 @@ async function callMeta(
       }
   const response = await fetchWithRetry(META_URL, {
     method: 'POST',
-    signal: AbortSignal.timeout(180_000),
+    signal: mergedSignal(180_000, signal),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}` },
     body: JSON.stringify(requestBody),
   })
@@ -451,6 +468,7 @@ async function callMetaStream(
   maxOutput: number,
   onProgress: (line: string) => void,
   history?: MetaHistoryTurn[],
+  signal?: AbortSignal,
 ): Promise<ModelTurn | { error: string }> {
   const reasoning = config.thinking !== undefined && config.thinking !== 'off' ? { reasoning: { effort: config.thinking } } : {}
   const requestBody =
@@ -476,7 +494,7 @@ async function callMetaStream(
         }
   const response = await fetchWithRetry(META_URL, {
     method: 'POST',
-    signal: AbortSignal.timeout(180_000),
+    signal: mergedSignal(180_000, signal),
     headers: { 'content-type': 'application/json', authorization: `Bearer ${config.apiKey}`, accept: 'text/event-stream' },
     body: JSON.stringify(requestBody),
   })

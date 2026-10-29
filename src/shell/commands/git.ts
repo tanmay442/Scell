@@ -781,7 +781,21 @@ async function runNetworkCommand(
 
 // ---- the command ----------------------------------------------------------
 
-export async function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string; progress?: (line: string) => void }): Promise<CommandResult> {
+let gitQueue: Promise<unknown> = Promise.resolve()
+
+/**
+ * All git calls serialize behind one queue: lg2 shares a module-level
+ * output collector and MEMFS mirror, so two interleaved calls (an
+ * agent step and a UI poll, say) corrupt each other's sync-back —
+ * files written between snapshot and sync could be deleted.
+ */
+export function gitCommand(vfs: Vfs, args: string[], opts: { cwd: string; progress?: (line: string) => void }): Promise<CommandResult> {
+  const run = gitQueue.then(() => gitCommandImpl(vfs, args, opts))
+  gitQueue = run.catch(() => {})
+  return run
+}
+
+async function gitCommandImpl(vfs: Vfs, args: string[], opts: { cwd: string; progress?: (line: string) => void }): Promise<CommandResult> {
   const { cwd } = opts
   if (args.length === 0) {
     return usage()

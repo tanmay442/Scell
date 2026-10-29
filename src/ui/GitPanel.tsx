@@ -45,7 +45,7 @@ function readBranch(vfs: Vfs, root: string): string | null {
   return sha.length >= 7 ? `${sha.slice(0, 7)} (detached)` : null
 }
 
-function parseStatus(stdout: string): Change[] {
+export function parseStatus(stdout: string): Change[] {
   const changes: Change[] = []
   const seen = new Set<string>()
   const pattern = /^(new file|modified|deleted|renamed|typechange|added):\s*(.+)$/

@@ -51,6 +51,7 @@ import {
 } from '@heroicons/react/24/outline'
 import { agentActions, agentStore, COMPACT_AT_CHARS, type AgentConfigForm, type ChatEntry, type SessionInfo } from './agent-store'
 import { platform } from '../platform'
+import { groupItems, splitHtmlBlocks } from './agent-entries'
 import { Logo } from './Logo'
 import SlicedWaves from './SlicedWaves'
 
@@ -86,42 +87,6 @@ const resultBox: CSSProperties = {
 }
 const approvalPre: CSSProperties = { whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--mono, monospace)', fontSize: 'var(--font-size-sm, 12px)' }
 
-/** Fold result entries into their tool entry (adjacent, same call). */
-function mergeToolResults(entries: readonly ChatEntry[]): ChatEntry[] {
-  const out: (ChatEntry & { resultText?: string })[] = []
-  for (const entry of entries) {
-    const prev = out[out.length - 1]
-    if (entry.kind === 'result' && prev?.kind === 'tool') {
-      out[out.length - 1] = { ...prev, resultText: entry.text }
-      continue
-    }
-    out.push(entry)
-  }
-  return out
-}
-
-type DisplayItem =
-  | { kind: 'single'; entry: ChatEntry & { resultText?: string } }
-  | { kind: 'tools'; id: number; entries: (ChatEntry & { resultText?: string })[] }
-
-function groupItems(entries: readonly ChatEntry[]): DisplayItem[] {
-  const merged = mergeToolResults(entries)
-  const items: DisplayItem[] = []
-  for (const entry of merged) {
-    const last = items[items.length - 1]
-    if (entry.kind === 'tool' && last?.kind === 'tools') {
-      last.entries.push(entry)
-      continue
-    }
-    if (entry.kind === 'tool') {
-      items.push({ kind: 'tools', id: entry.id, entries: [entry] })
-      continue
-    }
-    items.push({ kind: 'single', entry })
-  }
-  return items
-}
-
 const visualFrame: CSSProperties = {
   width: '100%',
   border: 'none',
@@ -129,13 +94,6 @@ const visualFrame: CSSProperties = {
   display: 'block',
 }
 
-/**
- * Interactive HTML visual, embedded so it reads as part of the thread:
- * no border, no card background, and the frame grows to the content
- * height (the chat scrolls; the visual never scrolls internally).
- * Sandboxed to scripts only — the content reports its height back
- * through postMessage, verified against the frame's own window.
- */
 function HtmlVisual({ path, html }: { path?: string; html?: string }) {
   const content = html ?? (path !== undefined ? (platform().vfs.read(path) ?? '') : '')
   const frameRef = useRef<HTMLIFrameElement>(null)
@@ -152,8 +110,8 @@ function HtmlVisual({ path, html }: { path?: string; html?: string }) {
   }, [])
 
   if (content === '') return null
-  const baseStyle = '<style>html,body{background:transparent!important;margin:0;padding:0;color:#ECECEC;font-family:system-ui,sans-serif}::-webkit-scrollbar{width:0;height:0}</style>'
-  const reporter = '<script>function __cellReport(){try{parent.postMessage({__cellVisualHeight:document.documentElement.scrollHeight},"*")}catch(e){}}window.addEventListener("load",__cellReport);if(window.ResizeObserver){new ResizeObserver(__cellReport).observe(document.documentElement)}</' + '<' + '/script>'
+  const baseStyle = '<style>html,body{background:transparent!important;margin:0;padding:0;height:auto!important;min-height:0!important;color:#ECECEC;font-family:system-ui,sans-serif}::-webkit-scrollbar{width:0;height:0}</style>'
+  const reporter = '<script>function __cellMeasure(){var b=document.body,d=document.documentElement;return Math.max(b?b.scrollHeight:0,b?b.offsetHeight:0,d.scrollHeight,d.offsetHeight)}function __cellReport(){try{parent.postMessage({__cellVisualHeight:__cellMeasure()},"*")}catch(e){}}window.addEventListener("load",function(){__cellReport();setTimeout(__cellReport,300);setTimeout(__cellReport,1200)});if(window.ResizeObserver){new ResizeObserver(__cellReport).observe(document.documentElement);if(document.body)new ResizeObserver(__cellReport).observe(document.body)}</' + '<' + '/script>'
   const withBase = content.includes('<head>')
     ? content.replace('<head>', `<head>${baseStyle}`)
     : content.includes('<html')
@@ -171,20 +129,6 @@ function HtmlVisual({ path, html }: { path?: string; html?: string }) {
 }
 
 /** Split assistant text into markdown and ```html fenced parts. */
-function splitHtmlBlocks(text: string): { kind: 'md' | 'html'; text: string }[] {
-  const parts: { kind: 'md' | 'html'; text: string }[] = []
-  const fence = /```html\s*\n([\s\S]*?)```/g
-  let last = 0
-  let match: RegExpExecArray | null
-  while ((match = fence.exec(text)) !== null) {
-    if (match.index > last) parts.push({ kind: 'md', text: text.slice(last, match.index) })
-    parts.push({ kind: 'html', text: match[1] })
-    last = match.index + match[0].length
-  }
-  if (last < text.length) parts.push({ kind: 'md', text: text.slice(last) })
-  return parts.length > 0 ? parts : [{ kind: 'md', text }]
-}
-
 function orderedSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
   return sessions.filter((s) => !s.archived).sort((a, b) => Number(b.pinned === true) - Number(a.pinned === true))
 }
@@ -204,6 +148,7 @@ function shareSession(id: string, label: string): void {
   anchor.click()
   URL.revokeObjectURL(url)
 }
+
 
 const Transcript = memo(function Transcript({ entries, running }: { entries: readonly ChatEntry[]; running: boolean }) {
   const items = groupItems(entries)
@@ -329,6 +274,12 @@ function ContextRing({ chars }: { chars: number }) {
 function VoiceButton() {
   const [listening, setListening] = useState(false)
   const recognitionRef = useRef<{ stop: () => void } | null>(null)
+  // never leave the mic hot when the composer unmounts (mode switch,
+  // hero->chat remount): stop recognition and drop its handlers
+  useEffect(() => () => {
+    try { recognitionRef.current?.stop() } catch { /* already stopped */ }
+    recognitionRef.current = null
+  }, [])
   const supported = typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)
 
   const toggle = () => {
@@ -389,15 +340,29 @@ const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
 function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const wasRunning = useRef(false)
+  useEffect(() => {
+    // keep the keyboard where the conversation is: after the first
+    // send (hero remounts into the chat) and when a run ends
+    if (wasRunning.current !== state.running || state.entries.length <= 1) {
+      wrapRef.current?.querySelector<HTMLElement>('[contenteditable="true"]')?.focus()
+    }
+    wasRunning.current = state.running
+  }, [state.running, state.entries.length])
   const form = state.config
-  const needsKey = form.apiKey.trim() === '' && form.provider !== 'compat'
+  const needsKey = !state.keyAvailable && form.provider !== 'compat'
   const modelLabel = MODEL_PRESETS.find((preset) => preset.provider === form.provider && preset.model === form.model)?.label ?? (form.model || form.provider)
 
   const attachFiles = async (files: FileList | null) => {
     if (files === null) return
     for (const file of [...files]) {
+      if (file.size > 200_000) {
+        agentActions.appendDraft(`[file: ${file.name} — too large to attach (${Math.round(file.size / 1024)} KB)]`)
+        continue
+      }
       try {
-        const text = await file.text()
+        const text = await file.slice(0, 64_000).text()
         const clipped = text.length > 12_000 ? `${text.slice(0, 12_000)}\n… (truncated)` : text
         agentActions.setDraft(`${agentStore.get().draft}\n\n[file: ${file.name}]\n\`\`\`\n${clipped}\n\`\`\``)
       } catch {
@@ -407,7 +372,7 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
   }
 
   return (
-    <>
+    <div ref={wrapRef}>
       <input
         ref={fileInputRef}
         type="file"
@@ -425,7 +390,7 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
         onSubmit={(value) => void agentActions.run(value)}
         isStopShown={state.running}
         onStop={() => agentActions.stop()}
-        placeholder="Ask anything. @ files, $ skills, / commands"
+        placeholder="Ask anything. / commands work here"
         input={<ChatComposerInput style={{ minHeight: 56 }} />}
         isDisabled={state.activeLocked}
         status={
@@ -485,7 +450,7 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
           </HStack>
         }
       />
-    </>
+    </div>
   )
 }
 
@@ -500,6 +465,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<AgentConfigForm | null>(null)
   const [renameTarget, setRenameTarget] = useState<{ id: string; value: string } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null)
   const form = state.config
 
   useEffect(() => {
@@ -578,14 +544,14 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                     label={`Options for ${session.label}`}
                     size="sm"
                     items={[
-                      { label: 'Rename', icon: PencilIcon, onClick: () => setRenameTarget({ id: session.id, value: session.label }) },
+                      { label: 'Rename', icon: PencilIcon, onClick: () => setRenameTarget({ id: session.id, value: session.title ?? '' }) },
                       { label: session.pinned ? 'Unpin' : 'Pin', icon: BookmarkIcon, onClick: () => agentActions.togglePin(session.id) },
                       { label: session.locked ? 'Unlock chat' : 'Lock chat', icon: session.locked ? LockOpenIcon : LockClosedIcon, onClick: () => agentActions.toggleLock(session.id) },
                       { label: 'Share', icon: ShareIcon, onClick: () => shareSession(session.id, session.label) },
-                      { label: 'Fork', icon: DocumentDuplicateIcon, onClick: () => agentActions.forkSession(session.id) },
+                      { label: 'Fork', icon: DocumentDuplicateIcon, onClick: () => { const forkId = agentActions.forkSession(session.id); if (forkId !== null) agentActions.openSession(forkId) } },
                       { type: 'divider' as const },
                       { label: session.archived ? 'Unarchive' : 'Archive', icon: ArchiveBoxIcon, onClick: () => agentActions.toggleArchive(session.id) },
-                      { label: 'Delete', icon: TrashIcon, onClick: () => agentActions.deleteSession(session.id) },
+                      { label: 'Delete', icon: TrashIcon, onClick: () => setDeleteTarget({ id: session.id, label: session.label }) },
                     ]}
                   />
                 }
@@ -614,7 +580,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                           size="sm"
                           items={[
                             { label: 'Unarchive', icon: ArchiveBoxIcon, onClick: () => agentActions.toggleArchive(session.id) },
-                            { label: 'Delete', icon: TrashIcon, onClick: () => agentActions.deleteSession(session.id) },
+                            { label: 'Delete', icon: TrashIcon, onClick: () => setDeleteTarget({ id: session.id, label: session.label }) },
                           ]}
                         />
                       }
@@ -706,6 +672,26 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
                 }}
               />
               <Button label="Cancel" variant="ghost" onClick={() => setRenameTarget(null)} />
+            </HStack>
+          </VStack>
+        ) : null}
+      </Dialog>
+
+      <Dialog isOpen={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }} purpose="form" width={420} padding={4}>
+        {deleteTarget !== null ? (
+          <VStack gap={3}>
+            <Text type="label" weight="semibold">Delete “{deleteTarget.label}”?</Text>
+            <Text type="supporting" color="secondary">The session file is removed. This cannot be undone.</Text>
+            <HStack gap={2}>
+              <Button
+                label="Delete"
+                variant="destructive"
+                onClick={() => {
+                  agentActions.deleteSession(deleteTarget.id)
+                  setDeleteTarget(null)
+                }}
+              />
+              <Button label="Cancel" variant="ghost" onClick={() => setDeleteTarget(null)} />
             </HStack>
           </VStack>
         ) : null}

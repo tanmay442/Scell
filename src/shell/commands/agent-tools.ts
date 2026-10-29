@@ -368,13 +368,16 @@ export class JobManager {
   start(command: string, cwd: string): JobRecord {
     const denied = bashDenyReason(command)
     if (denied !== null) throw new Error(denied)
-    const id = `job-${++this.counter}`
+    // run-scoped unique id: a bare counter per run overwrote the
+    // previous run's job-1 status/log while it could still write
+    const id = `job-${Date.now().toString(36)}-${++this.counter}`
+    const startedAt = Date.now()
     const record: JobRecord = { id, command, status: 'running', output: '' }
     this.jobs.set(id, record)
     const logPath = `${JOBS_DIR}/${id}.log`
     const writeStatus = () => {
       try {
-        this.vfs.write(`${JOBS_DIR}/${id}.json`, JSON.stringify({ id, command, status: record.status, ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}) }))
+        this.vfs.write(`${JOBS_DIR}/${id}.json`, JSON.stringify({ id, command, status: record.status, startedAt, ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}) }))
       } catch { /* status file is best-effort */ }
     }
     writeStatus()

@@ -15,6 +15,13 @@ pnpm dev          # → http://localhost:5199
 That's the whole setup. The WASM toolchain (21 MB total) is committed under
 `public/wasm/` — no native builds, no downloads.
 
+The app opens on the **Agent home**: a chat front door (sessions with
+model-generated titles, skills, tools, model settings, a status dock with
+agent/jobs/review state) where an agent works the workspace for you. The
+full IDE — editor, terminal, git, preview — is one click away under
+**Workspace**, and everything below describes both surfaces. In the
+terminal, the same harness answers to `cell agent "task"`.
+
 ## What works (all asserted by tests)
 
 | Capability | How it's real | Verified by |
@@ -29,13 +36,15 @@ That's the whole setup. The WASM toolchain (21 MB total) is committed under
 | git | Real libgit2 1.9.4 (wasm-git). `.git` is a visible directory; clone/fetch/push over https — CORS-blocked hosts (github) go through a relay chain automatically; `pull` = fetch+merge | e2e: clone from a real git server + github through the relay |
 | App preview | `cell preview`: esbuild-wasm bundles the module graph in-page (exports maps, subpaths, tsx, images), Tailwind compiled live by the oxide runtime, `public/` served at root, Vercel-style `api/*.js` executed per request in the isolate, hot reload | browser e2e benchmarks (style + asset truth probes) |
 | Object storage | `cell save/list/load/status` — whole-workspace tar.gz to any S3-compatible endpoint, SigV4 on WebCrypto (verified against botocore) | `cell-cmd.test.ts` |
-| AI agent | `cell agent "task" [--steps N] [--resume <id>]` — Meta/Anthropic/OpenAI tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill` + custom `~/.cell/tools/*.json`, skills with progressive disclosure, slash commands, sessions in `~/.cell/sessions/`, per-tool approval, secret redaction, SSE streaming | `agent*.test.ts` |
+| AI agent | Agent home (front door) + `cell agent "task"` in the terminal — Meta/Anthropic/OpenAI/OpenAI-compatible tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill`/`job_start`/`job_poll`/`job_list` + custom `~/.cell/tools/*.json`, skills with progressive disclosure, slash commands, persisted sessions (model-generated titles, pin/lock/archive/fork), resumable chat with restored history, HTML visuals rendered in-thread, per-tool approval in Ask mode (default: full permission), background jobs, secret redaction, SSE streaming, abort + auto-compaction | `agent*.test.ts` |
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ UI (React): Explorer · Editor (CodeMirror) · Terminal (xterm)│
+│ Agent home (Astryx): chat · sessions · skills · settings     │
+│ StatusDock: agent state · jobs · review · workspace          │
+│ Workspace: Explorer · Editor (CodeMirror) · Terminal (xterm) │
 │             GitPanel · PreviewPanel · Problems               │
 ├──────────────────────────────────────────────────────────────┤
 │ EventBus  ← coalesced VFS events (one emit per 120ms window) │
@@ -94,6 +103,7 @@ scripts/
   e2e.mjs              main e2e over headless Chrome (raw CDP, no deps)
   e2e-gdg.mjs          benchmark: clone/build/preview the gdg-hbtu site
   e2e-scribe.mjs       repro: clone/build/preview the scribe site
+  e2e-agent.mjs        live agent loop against the Meta API (CELL_AGENT_LIVE_KEY)
   git-http-server.mjs  real `git http-backend` server for clone tests
   vendor-public.mjs    postinstall: materialize public/vendor/ from npm
 public/
@@ -138,12 +148,12 @@ plus the live registry and github (internet required).
 | File | Purpose |
 |---|---|
 | `~/.gitconfig` | git identity — edited in the app, bridged into libgit2 |
-| `~/.cell/agent.json` | `{ "provider": "meta" \| "anthropic" \| "openai", "model": "…", "apiKey": "…" }` — meta uses `muse-spark-1.3-contributor` and reads the key from the machine auth file when `apiKey` is omitted |
+| `~/.cell/agent.json` | `{ "provider": "meta" \| "anthropic" \| "openai" \| "compat", "model": "…", "apiKey": "…", "baseURL": "…" (compat), "permission": "full" \| "ask" (default full), "thinking": "minimal".."xhigh" (meta reasoning effort) }` — seeded with meta defaults; in the browser the key must be in this file or the Agent panel (there is no host auth file in a tab); under Node/vitest meta also resolves `~/.pi/agent/auth.json` |
 | `~/.cell/env.json` | env vars for node processes and api functions (`{"GOOGLE_API_KEY": "…"}`) |
 | `~/.cell/tools/*.json` | custom agent tools: `{ "name", "description", "parameters", "run": { "kind": "bash", "command": "… {{arg}} …" } }` |
 | `~/.cell/skills/<name>/SKILL.md` | agent skills (frontmatter `name`+`description`, markdown body); project override at `<project>/.cell/skills/` |
 | `~/.cell/commands/*.md` | agent slash commands (`/commit`, `/preview` seeds) |
-| `~/.cell/sessions/*.json` | agent run transcripts + resumable history (`cell agent --resume <id>`) |
+| `~/.cell/sessions/*.json` | agent sessions: transcript + resumable history + sidebar metadata (`title` model-generated, `pinned`, `archived`, `locked`); resume via the sidebar or `cell agent --resume <id>` |
 | `~/.cell/storage.json` | S3-compatible endpoint for `cell save/load` snapshots |
 | `~/.gitconfig` `[cell] corsproxy` | custom git CORS relay list (`off` disables) |
 

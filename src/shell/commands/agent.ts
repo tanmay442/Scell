@@ -238,12 +238,17 @@ export async function generateSessionTitle(vfs: Vfs, id: string): Promise<string
   const lastAssistant = [...loaded.session.turns].reverse().find((turn) => turn.role === 'assistant')?.text ?? ''
   const ask = `Give this coding-agent session a 3-6 word title (plain words, no quotes, no period). Reply with the title only.\n\nTask: ${loaded.session.prompt.slice(0, 500)}\nOutcome: ${lastAssistant.slice(0, 500)}`
   const state = newProviderState(ask)
-  const result = await callModel(configured.config, state, [], 'You title sessions.', undefined, undefined)
+  const result = await callModel({ ...configured.config, thinking: 'minimal' }, state, [], 'You title sessions.', undefined, undefined)
   if ('error' in result) return null
   const title = result.text.trim().replace(/^["']|["']$/g, '').split('\n')[0].slice(0, 60).trim()
   if (title === '') return null
   try {
-    saveSession(vfs, { ...loaded.session, title })
+    // re-read before writing: a run may have persisted newer turns
+    // while the title call was in flight; never save the stale copy
+    const fresh = loadSession(vfs, id)
+    if ('error' in fresh) return null
+    if (fresh.session.title !== undefined && fresh.session.title.trim() !== '') return fresh.session.title
+    saveSession(vfs, { ...fresh.session, title })
   } catch {
     // best-effort
   }
@@ -369,7 +374,17 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
   const persist = (steps: number) => {
     try {
-      saveSession(vfs, { id, startedAt, provider: config.provider, model: config.model, prompt: sessionPrompt, transcript, turns, steps })
+      // merge sidebar metadata from disk at save time: a run must never
+      // wipe a title/pin/archive/lock the user set (or a title the
+      // titler wrote) while it was working
+      const existing = loadSession(vfs, id)
+      const meta = 'error' in existing ? {} : {
+        ...(existing.session.title !== undefined ? { title: existing.session.title } : {}),
+        ...(existing.session.pinned !== undefined ? { pinned: existing.session.pinned } : {}),
+        ...(existing.session.archived !== undefined ? { archived: existing.session.archived } : {}),
+        ...(existing.session.locked !== undefined ? { locked: existing.session.locked } : {}),
+      }
+      saveSession(vfs, { id, startedAt, provider: config.provider, model: config.model, prompt: sessionPrompt, transcript, turns, steps, ...meta })
     } catch {
       // sessions are best-effort — the transcript still returns
     }
@@ -386,7 +401,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     // the turns into one user message and continue from it (instead of
     // the old middle-drop, which lost decisions silently)
     const manualCompact = opts.shouldCompact?.() === true
-    if (step > 1 && step - lastCompactStep >= 3 && (manualCompact || contextSize(state, turns, config.provider) > COMPACT_AT_CHARS)) {
+    if (step > 1 && (manualCompact || (step - lastCompactStep >= 3 && contextSize(state, turns, config.provider) > COMPACT_AT_CHARS))) {
       const summary = await summarizeTurns(config, turns, entries)
       if (summary !== null) {
         applyCompaction(state, config.provider, summary)
@@ -396,7 +411,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
       }
     }
     opts.onContext?.(contextSize(state, turns, config.provider))
-    const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns)
+    const model = await callModel(config, state, entries, systemPrompt, opts.onProgress, turns, opts.signal)
     if ('error' in model) {
       transcript.push(`agent ✗ ${redactSecrets(model.error)}`)
       persist(step)

@@ -1484,3 +1484,9 @@ kbd {
 [data-astryx-theme] [role='dialog'] {
   corner-shape: squircle;
 }
+
+/* circles stay circles (avatars, status dots) */
+[data-astryx-theme] [class*='astryx-avatar'],
+[data-astryx-theme] [class*='astryx-avatar'] * {
+  corner-shape: round;
+}

@@ -5,7 +5,6 @@ import { Text } from '@astryxdesign/core/Text'
 import { Button } from '@astryxdesign/core/Button'
 import { StatusDot } from '@astryxdesign/core/StatusDot'
 import {
-  ChevronRightIcon,
   ChevronDownIcon,
   FolderOpenIcon,
   LinkIcon,
@@ -16,6 +15,8 @@ import { platform } from '../platform'
 import { agentStore } from './agent-store'
 import { getActivePath } from './workspace-store'
 import { findGitRepos, gitCommand } from '../shell/commands/git'
+import { parseStatus } from './GitPanel'
+import { agentStore as _agentStoreRef } from './agent-store'
 import { vfsPath } from '../vfs/types'
 import type { CSSProperties } from 'react'
 
@@ -47,6 +48,7 @@ const EMPTY: DockData = { jobsRunning: 0, jobsDone: 0, repoName: null, branch: n
 
 async function pollDock(): Promise<DockData> {
   const { vfs } = platform()
+  const agentBusy = _agentStoreRef.get().running
   let jobsRunning = 0
   let jobsDone = 0
   try {
@@ -55,9 +57,12 @@ async function pollDock(): Promise<DockData> {
       for (const name of vfs.readDir(dir)) {
         if (!name.endsWith('.json')) continue
         try {
-          const parsed = JSON.parse(vfs.read(`${dir}/${name}`) ?? '{}') as { status?: string }
-          if (parsed.status === 'running') jobsRunning++
-          else jobsDone++
+          const parsed = JSON.parse(vfs.read(`${dir}/${name}`) ?? '{}') as { status?: string; startedAt?: number }
+          // a crashed tab leaves 'running' behind forever; only the
+          // last hour counts as live, older is history
+          const fresh = parsed.startedAt !== undefined && Date.now() - parsed.startedAt < 3_600_000
+          if (parsed.status === 'running' && fresh) jobsRunning++
+          else if (parsed.status === 'done') jobsDone++
         } catch { /* ignore */ }
       }
     }
@@ -66,6 +71,10 @@ async function pollDock(): Promise<DockData> {
   let repoName: string | null = null
   let branch: string | null = null
   let changedFiles: string[] = []
+  if (agentBusy) {
+    // do not mirror the VFS into MEMFS mid-run; keep last git snapshot
+    return { jobsRunning, jobsDone, ...lastGit }
+  }
   try {
     const repos = findGitRepos(vfs)
     const active = getActivePath() ?? '/home/user/project'
@@ -75,15 +84,14 @@ async function pollDock(): Promise<DockData> {
       const head = vfs.read(`${root}/.git/HEAD`) ?? ''
       branch = head.startsWith('ref: refs/heads/') ? head.slice('ref: refs/heads/'.length).trim() : null
       const status = await gitCommand(vfs, ['status'], { cwd: root })
-      changedFiles = status.stdout
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line !== '' && !line.startsWith('#') && !line.startsWith('On branch') && !line.startsWith('Your branch'))
-        .slice(0, 20)
+      changedFiles = parseStatus(status.stdout).map((change) => change.path).slice(0, 20)
     }
   } catch { /* git is best-effort here */ }
+  lastGit = { repoName, branch, changedFiles }
   return { jobsRunning, jobsDone, repoName, branch, changedFiles }
 }
+
+let lastGit: Pick<DockData, 'repoName' | 'branch' | 'changedFiles'> = { repoName: null, branch: null, changedFiles: [] }
 
 /**
  * Persistent right-side status dock (both modes): what the agent is
@@ -108,7 +116,8 @@ export function StatusDock({ onOpenWorkspace }: { onOpenWorkspace?: () => void }
       alive = false
       clearInterval(timer)
     }
-  }, [agent.running, agent.entries.length])
+    // re-poll when a run starts/ends; entry pushes do not re-arm it
+  }, [agent.running])
 
   const lastTool = [...agent.entries].reverse().find((entry) => entry.kind === 'tool')
   const agentLabel = agent.pendingSummary !== null
@@ -176,7 +185,6 @@ export function StatusDock({ onOpenWorkspace }: { onOpenWorkspace?: () => void }
           <HStack gap={2} vAlign="center">
             <LinkIcon width={14} />
             <Text type="supporting" color="secondary">No connectors yet</Text>
-            <ChevronRightIcon width={12} />
           </HStack>
         </VStack>
       </Card>
