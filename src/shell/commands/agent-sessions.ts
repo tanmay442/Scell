@@ -27,6 +27,9 @@ export interface AgentSession {
   id: string
   /** model-generated short title for the sidebar (set lazily) */
   title?: string
+  pinned?: boolean
+  archived?: boolean
+  locked?: boolean
   startedAt: string
   provider: string
   model: string

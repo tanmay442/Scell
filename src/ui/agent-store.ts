@@ -2,7 +2,7 @@ import { platform } from '../platform'
 import { createShell } from '../shell/shell'
 import { runAgent, generateSessionTitle, COMPACT_AT_CHARS } from '../shell/commands/agent'
 import type { SessionTurn } from '../shell/commands/agent-sessions'
-import { listSessions, loadSession } from '../shell/commands/agent-sessions'
+import { listSessions, loadSession, saveSession, sessionId } from '../shell/commands/agent-sessions'
 import { loadSkills } from '../shell/commands/agent-skills'
 import { registryEntries, type ToolCall } from '../shell/commands/agent-tools'
 import { getActivePath } from './workspace-store'
@@ -35,11 +35,15 @@ export interface SessionInfo {
   id: string
   label: string
   title?: string
+  pinned?: boolean
+  archived?: boolean
+  locked?: boolean
 }
 
 export interface AgentSnapshot {
   entries: readonly ChatEntry[]
   running: boolean
+  activeLocked: boolean
   pendingSummary: string | null
   pendingCount: number
   sessions: readonly SessionInfo[]
@@ -62,6 +66,7 @@ let entryId = 0
 let snapshot: AgentSnapshot = {
   entries: [],
   running: false,
+  activeLocked: false,
   pendingSummary: null,
   pendingCount: 0,
   sessions: [],
@@ -144,11 +149,27 @@ function loadConfigForm(): AgentConfigForm {
 function sessionInfo(vfs: ReturnType<typeof platform>['vfs'], id: string): SessionInfo {
   const loaded = loadSession(vfs, id)
   if ('error' in loaded) return { id, label: id }
+  const flags = {
+    ...(loaded.session.pinned ? { pinned: true } : {}),
+    ...(loaded.session.archived ? { archived: true } : {}),
+    ...(loaded.session.locked ? { locked: true } : {}),
+  }
   const title = loaded.session.title?.trim()
-  if (title !== undefined && title !== '') return { id, label: title, title }
+  if (title !== undefined && title !== '') return { id, label: title, title, ...flags }
   const prompt = loaded.session.prompt.trim()
-  if (prompt !== '') return { id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt }
-  return { id, label: id }
+  if (prompt !== '') return { id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt, ...flags }
+  return { id, label: id, ...flags }
+}
+
+/** Patch flags/title on a stored session, preserving its history. */
+function mutateSession(id: string, patch: Partial<{ title: string; pinned: boolean; archived: boolean; locked: boolean }>): void {
+  const { vfs } = platform()
+  const loaded = loadSession(vfs, id)
+  if ('error' in loaded) return
+  try {
+    saveSession(vfs, { ...loaded.session, ...patch })
+  } catch { /* best-effort */ }
+  agentActions.refresh()
 }
 
 /** Sessions without a model title get one lazily (one cheap call each,
@@ -220,13 +241,71 @@ export const agentActions = {
   openSession(id: string): void {
     if (snapshot.running) return
     const { vfs } = platform()
-    set({ entries: [], contextChars: 0, resumeTarget: id, sessionId: id, draft: '' })
+    const info = snapshot.sessions.find((s) => s.id === id)
+    set({ entries: [], contextChars: 0, resumeTarget: id, sessionId: id, draft: '', activeLocked: info?.locked === true })
     seedHistoryEntries(vfs, id)
+  },
+
+  renameSession(id: string, title: string): void {
+    const clean = title.trim().slice(0, 80)
+    if (clean !== '') mutateSession(id, { title: clean })
+  },
+
+  togglePin(id: string): void {
+    const session = snapshot.sessions.find((s) => s.id === id)
+    mutateSession(id, { pinned: session?.pinned !== true })
+  },
+
+  toggleArchive(id: string): void {
+    const session = snapshot.sessions.find((s) => s.id === id)
+    mutateSession(id, { archived: session?.archived !== true })
+    if (snapshot.resumeTarget === id) set({ resumeTarget: null })
+  },
+
+  toggleLock(id: string): void {
+    const session = snapshot.sessions.find((s) => s.id === id)
+    mutateSession(id, { locked: session?.locked !== true })
+  },
+
+  forkSession(id: string): void {
+    const { vfs } = platform()
+    const loaded = loadSession(vfs, id)
+    if ('error' in loaded) return
+    const newId = sessionId()
+    try {
+      saveSession(vfs, {
+        ...loaded.session,
+        id: newId,
+        title: `${loaded.session.title ?? loaded.session.prompt.slice(0, 40)} (fork)`.slice(0, 80),
+        startedAt: new Date().toISOString(),
+        archived: false,
+      })
+    } catch { /* best-effort */ }
+    agentActions.refresh()
+  },
+
+  deleteSession(id: string): void {
+    const { vfs } = platform()
+    try {
+      vfs.delete(`/home/user/.cell/sessions/${id}.json`)
+    } catch { /* best-effort */ }
+    if (snapshot.resumeTarget === id) set({ resumeTarget: null, entries: [], sessionId: null })
+    agentActions.refresh()
+  },
+
+  /** Markdown export of a session transcript (Share). */
+  sessionMarkdown(id: string): string {
+    const { vfs } = platform()
+    const loaded = loadSession(vfs, id)
+    if ('error' in loaded) return ''
+    const lines = [`# ${loaded.session.title ?? loaded.session.prompt}`, '', `_${loaded.session.provider}/${loaded.session.model} · ${loaded.session.startedAt}_`, '']
+    for (const line of loaded.session.transcript) lines.push(line)
+    return lines.join('\n')
   },
 
   clearChat(): void {
     if (snapshot.running) return
-    set({ entries: [], contextChars: 0, sessionId: null, resumeTarget: null, draft: '' })
+    set({ entries: [], contextChars: 0, sessionId: null, resumeTarget: null, draft: '', activeLocked: false })
   },
 
   decide(allowed: boolean): void {
@@ -249,7 +328,7 @@ export const agentActions = {
     const resumeId = snapshot.resumeTarget
     const { vfs, bus } = platform()
     abortController = new AbortController()
-    set({ running: true, resumeTarget: null, draft: '' })
+    set({ running: true, resumeTarget: null, draft: '', activeLocked: false })
     pushEntry('user', text)
     bus.emit('app:status', { message: resumeId !== null ? `agent resuming ${resumeId}…` : 'agent running…', tone: 'info' })
     const cwd = getActivePath() ?? HOME

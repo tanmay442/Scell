@@ -73,6 +73,15 @@ const BASE_SYSTEM_PROMPT = `You are an autonomous coding agent running INSIDE Ce
 - python3 runs offline (pyodide fallback exists — matplotlib/numpy/pandas work); write visuals to ~/artifacts.
 - Preview browser apps with: cell preview [dir] (the bundler path, not a server).
 
+## Visuals in chat
+
+The chat renders HTML live. Use a visual whenever one explains better than text — a chart, a comparison, a diagram, a table with many rows, a timeline, a mockup. Do not describe in prose what a small visual would show at a glance.
+
+- Preferred: use the write tool to create a self-contained .html file at ~/artifacts/<name>.html (inline CSS/JS/SVG only, no external requests). It appears in the chat as an interactive visual the moment you finish.
+- Or emit a \`\`\`html fenced block in your reply for something small and inline.
+- Python charts: matplotlib PNGs are fine as files, but for anything the user should SEE in chat, build the HTML version (SVG bars/lines are easy to generate from the same numbers).
+- One idea per visual, values labelled, sized for a chat column (~760px wide, ~340px tall). Dark page background is safest; the visual sits on a white card otherwise, so give it its own background.
+
 Work like a careful engineer: inspect before changing, make small verifiable moves, run the checks, and say plainly what you did at the end.`
 
 function hostMetaKey(): string | null {

@@ -23,6 +23,7 @@ import { Card } from '@astryxdesign/core/Card'
 import { Button } from '@astryxdesign/core/Button'
 import { Dialog, DialogHeader } from '@astryxdesign/core/Dialog'
 import { DropdownMenu } from '@astryxdesign/core/DropdownMenu'
+import { MoreMenu } from '@astryxdesign/core/MoreMenu'
 import { TextInput } from '@astryxdesign/core/TextInput'
 import { Selector } from '@astryxdesign/core/Selector'
 import { ProgressBar } from '@astryxdesign/core/ProgressBar'
@@ -40,8 +41,16 @@ import {
   ClockIcon,
   CheckIcon,
   XMarkIcon,
+  PencilIcon,
+  BookmarkIcon,
+  LockClosedIcon,
+  LockOpenIcon,
+  ShareIcon,
+  ArchiveBoxIcon,
+  TrashIcon,
+  DocumentDuplicateIcon,
 } from '@heroicons/react/24/outline'
-import { agentActions, agentStore, COMPACT_AT_CHARS, type AgentConfigForm, type ChatEntry } from './agent-store'
+import { agentActions, agentStore, COMPACT_AT_CHARS, type AgentConfigForm, type ChatEntry, type SessionInfo } from './agent-store'
 import { platform } from '../platform'
 import { Logo } from './Logo'
 import SlicedWaves from './SlicedWaves'
@@ -150,6 +159,26 @@ function splitHtmlBlocks(text: string): { kind: 'md' | 'html'; text: string }[] 
   }
   if (last < text.length) parts.push({ kind: 'md', text: text.slice(last) })
   return parts.length > 0 ? parts : [{ kind: 'md', text }]
+}
+
+function orderedSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
+  return sessions.filter((s) => !s.archived).sort((a, b) => Number(b.pinned === true) - Number(a.pinned === true))
+}
+
+function archivedSessions<T extends { archived?: boolean }>(sessions: readonly T[]): T[] {
+  return sessions.filter((s) => s.archived)
+}
+
+function shareSession(id: string, label: string): void {
+  const markdown = agentActions.sessionMarkdown(id)
+  if (markdown === '') return
+  const blob = new Blob([markdown], { type: 'text/markdown' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${label.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 60) || id}.md`
+  anchor.click()
+  URL.revokeObjectURL(url)
 }
 
 const Transcript = memo(function Transcript({ entries, running }: { entries: readonly ChatEntry[]; running: boolean }) {
@@ -374,10 +403,13 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
         onStop={() => agentActions.stop()}
         placeholder="Ask anything. @ files, $ skills, / commands"
         input={<ChatComposerInput style={{ minHeight: 56 }} />}
+        isDisabled={state.activeLocked}
         status={
-          needsKey && !state.running
-            ? { type: 'error', message: 'No API key configured — open Model & settings in the sidebar to add one.' }
-            : undefined
+          state.activeLocked
+            ? { type: 'warning', message: 'This chat is locked. Unlock it from the session menu to continue.' }
+            : needsKey && !state.running
+              ? { type: 'error', message: 'No API key configured — open Model settings in the sidebar to add one.' }
+              : undefined
         }
         sendActions={
           <HStack gap={1} vAlign="center">
@@ -443,6 +475,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsDraft, setSettingsDraft] = useState<AgentConfigForm | null>(null)
+  const [renameTarget, setRenameTarget] = useState<{ id: string; value: string } | null>(null)
   const form = state.config
 
   useEffect(() => {
@@ -507,21 +540,66 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
           </SideNavSection>
 
           <SideNavSection title="Sessions">
+            <VStack gap={1.5}>
+            {orderedSessions(state.sessions).map((session) => (
+              <SideNavItem
+                key={session.id}
+                label={session.label}
+                icon={session.pinned ? BookmarkIcon : ClockIcon}
+                size="sm"
+                isSelected={state.resumeTarget === session.id}
+                onClick={() => agentActions.openSession(session.id)}
+                actions={
+                  <MoreMenu
+                    label={`Options for ${session.label}`}
+                    size="sm"
+                    items={[
+                      { label: 'Rename', icon: PencilIcon, onClick: () => setRenameTarget({ id: session.id, value: session.label }) },
+                      { label: session.pinned ? 'Unpin' : 'Pin', icon: BookmarkIcon, onClick: () => agentActions.togglePin(session.id) },
+                      { label: session.locked ? 'Unlock chat' : 'Lock chat', icon: session.locked ? LockOpenIcon : LockClosedIcon, onClick: () => agentActions.toggleLock(session.id) },
+                      { label: 'Share', icon: ShareIcon, onClick: () => shareSession(session.id, session.label) },
+                      { label: 'Fork', icon: DocumentDuplicateIcon, onClick: () => agentActions.forkSession(session.id) },
+                      { type: 'divider' as const },
+                      { label: session.archived ? 'Unarchive' : 'Archive', icon: ArchiveBoxIcon, onClick: () => agentActions.toggleArchive(session.id) },
+                      { label: 'Delete', icon: TrashIcon, onClick: () => agentActions.deleteSession(session.id) },
+                    ]}
+                  />
+                }
+              />
+            ))}
             {state.sessions.length === 0 ? (
               <Text type="supporting" color="secondary">No sessions yet</Text>
-            ) : (
-              state.sessions.map((session) => (
-                <SideNavItem
-                  key={session.id}
-                  label={session.label}
-                  icon={ClockIcon}
-                  size="sm"
-                  isSelected={state.resumeTarget === session.id}
-                  onClick={() => agentActions.openSession(session.id)}
-                />
-              ))
-            )}
+            ) : null}
+            </VStack>
           </SideNavSection>
+
+          {archivedSessions(state.sessions).length > 0 ? (
+            <SideNavSection title="Archived" isHeaderHidden>
+              <SideNavItem label={`Archived (${archivedSessions(state.sessions).length})`} icon={ArchiveBoxIcon} size="sm" collapsible={{ defaultIsCollapsed: true }}>
+                <VStack gap={1.5}>
+                  {archivedSessions(state.sessions).map((session) => (
+                    <SideNavItem
+                      key={session.id}
+                      label={session.label}
+                      size="sm"
+                      isSelected={state.resumeTarget === session.id}
+                      onClick={() => agentActions.openSession(session.id)}
+                      actions={
+                        <MoreMenu
+                          label={`Options for ${session.label}`}
+                          size="sm"
+                          items={[
+                            { label: 'Unarchive', icon: ArchiveBoxIcon, onClick: () => agentActions.toggleArchive(session.id) },
+                            { label: 'Delete', icon: TrashIcon, onClick: () => agentActions.deleteSession(session.id) },
+                          ]}
+                        />
+                      }
+                    />
+                  ))}
+                </VStack>
+              </SideNavItem>
+            </SideNavSection>
+          ) : null}
 
         </SideNav>
       }>
@@ -588,6 +666,26 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
           </LayoutContent>
         }
       />
+
+      <Dialog isOpen={renameTarget !== null} onOpenChange={(open) => { if (!open) setRenameTarget(null) }} purpose="form" width={420} padding={4}>
+        {renameTarget !== null ? (
+          <VStack gap={3}>
+            <Text type="label" weight="semibold">Rename session</Text>
+            <TextInput label="Title" value={renameTarget.value} onChange={(value) => setRenameTarget({ ...renameTarget, value })} />
+            <HStack gap={2}>
+              <Button
+                label="Save"
+                variant="primary"
+                onClick={() => {
+                  agentActions.renameSession(renameTarget.id, renameTarget.value)
+                  setRenameTarget(null)
+                }}
+              />
+              <Button label="Cancel" variant="ghost" onClick={() => setRenameTarget(null)} />
+            </HStack>
+          </VStack>
+        ) : null}
+      </Dialog>
 
       <Dialog isOpen={settingsOpen} onOpenChange={setSettingsOpen} purpose="form" width={520}>
         <Layout
