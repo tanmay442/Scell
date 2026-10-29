@@ -50,15 +50,15 @@ const SUGGESTIONS: { title: string; detail: string; prompt: string }[] = [
 const CONTENT_WIDTH = 800
 const fill: CSSProperties = { height: '100%', minHeight: 0 }
 const heroWrap: CSSProperties = { position: 'relative', height: '100%', overflow: 'hidden' }
-const wavesLayer: CSSProperties = { position: 'absolute', left: 0, right: 0, bottom: 0, height: '34%', opacity: 0.42, pointerEvents: 'none' }
+const wavesLayer: CSSProperties = { position: 'absolute', left: 0, right: 0, bottom: 0, height: '62%', opacity: 0.5, pointerEvents: 'none' }
 const heroContent: CSSProperties = {
   position: 'relative',
   height: '100%',
-  justifyContent: 'flex-start',
+  justifyContent: 'center',
   maxWidth: CONTENT_WIDTH,
   marginInline: 'auto',
   width: '100%',
-  padding: 'var(--spacing-12, 96px) var(--spacing-4, 16px) var(--spacing-4, 16px)',
+  padding: '24px',
 }
 const resultBox: CSSProperties = {
   whiteSpace: 'pre-wrap',
@@ -306,10 +306,11 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
             {isEmpty ? (
               <Stack style={heroWrap}>
                 <div style={wavesLayer} aria-hidden="true">
-                  <SlicedWaves ribbons={3} spacing={30} perspective={0.45} blur={0.6} glow={0.9} position={0.72} fade={0.35} mouseInteraction={false} paused />
+                  <SlicedWaves ribbons={3} spacing={30} perspective={0.45} blur={0.6} glow={0.9} position={0.72} fade={0.35} mouseInteraction={false} />
                 </div>
-                <VStack gap={3} style={heroContent}>
+                <VStack gap={4} style={heroContent}>
                   <VStack gap={2}>
+                    <Logo size={52} />
                     <Text type="display-2" as="h1">What should the agent do?</Text>
                     <Text type="body" color="secondary">
                       It works in this workspace: bash, files, git, npm, python charts, live preview.
