@@ -1474,3 +1474,13 @@ kbd {
 .title-home:hover {
   background: var(--hover);
 }
+
+/* squircle corner curve on Astryx container surfaces (composer, cards,
+   dialogs, dock) — border-radius comes from the theme tokens; buttons
+   and round controls keep circular corners */
+[data-astryx-theme] div,
+[data-astryx-theme] section,
+[data-astryx-theme] article,
+[data-astryx-theme] [role='dialog'] {
+  corner-shape: squircle;
+}
