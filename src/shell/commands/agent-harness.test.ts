@@ -583,7 +583,7 @@ describe('permission modes', () => {
 
 describe('UI hooks', () => {
   it('onSession/onToolResult/onContext fire during a run', async () => {
-    const vfs = permissionVfs()
+    const vfs = agentVfs()
     scriptStub([
       anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
       anthropicText('done'),
