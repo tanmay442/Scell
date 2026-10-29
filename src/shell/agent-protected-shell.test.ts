@@ -105,3 +105,16 @@ describe('protected shell: persistence channels stay closed', () => {
     expect(vfs.read('/home/user/.cell/agent.json')).toContain(SECRET)
   })
 })
+
+describe('protected shell: link sitting at ~/.bashrc survives rm', () => {
+  it('rm ~/.bashrc refuses when .bashrc is a symlink', async () => {
+    const vfs = seededVfs()
+    vfs.write('/home/user/dotfiles-bashrc', 'export HUMAN=1\n')
+    const { VfsBackedFs } = await import('./vfs-fs')
+    const humanFs = new VfsBackedFs(vfs)
+    await humanFs.symlink('/home/user/dotfiles-bashrc', '/home/user/.bashrc')
+    const deps = depsFor(vfs, true)
+    await bash(deps, 'rm ~/.bashrc')
+    expect(await humanFs.readlink('/home/user/.bashrc')).toBe('/home/user/dotfiles-bashrc')
+  })
+})

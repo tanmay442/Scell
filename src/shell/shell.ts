@@ -174,16 +174,28 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
   /** Source .bashrc in a subshell and report whether it exited 0.
    * The subshell contains `exit`; the RC line is echoed outside it, so
    * even a parse failure is distinguishable (marker absent = bad). */
-  const probeBashrc = async (probeCwd: string): Promise<boolean> => {
+  const probeBashrc = async (probeCwd: string, timeoutMs: number): Promise<boolean> => {
+    const rcPath = await prepareBashrc(randomHex())
+    if (rcPath === null) return false
     try {
-      const rcPath = await prepareBashrc(randomHex())
-      if (rcPath === null) return false
       const probe = `( . '${rcPath}' >/dev/null 2>&1; echo __CELL_BASHRC_RC__$? ); __cell_env_dump ${randomHex()} 0`
-      const result = await bash.exec(probe, { cwd: probeCwd, env: { ...sessionEnv } })
-      const match = /__CELL_BASHRC_RC__(\d+)/.exec(result.stdout)
-      return match !== null && match[1] === '0'
+      const bounded = timeoutMs > 0
+        ? await Promise.race([
+            bash.exec(probe, { cwd: probeCwd, env: { ...sessionEnv } }),
+            new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('probe timeout')), Math.min(timeoutMs, 30_000))),
+          ])
+        : await bash.exec(probe, { cwd: probeCwd, env: { ...sessionEnv } })
+      // verdict = the rc COMPLETED (marker present). An rc that merely
+      // ends non-zero ([ -f x ] guards, missing-tool checks) is normal
+      // bash and must be sourced, exports and all; only a parse-death
+      // (marker absent) marks it bad. Trade-off, explicit: the probe
+      // sources the rc once extra per uncached (hash, cwd) — rc side
+      // effects run twice on that first exec.
+      return /__CELL_BASHRC_RC__\d+/.test(bounded.stdout)
     } catch {
       return false
+    } finally {
+      void fs.rm(rcPath, { force: true }).catch(() => {})
     }
   }
 
@@ -215,7 +227,7 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
         const cached = bashrcVerdicts.get(bashrcKey)
         if (cached !== undefined) includeBashrc = cached
         else {
-          const ok = await probeBashrc(cwd ?? HOME_DIR)
+          const ok = await probeBashrc(cwd ?? HOME_DIR, timeoutMs)
           bashrcVerdicts.set(bashrcKey, ok)
           includeBashrc = ok
         }
@@ -224,12 +236,10 @@ export function createShell(vfs?: Vfs, opts?: { extraBins?: Map<string, string>;
       const runOnce = async (withBashrc: boolean): Promise<{ shellResult: ShellResult; markerMissing: boolean }> => {
         // the user command rides a temp file, never raw interpolation:
         // unclosed quotes/syntax in the file fail the `source` alone, so
-        // the epilogue below still runs (P0-3). `exit` is shadowed by a
-        // function whose `return` stops the sourced file with that code
-        // instead of killing the long-lived session shell. (.bashrc is
-        // probe-verified before inclusion — see probeBashrc; the shadow
-        // alone cannot save an exec from a .bashrc `exit`, because the
-        // shadow is defined inside the same script the exit aborts.)
+        // the epilogue below still runs (P0-3). .bashrc is sourced from
+        // the exit-to-return rewritten copy (prepareBashrc) after a
+        // probe verdict (probeBashrc) — no shadow is involved; just-
+        // bash's `exit` cannot be shadowed at all (verified).
         await fs.writeFile(tmpPath, cmd)
         const rcPath = withBashrc ? await prepareBashrc(nonce) : null
         const options = { cwd: cwd ?? HOME_DIR, env: { ...sessionEnv } }

@@ -82,13 +82,23 @@ export function AgentPanel() {
 
   // FIFO: parallel runs/jobs can queue approvals; a single-slot
   // resolver would drop all but the last
+  const approvalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const armApprovalTimer = useCallback(() => {
+    if (approvalTimerRef.current !== null) clearTimeout(approvalTimerRef.current)
+    // mirror the harness-side 300s approval timeout so a dead prompt
+    // leaves the head of the queue instead of hiding the next call
+    approvalTimerRef.current = setTimeout(() => decide(false), 300_000)
+  }, [])
   const approve = useCallback((call: ToolCall): Promise<boolean> => {
     return new Promise<boolean>((resolve) => {
       const entry = { summary: `${call.name} ${summarizeCall(call)}`, resolve }
       approvalQueueRef.current.push(entry)
-      if (approvalQueueRef.current.length === 1) setPending({ summary: entry.summary })
+      if (approvalQueueRef.current.length === 1) {
+        setPending({ summary: entry.summary })
+        armApprovalTimer()
+      }
     })
-  }, [])
+  }, [armApprovalTimer])
 
   const lastDecisionRef = useRef(0)
   const decide = (allowed: boolean) => {
@@ -96,10 +106,15 @@ export function AgentPanel() {
     const now = Date.now()
     if (now - lastDecisionRef.current < 350) return
     lastDecisionRef.current = now
+    if (approvalTimerRef.current !== null) {
+      clearTimeout(approvalTimerRef.current)
+      approvalTimerRef.current = null
+    }
     const head = approvalQueueRef.current.shift()
     head?.resolve(allowed)
     const next = approvalQueueRef.current[0]
     setPending(next ? { summary: next.summary } : null)
+    if (next) armApprovalTimer()
   }
 
   const cancelApprovals = () => {

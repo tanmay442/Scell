@@ -177,6 +177,10 @@ function sidecarFor(metaVfs: Vfs): SharedSidecar {
       reload()
       return
     }
+    if (event.kind === 'rename' && event.to === FS_META_PATH) {
+      if (!selfSaving) reload()
+      return
+    }
     if (event.kind === 'delete') store.prune(event.path)
     if (event.kind === 'rename' && event.to !== undefined) store.remap(event.path, event.to)
   })
@@ -560,6 +564,10 @@ export class VfsBackedFs implements IFileSystem {
   async rm(path: string, options?: RmOptions): Promise<void> {
     const z = this.locate(path)
     if (z.zone === 'devnull') return
+    // literal-path protection first: a symlink SITTING at ~/.bashrc or
+    // inside ~/.cell must not be deleted by a protected shell, while
+    // removing an unprotected link pointing at a protected target is fine
+    this.guardSidecarWrite(path)
     // a symlink itself is removed even when its target is gone or
     // protected (exists() follows the link and would lie)
     if (this.symlinks.has(normalize(path))) {
@@ -607,6 +615,7 @@ export class VfsBackedFs implements IFileSystem {
   }
 
   async mv(src: string, dest: string): Promise<void> {
+    this.guardSidecarWrite(src)
     this.guardSidecarWrite(dest)
     if (!(await this.exists(src))) throw new Error(`ENOENT: no such file or directory '${src}'`)
     if (await this.exists(dest)) await this.rm(dest, { recursive: true })
@@ -650,11 +659,12 @@ export class VfsBackedFs implements IFileSystem {
   getAllPaths(): string[] {
     const paths = this.vfs.listAllFiles()
     paths.push(...this.sysFiles.keys())
-    paths.push(...this.symlinks.keys())
+    paths.push(...[...this.symlinks.keys()].filter((key) => !(this.fsProtected && isProtectedPath(key))))
     return paths
   }
 
   async chmod(path: string, mode: number): Promise<void> {
+    this.guardSidecarWrite(path)
     if (!(await this.exists(path))) throw new Error(`ENOENT: no such file or directory '${path}'`)
     this.modes.set(normalize(path), mode)
     this.sidecar.save()
@@ -688,7 +698,7 @@ export class VfsBackedFs implements IFileSystem {
 
   async lstat(path: string): Promise<FsStat> {
     const p = normalize(path)
-    const target = this.symlinks.get(p)
+    const target = this.fsProtected && isProtectedPath(p) ? undefined : this.symlinks.get(p)
     if (target !== undefined) {
       return {
         isFile: false,

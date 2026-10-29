@@ -85,15 +85,24 @@ export default function TerminalPanel() {
       if (call.input.path !== undefined) return String(call.input.path)
       return JSON.stringify(call.input).slice(0, 140)
     }
+    let approvalTimer: ReturnType<typeof setTimeout> | null = null
     const showApproval = () => {
       const head = approvalQueue[0]
       if (!head) return
+      // mirror the harness-side 300s approval timeout: a dead prompt
+      // must leave the queue head, not hide the next approval
+      if (approvalTimer !== null) clearTimeout(approvalTimer)
+      approvalTimer = setTimeout(() => settleApproval(false), 300_000)
       liveSuspended = true
       approvalAnswer = ''
       typeahead = ''
       term.write(`\r\x1b[K\x1b[33mApprove ${head.summary}? [y/N] \x1b[0m`)
     }
     const settleApproval = (allowed: boolean) => {
+      if (approvalTimer !== null) {
+        clearTimeout(approvalTimer)
+        approvalTimer = null
+      }
       const head = approvalQueue.shift()
       head?.resolve(allowed)
       if (approvalQueue.length > 0) showApproval()
@@ -212,7 +221,7 @@ export default function TerminalPanel() {
           return
         }
         const resolved = resolveCd(target)
-        if (vfs.isDir(resolved)) {
+        if (vfs.isDir(resolved) || SYS_PREFIXES.some((prefix) => resolved === prefix || resolved.startsWith(`${prefix}/`))) {
           previousCwd = cwd
           cwd = resolved
           bus.emit('terminal:cwd', { cwd })

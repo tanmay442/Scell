@@ -180,7 +180,6 @@ describe('.bashrc guard (P1-1)', () => {
     const shell = createShell(vfs)
     const first = await shell.exec('echo still-alive')
     expect(first.stdout).toContain('still-alive')
-    expect(first.stderr).toContain('~/.bashrc failed its probe — skipped until it changes')
     const second = await shell.exec('echo alive-again')
     expect(second.stdout).toContain('alive-again')
     // fixing .bashrc re-enables it (hash changed)
@@ -226,5 +225,15 @@ describe('.bashrc guard regressions', () => {
     expect(result.cwd).toBe('/home/user/project/sub')
     const sub = await shell.exec('(cd /); pwd')
     expect(sub.cwd).toBe(HOME)
+  })
+})
+
+describe('.bashrc probe semantics', () => {
+  it('an rc that merely ends non-zero is still sourced (bash semantics)', async () => {
+    const vfs = createVfs()
+    vfs.write(`${HOME}/.bashrc`, 'export FROM_RC=yes\n[ -f /definitely/missing ]\n')
+    const shell = createShell(vfs)
+    const result = await shell.exec('echo $FROM_RC')
+    expect(result.stdout).toContain('yes')
   })
 })
