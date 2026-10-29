@@ -42,7 +42,7 @@ function toResult(result: CommandResult | ShellResult): CommandResult {
   }
 }
 
-export const HOME_DIR = '/home/user'
+const HOME_DIR = '/home/user'
 const BASHRC = `${HOME_DIR}/.bashrc`
 
 /** shell internals that must not leak into the persisted env */

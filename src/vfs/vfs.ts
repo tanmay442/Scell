@@ -232,4 +232,3 @@ export function createVfs(initial?: VfsFileMap): Vfs {
   } satisfies Vfs
 }
 
-export { decoder as utf8Decoder }

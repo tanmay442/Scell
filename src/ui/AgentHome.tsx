@@ -16,7 +16,6 @@ import {
   ChatSystemMessage,
   ChatToolCalls,
 } from '@astryxdesign/core/Chat'
-import { Avatar } from '@astryxdesign/core/Avatar'
 import { Markdown } from '@astryxdesign/core/Markdown'
 import { ClickableCard } from '@astryxdesign/core/ClickableCard'
 import { Card } from '@astryxdesign/core/Card'
@@ -125,23 +124,48 @@ function groupItems(entries: readonly ChatEntry[]): DisplayItem[] {
 
 const visualFrame: CSSProperties = {
   width: '100%',
-  height: 340,
-  border: '1px solid #2A2A2A',
-  borderRadius: 10,
-  background: '#FFFFFF',
+  border: 'none',
+  background: 'transparent',
+  display: 'block',
 }
 
-/** Minimal interactive HTML visual: sandboxed iframe (scripts only,
- * no same-origin access), from an artifact file or an html fence. */
+/**
+ * Interactive HTML visual, embedded so it reads as part of the thread:
+ * no border, no card background, and the frame grows to the content
+ * height (the chat scrolls; the visual never scrolls internally).
+ * Sandboxed to scripts only — the content reports its height back
+ * through postMessage, verified against the frame's own window.
+ */
 function HtmlVisual({ path, html }: { path?: string; html?: string }) {
   const content = html ?? (path !== undefined ? (platform().vfs.read(path) ?? '') : '')
+  const frameRef = useRef<HTMLIFrameElement>(null)
+  const [height, setHeight] = useState(200)
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== frameRef.current?.contentWindow) return
+      const reported = (event.data as { __cellVisualHeight?: unknown })?.__cellVisualHeight
+      if (typeof reported === 'number' && reported > 0) setHeight(Math.min(2400, Math.ceil(reported)))
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [])
+
   if (content === '') return null
+  const baseStyle = '<style>html,body{background:transparent!important;margin:0;padding:0;color:#ECECEC;font-family:system-ui,sans-serif}::-webkit-scrollbar{width:0;height:0}</style>'
+  const reporter = '<script>function __cellReport(){try{parent.postMessage({__cellVisualHeight:document.documentElement.scrollHeight},"*")}catch(e){}}window.addEventListener("load",__cellReport);if(window.ResizeObserver){new ResizeObserver(__cellReport).observe(document.documentElement)}</' + '<' + '/script>'
+  const withBase = content.includes('<head>')
+    ? content.replace('<head>', `<head>${baseStyle}`)
+    : content.includes('<html')
+      ? content.replace(/<html[^>]*>/, (tag) => `${tag}${baseStyle}`)
+      : `${baseStyle}${content}`
+  const srcDoc = withBase.includes('</body>') ? withBase.replace('</body>', `${reporter}</body>`) : `${withBase}${reporter}`
   return (
     <Stack style={{ width: '100%' }}>
       {path !== undefined ? (
         <Text type="supporting" color="secondary" style={{ fontFamily: 'var(--mono, monospace)', fontSize: 11 }}>{path}</Text>
       ) : null}
-      <iframe title={path ?? 'visual'} sandbox="allow-scripts" srcDoc={content} style={visualFrame} />
+      <iframe ref={frameRef} title={path ?? 'visual'} sandbox="allow-scripts" srcDoc={srcDoc} style={{ ...visualFrame, height }} />
     </Stack>
   )
 }
@@ -231,7 +255,7 @@ const Transcript = memo(function Transcript({ entries, running }: { entries: rea
           )
         }
         return (
-          <ChatMessage key={entry.id} sender="assistant" avatar={<Avatar name="Cell" size="md" />}>
+          <ChatMessage key={entry.id} sender="assistant">
             {splitHtmlBlocks(entry.text).map((part, partIndex) =>
               part.kind === 'html' ? (
                 <HtmlVisual key={partIndex} html={part.text} />

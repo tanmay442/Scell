@@ -18,7 +18,7 @@ export function isProtectedPath(normalizedAbsPath: string): boolean {
  * auto-executes. ~/.bashrc is sourced by EVERY shell (including the
  * human's unprotected terminal), so an agent-written .bashrc is a
  * persistence + exfiltration channel even though reads are harmless. */
-export const WRITE_PROTECTED_PATHS = ['/home/user/.bashrc']
+const WRITE_PROTECTED_PATHS = ['/home/user/.bashrc']
 
 /** True when an absolute, normalized path may be read but not written. */
 export function isWriteProtectedPath(normalizedAbsPath: string): boolean {

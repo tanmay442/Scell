@@ -40,7 +40,7 @@ export interface SessionInfo {
   locked?: boolean
 }
 
-export interface AgentSnapshot {
+interface AgentSnapshot {
   entries: readonly ChatEntry[]
   running: boolean
   activeLocked: boolean
@@ -394,15 +394,27 @@ function seedHistoryEntries(vfs: ReturnType<typeof platform>['vfs'], id: string)
   if ('error' in loaded) return
   const turns: SessionTurn[] = loaded.session.turns.slice(-60)
   pushEntry('note', `↻ resumed “${loaded.session.title ?? loaded.session.prompt.slice(0, 60)}” — earlier messages restored`)
+  let pendingVisual: string | null = null
   for (const turn of turns) {
     if (turn.role === 'user') pushEntry('user', turn.text)
     else if (turn.role === 'assistant') {
       if (turn.text.trim() !== '') pushEntry('assistant', turn.text)
       for (const call of turn.toolCalls ?? []) {
         pushEntry('tool', `${call.name} ${call.input.path ?? call.input.command ?? ''}`.trim(), call.name, 'complete')
+        const callPath = typeof call.input.path === 'string' ? call.input.path : ''
+        if (callPath.endsWith('.html')) pendingVisual = callPath
       }
     } else if (turn.role === 'tool') {
       pushEntry('result', clipLines(turn.text, 12))
+      // visuals produced in this session render again on revisit
+      if (pendingVisual !== null) {
+        const normalized = pendingVisual.startsWith('~') ? `/home/user${pendingVisual.slice(1)}` : pendingVisual
+        if (vfs.isFile(normalized)) {
+          shownVisuals.add(normalized)
+          pushEntry('visual', normalized)
+        }
+        pendingVisual = null
+      }
     }
   }
 }

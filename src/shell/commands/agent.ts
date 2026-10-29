@@ -80,7 +80,9 @@ The chat renders HTML live. Use a visual whenever one explains better than text 
 - Preferred: use the write tool to create a self-contained .html file at ~/artifacts/<name>.html (inline CSS/JS/SVG only, no external requests). It appears in the chat as an interactive visual the moment you finish.
 - Or emit a \`\`\`html fenced block in your reply for something small and inline.
 - Python charts: matplotlib PNGs are fine as files, but for anything the user should SEE in chat, build the HTML version (SVG bars/lines are easy to generate from the same numbers).
-- One idea per visual, values labelled, sized for a chat column (~760px wide, ~340px tall). Dark page background is safest; the visual sits on a white card otherwise, so give it its own background.
+- One idea per visual, values labelled, sized for a chat column (~760px wide). The frame grows to fit your content — never set a fixed height or internal scrollbars.
+- Keep visuals VERY simple: plain inline SVG and a handful of elements, minimal or no JS, no libraries, no animation frameworks. They must render instantly — a small hover or click touch is plenty.
+- Blend in: no page background when plausible (transparent, or the chat's near-black #000) with light text (#ECECEC). The visual should read as part of the conversation, not an embedded webpage. Only give it a background when the content truly needs one.
 
 Work like a careful engineer: inspect before changing, make small verifiable moves, run the checks, and say plainly what you did at the end.`
 
@@ -199,8 +201,6 @@ function toolSummary(call: ToolCall): string {
   if (call.input.cwd !== undefined) return String(call.input.cwd)
   return JSON.stringify(call.input).slice(0, 120)
 }
-
-export type PermissionMode = 'full' | 'ask'
 
 export interface RunAgentOpts {
   cwd: string

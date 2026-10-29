@@ -87,7 +87,7 @@ export function isDeniedPath(absPath: string): boolean {
 
 /** Write/edit additionally refuse shell-auto-executed files (~/.bashrc):
  * readable, never writable by the agent. */
-export function isWriteDeniedPath(absPath: string): boolean {
+function isWriteDeniedPath(absPath: string): boolean {
   const normalizedPath = vfsPath.normalize(absPath)
   return isProtectedPath(normalizedPath) || isWriteProtectedPath(normalizedPath)
 }
