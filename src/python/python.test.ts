@@ -651,21 +651,87 @@ describe('installPureWheel hardening', () => {
   it('refuses evil zip members (pth, sitecustomize, escape, foreign top-level)', async () => {
     const { installWheelMembers } = await import('./runner')
     const { loadPyodide } = await import('pyodide')
-    const { execSync } = await import('node:child_process')
     const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
-    const buildZip = async (names: string[]): Promise<Uint8Array> => {
-      const { writeFileSync } = await import('node:fs')
-      writeFileSync('/tmp/evil-members.json', JSON.stringify(names))
-      const hex = execSync('python3 /tmp/make-evil-zip.py').toString().trim()
-      return new Uint8Array(Buffer.from(hex, 'hex'))
+    const buildZip = (names: string[]): Uint8Array => {
+      const encoder = new TextEncoder()
+      const table = new Uint32Array(256)
+      for (let n = 0; n < 256; n++) {
+        let c = n
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+        table[n] = c
+      }
+      const crcOf = (bytes: Uint8Array): number => {
+        let crc = 0xffffffff
+        for (const b of bytes) crc = table[(crc ^ b) & 0xff] ^ (crc >>> 8)
+        return (crc ^ 0xffffffff) >>> 0
+      }
+      const chunks: Uint8Array[] = []
+      const central: Uint8Array[] = []
+      let offset = 0
+      for (const name of names) {
+        const nameBytes = encoder.encode(name)
+        const data = encoder.encode('# test\n')
+        const crc = crcOf(data)
+        const local = new DataView(new ArrayBuffer(30))
+        local.setUint32(0, 0x04034b50, true)
+        local.setUint16(4, 20, true)
+        local.setUint16(6, 0, true)
+        local.setUint16(8, 0, true)
+        local.setUint16(10, 0, true)
+        local.setUint16(12, 0, true)
+        local.setUint32(14, crc, true)
+        local.setUint32(18, data.length, true)
+        local.setUint32(22, data.length, true)
+        local.setUint16(26, nameBytes.length, true)
+        local.setUint16(28, 0, true)
+        chunks.push(new Uint8Array(local.buffer), nameBytes, data)
+        const cent = new DataView(new ArrayBuffer(46))
+        cent.setUint32(0, 0x02014b50, true)
+        cent.setUint16(4, 20, true)
+        cent.setUint16(6, 20, true)
+        cent.setUint16(8, 0, true)
+        cent.setUint16(10, 0, true)
+        cent.setUint16(12, 0, true)
+        cent.setUint16(14, 0, true)
+        cent.setUint32(16, crc, true)
+        cent.setUint32(20, data.length, true)
+        cent.setUint32(24, data.length, true)
+        cent.setUint16(28, nameBytes.length, true)
+        cent.setUint16(30, 0, true)
+        cent.setUint16(32, 0, true)
+        cent.setUint16(34, 0, true)
+        cent.setUint16(36, 0, true)
+        cent.setUint32(38, 0, true)
+        cent.setUint32(42, offset, true)
+        central.push(new Uint8Array(cent.buffer), nameBytes)
+        offset += 30 + nameBytes.length + data.length
+      }
+      const centralSize = central.reduce((n, c) => n + c.length, 0)
+      const end = new DataView(new ArrayBuffer(22))
+      end.setUint32(0, 0x06054b50, true)
+      end.setUint16(4, 0, true)
+      end.setUint16(6, 0, true)
+      end.setUint16(8, names.length, true)
+      end.setUint16(10, names.length, true)
+      end.setUint32(12, centralSize, true)
+      end.setUint32(16, offset, true)
+      end.setUint16(20, 0, true)
+      const parts = [...chunks, ...central, new Uint8Array(end.buffer)]
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
+      let at = 0
+      for (const p of parts) {
+        out.set(p, at)
+        at += p.length
+      }
+      return out
     }
     const evilNames = ['pypdf/__init__.py', 'pypdf/evil.pth', 'sitecustomize.py', '../../ESC.py', 'numpy/__init__.py', '/abs.py', 'a/b/../../../c.py']
-    const evil = await buildZip(evilNames)
+    const evil = buildZip(evilNames)
     py.FS.mkdirTree('/tmp/wheels')
     py.FS.writeFile('/tmp/wheels/evil.zip', evil)
     await expect(installWheelMembers(py, '/tmp/wheels/evil.zip', 'pypdf', 'pypdf')).rejects.toThrow(/refusing wheel members/)
     // and a clean wheel passes the same gate
-    const good = await buildZip(['pypdf/__init__.py', 'pypdf-6.21.4.dist-info/METADATA'])
+    const good = buildZip(['pypdf/__init__.py', 'pypdf-6.21.4.dist-info/METADATA'])
     py.FS.writeFile('/tmp/wheels/good.zip', good)
     await installWheelMembers(py, '/tmp/wheels/good.zip', 'pypdf', 'os')
   }, 300_000)
