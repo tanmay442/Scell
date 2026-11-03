@@ -132,6 +132,9 @@ export interface PythonRunOptions {
   /** loading progress (package installs) */
   onStatus?: (text: string) => void
   onOut: (stream: 'stdout' | 'stderr', text: string) => void
+  /** base URL for vendored wheels (tests serve public/vendor over HTTP;
+   * production defaults to same-origin /vendor/wheels) */
+  wheelBaseUrl?: string
 }
 
 export interface PythonWrittenFile {
@@ -310,7 +313,7 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
     for (const name of missing) {
       options.onStatus?.(`pip installing ${name}…`)
       try {
-        await installPureWheel(pyodide, name, options.onStatus)
+        await installPureWheel(pyodide, name, options.onStatus, options.wheelBaseUrl)
         options.onStatus?.(`pip installed ${name}`)
       } catch (err) {
         options.onStatus?.(`pip: ${name} unavailable (${describeError(err).text.slice(0, 80)})`)

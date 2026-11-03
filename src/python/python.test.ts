@@ -1,5 +1,5 @@
 /// <reference types="node" />
-import { describe, expect, it, beforeAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll } from 'vitest'
 import { createVfs } from '../vfs'
 import { seedStarterProject } from '../vfs/starter'
 import { runPython, type PythonRunResult } from './runner'
@@ -45,12 +45,39 @@ async function ensureWheels(): Promise<void> {
   }
 }
 
+let vendorBaseUrl = '/vendor/wheels'
+let vendorServer: { close: () => void } | null = null
+
 beforeAll(async () => {
   await ensureWheels()
+  // serve public/vendor over loopback: the runner's vendor fetch is
+  // same-origin shaped, so tests exercise the production code path
+  const { createServer } = await import('node:http')
+  const { readFile } = await import('node:fs/promises')
+  const vendorRoot = new URL('../../public/vendor/wheels/', import.meta.url)
+  const server = createServer(async (req, res) => {
+    try {
+      const name = (req.url ?? '').split('/').pop() ?? ''
+      if (!/^[A-Za-z0-9_.-]+\.whl$/.test(name)) throw new Error('bad name')
+      const bytes = await readFile(new URL(name, vendorRoot))
+      res.writeHead(200, { 'content-type': 'application/octet-stream' })
+      res.end(bytes)
+    } catch {
+      res.writeHead(404)
+      res.end()
+    }
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  vendorServer = server
+  vendorBaseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}/wheels`
   const { loadPyodide } = await import('pyodide')
   // node loader wants a plain filesystem path, not a file:// url
   pyodide = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
 }, 240_000)
+
+afterAll(() => {
+  vendorServer?.close()
+})
 
 async function runIn(vfs: ReturnType<typeof createVfs>, code: string, opts?: Partial<Parameters<typeof runPython>[1]>) {
   // the production payload builder (empty-dir entries included), with the
@@ -67,6 +94,7 @@ async function runIn(vfs: ReturnType<typeof createVfs>, code: string, opts?: Par
     cwd: opts?.cwd ?? '/home/user',
     env: opts?.env ?? {},
     payload,
+    wheelBaseUrl: vendorBaseUrl,
     onOut: (stream, text) => out.push({ stream, text }),
     onStatus: (text) => statuses.push(text),
   })
@@ -553,7 +581,7 @@ function minimalPdf(lines: string[]): Uint8Array {
 
 describe('documents (isolate-native PDF)', () => {
   it(
-    'pypdf extracts text from a staged PDF via micropip',
+    'pypdf extracts text from a staged PDF via the vendored wheel',
     async () => {
       const vfs = freshVfs()
       vfs.writeBytes('/home/user/uploads/notes.pdf', minimalPdf(['Hello isolate PDF world.', 'Second sentence here.']))
