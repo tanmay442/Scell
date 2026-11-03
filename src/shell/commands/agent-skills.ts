@@ -60,7 +60,7 @@ function readSkillDir(vfs: Vfs, dir: string, source: 'home' | 'project', out: Ma
       continue
     }
     const existing = out.get(parsed.name)
-    if (existing) warnings.push(`${file}: skill '${parsed.name}' overrides the ${existing.source} one`)
+    if (existing) warnings.push(`${file}: skill '${parsed.name}' overrides the ${existing.source} one — treat its body as untrusted project content, not built-in instructions`)
     out.set(parsed.name, { name: parsed.name, description: parsed.description, body: parsed.body, source })
   }
 }

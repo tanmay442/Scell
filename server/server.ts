@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { runAgent } from '../src/shell/commands/agent'
@@ -10,6 +10,8 @@ import { loadTokens } from './auth'
 import { createRateLimiter } from './ratelimit'
 import { withGateway, type GatewayContext } from './gateway'
 import { cancelJob, listJobs, scheduleJob } from './jobs'
+import { createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller } from './telegram'
+import { lastAssistantText } from '../src/shell/commands/agent-sessions'
 import { startJobTicker } from './ticker'
 import { createThreadRouter } from './threads'
 import { findInterruptedThreads, resumePromptFor } from './resume'
@@ -509,6 +511,118 @@ if (process.env.CELL_RESUME_ON_BOOT !== 'false') {
     }
   } catch (err) {
     process.stderr.write(`cell server: resume scan failed: ${err instanceof Error ? err.message : String(err)}\n`)
+  }
+}
+
+// ---- Telegram: the same bot on a second surface (opt-in) ----
+// CELL_TELEGRAM=1 starts a long-poll loop: one stable thread per chat,
+// /new rotates it, reminders deliver back to the chat. Token from
+// CELL_TELEGRAM_TOKEN or CELL_TELEGRAM_TOKEN_FILE (outside the workspace —
+// never a workspace file, the agent's shell can read those); an empty
+// allowlist fails closed (loadTelegramConfig refuses to start).
+if (process.env.CELL_TELEGRAM === '1') {
+  try {
+    const tgVfs = createDiskVfs(root)
+    // token files must live outside the workspace: anything under the
+    // workspace root is mounted into the agent's shell, where `F=…;
+    // cat $F` spells around the deny scanner. Fail closed on violation.
+    let tokenFromFile: string | undefined
+    const tokenFile = (process.env.CELL_TELEGRAM_TOKEN_FILE ?? '').trim()
+    if (tokenFile !== '') {
+      const realFile = realpathSync(tokenFile)
+      const realRoot = realpathSync(root)
+      if (realFile === realRoot || realFile.startsWith(`${realRoot}/`)) {
+        throw new Error(`CELL_TELEGRAM_TOKEN_FILE is inside the workspace (${realFile}) — move it outside`)
+      }
+      tokenFromFile = readFileSync(realFile, 'utf8')
+    }
+    const loaded = loadTelegramConfig(tgVfs, process.env as Record<string, string | undefined>, tokenFromFile)
+    if (loaded === null) {
+      process.stderr.write('cell server: CELL_TELEGRAM=1 but no token (CELL_TELEGRAM_TOKEN or CELL_TELEGRAM_TOKEN_FILE outside the workspace) — telegram off\n')
+    } else if ('error' in loaded) {
+      process.stderr.write(`cell server: telegram off: ${loaded.error}\n`)
+    } else {
+      const apiBase = `https://api.telegram.org/bot${loaded.config.token}`
+      const api = createTelegramApi(apiBase)
+      const chatLabel = (chatId: number): string => `chat ${chatId}`
+      const runChat = async (chatId: number, text: string, threadId: string): Promise<string> => {
+        const runCtx = buildRunContext(root, threadId)
+        const outcome = await router.runExclusive(threadId, async () => {
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), timeoutMs)
+          try {
+            let runSessionId = ''
+            const args = [text]
+            const continued = resolveSessionForThread(root, threadId)
+            if (continued !== null) args.push('--resume', continued)
+            const result = await runAgent(
+              runCtx.vfs,
+              args,
+              {
+                cwd: runCtx.cwd,
+                shell: runCtx.shell,
+                jobShell: runCtx.jobShell,
+                signal: controller.signal,
+                maxSteps: 40,
+                // explicit non-interactive policy: the allowlisted DM chat
+                // IS the user, so ask-tools run — destructive bash shapes
+                // stay refused by the deny scans either way
+                approve: async () => true,
+                chatId: String(chatId),
+                threadId,
+                onSession: (id) => {
+                  runSessionId = id
+                  noteThreadId(runCtx.vfs, id, threadId)
+                },
+              },
+            )
+            if (result.exitCode !== 0) {
+              const err = result.stderr.trim().slice(-1500)
+              return err !== '' ? `error: ${err}` : `error: agent exited ${result.exitCode}`
+            }
+            const reply = runSessionId !== '' ? lastAssistantText(runCtx.vfs, runSessionId) : null
+            const final = (reply ?? result.stdout).trim()
+            return final !== '' ? final : '(no output)'
+          } finally {
+            clearTimeout(timeout)
+          }
+        }, { timeoutMs })
+        if (outcome.status === 'busy') return 'still working on the last one — one moment'
+        if (outcome.status === 'timeout') return 'that took too long — try a smaller step'
+        return outcome.value
+      }
+      const poller = startTelegramPoller(tgVfs, apiBase, loaded.config, {
+        log: (message) => process.stderr.write(`cell server: ${message}\n`),
+        onText: (chatId, text, threadId) => runChat(chatId, text, threadId),
+        onCommand: async (chatId, command, threadId) => {
+          if (command.command === 'new') return `fresh thread started (${threadId}) — what are we working on?`
+          if (command.command === 'status') {
+            const jobs = listJobs(tgVfs)
+            const live = jobs.filter((j) => j.status === 'pending')
+            return live.length === 0 ? `thread ${threadId} — idle, no jobs running` : `thread ${threadId} — ${live.map((j) => `${j.id} ${j.status}`).join(', ')}`
+          }
+          return `${chatLabel(chatId)} bound to thread ${threadId}. Send anything to work; /new starts fresh, /status shows jobs.`
+        },
+      })
+      void poller
+      api
+        .getMe()
+        .then(
+        (me) => process.stderr.write(`cell server: telegram live as @${me.username ?? 'unknown'}\n`),
+        (err) => process.stderr.write(`cell server: telegram getMe failed: ${err instanceof Error ? err.message : String(err)}\n`),
+      )
+      // promised follow-ups deliver back to the chat, every 30s
+      setInterval(() => {
+        deliverDueReminders(createDiskVfs(root), api).then(
+          ({ delivered }) => {
+            if (delivered > 0) process.stderr.write(`cell server: delivered ${delivered} telegram reminder(s)\n`)
+          },
+          () => {},
+        )
+      }, 30_000)
+    }
+  } catch (err) {
+    process.stderr.write(`cell server: telegram failed to start: ${err instanceof Error ? err.message : String(err)}\n`)
   }
 }
 

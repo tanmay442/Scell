@@ -53,8 +53,19 @@ function under(root: string, path: string): boolean {
   return path === root || path.startsWith(`${root}/`)
 }
 
-function outsideScope(path: string): Error {
-  return new Error(`EINVAL: outside capability scope '${path}'`)
+/** Typed refusal for paths outside the grant: runTool matches on the
+ * class (not the message) so hostile paths cannot break the matcher. */
+export class ScopeError extends Error {
+  path: string
+  constructor(path: string) {
+    super(`EINVAL: outside capability scope '${path}'`)
+    this.name = 'ScopeError'
+    this.path = path
+  }
+}
+
+function outsideScope(path: string): ScopeError {
+  return new ScopeError(path)
 }
 
 export interface ScopeOptions {

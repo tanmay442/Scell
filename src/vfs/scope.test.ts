@@ -157,3 +157,18 @@ describe('scopeVfs as the agent file-tool boundary', () => {
     expect(base.read('/home/user/threads/abc/notes2.txt')).toBe('hi')
   })
 })
+
+describe('scope refusal message', () => {
+  it('refuses hostile paths with quotes as scope errors, not raw internals', async () => {
+    const { runTool } = await import('../shell/commands/agent-tools')
+    const base = createVfs()
+    const scoped = scopeVfs(base, SCOPE, MOUNTS)
+    const deps = { vfs: scoped, shell: { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }, cwd: SCOPE }
+    for (const path of ['/home/user/threads/other/file.txt', "/home/user/threads/other/o'brien.txt"]) {
+      const out = await runTool(deps as never, { id: 'r', name: 'read', input: { path } })
+      expect(out.isError).toBe(true)
+      expect(out.content).toBe(`refused: ${path} is outside your thread scope`)
+      expect(out.content).not.toMatch(/EINVAL/)
+    }
+  })
+})

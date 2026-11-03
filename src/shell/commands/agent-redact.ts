@@ -14,6 +14,14 @@ const PATTERNS: { re: RegExp; replace: string }[] = [
   // Anthropic + OpenAI secret keys
   { re: /sk-ant-[A-Za-z0-9_-]{8,}/g, replace: 'sk-ant-…[redacted]' },
   { re: /sk-[A-Za-z0-9_-]{8,}/g, replace: 'sk-…[redacted]' },
+  // GitHub tokens: ghp_/gho_/ghu_/ghs_/ghr_ + fine-grained github_pat_
+  { re: /gh[opusr]_[A-Za-z0-9_]{8,}/g, replace: 'gh…[redacted]' },
+  { re: /github_pat_[A-Za-z0-9_]{8,}/g, replace: 'github_pat_…[redacted]' },
+  // Slack tokens, AWS access keys, Google API keys, xAI keys
+  { re: /xox[baprs]-[A-Za-z0-9-]{8,}/g, replace: 'xox…[redacted]' },
+  { re: /AKIA[0-9A-Z]{16}/g, replace: 'AKIA…[redacted]' },
+  { re: /AIza[0-9A-Za-z_-]{8,}/g, replace: 'AIza…[redacted]' },
+  { re: /xai-[A-Za-z0-9_-]{8,}/g, replace: 'xai-…[redacted]' },
   // Authorization: Bearer <token> (any case)
   { re: /bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: 'Bearer …[redacted]' },
   // JSON / JS fields: "apiKey", "api_key", "key", secretAccessKey, secret, token —

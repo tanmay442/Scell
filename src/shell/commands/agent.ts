@@ -13,6 +13,7 @@ import {
   type ToolResult,
 } from './agent-tools'
 import { loadSkills, skillIndex } from './agent-skills'
+import { memoryPromptBlock, readBotIdentity } from './agent-memory'
 import { saveSession, loadSession, sessionId, truncateTurns, type SessionTurn } from './agent-sessions'
 import { expandSlashCommand } from './agent-commands'
 import {
@@ -233,6 +234,12 @@ export interface RunAgentOpts {
   onToolResult?: (call: ToolCall, result: ToolResult) => void
   onContext?: (chars: number) => void
   onSession?: (id: string) => void
+  /** subagent nesting level (runAgent sets this for delegate children) */
+  delegateDepth?: number
+  /** chat-surface attribution: stamped onto reminders this run creates */
+  chatId?: string
+  /** thread the run belongs to (stable per chat on Telegram) */
+  threadId?: string
 }
 
 /**
@@ -348,7 +355,11 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const { skills, warnings: skillWarnings } = loadSkills(vfs, opts.cwd)
   const skillBodies = new Map(skills.map((skill) => [skill.name, `# ${skill.name}\n\n${skill.body}`]))
 
-  const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nYour workspace for this thread is ${opts.cwd} — your own folder. Create files, projects and artifacts there by default (paths relative to it work in every tool). The open project and ~/.cell registries stay reachable by absolute path; other threads' folders are not visible to you and do not exist as far as your tools are concerned.\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
+  // one bot, every surface: the same identity, memory and skill index in
+  // the web UI, Telegram and headless runs — threads differ, the bot doesn't
+  const bot = readBotIdentity(vfs)
+  const memoryBlock = memoryPromptBlock(vfs)
+  const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nYou are ${bot.name}, the user's primary agent across every surface (web chat, Telegram, headless runs). Behave as one continuous assistant: use history_search to recall what you did in other threads, memory_save for durable user facts, and delegate for parallelizable sub-tasks. Your timezone is ${bot.timezone} — use it for "today/tomorrow" math in reminders.\n\nYour workspace for this thread is ${opts.cwd} — your own folder. Create files, projects and artifacts there by default (paths relative to it work in every tool). The open project and ~/.cell registries stay reachable by absolute path; other threads' folders are not visible to you and do not exist as far as your tools are concerned.${memoryBlock === '' ? '' : `\n\n${memoryBlock}`}\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
 
   const state: ProviderState = resumeId !== null ? emptyProviderState() : newProviderState(expanded.prompt)
   if (resumeId !== null) {
@@ -376,7 +387,50 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   let turns: SessionTurn[] = resumeId !== null ? [...resumedTurns] : [{ role: 'user', text: prompt }]
   if (resumeId !== null && expanded.prompt !== '') turns.push({ role: 'user', text: expanded.prompt })
 
-  const deps = { vfs, shell: opts.shell, cwd: opts.cwd, skills: skillBodies, customTools, ...(opts.jobShell ? { jobs: new JobManager(opts.jobShell, vfs) } : {}) }
+  // delegation: a subagent gets a fresh context window but the same tools
+  // and scope, capped at 12 steps; one level only (no grand-delegates)
+  const depth = opts.delegateDepth ?? 0
+  const delegate =
+    depth >= 1
+      ? undefined
+      : async (task: string): Promise<{ text: string; steps: number } | { error: string }> => {
+          // fresh session (no --resume): the child gets its own
+          // agent-<stamp>-<rand> id, searchable via history_search later
+          let childSessionId = ''
+          const child = await runAgent(vfs, [`Sub-task from the parent agent (answer with the result, nothing else):\n\n${task}`], {
+            cwd: opts.cwd,
+            shell: opts.shell,
+            approve: opts.approve,
+            approveTimeoutMs: opts.approveTimeoutMs,
+            signal: opts.signal,
+            maxSteps: 12,
+            delegateDepth: depth + 1,
+            ...(opts.chatId !== undefined ? { chatId: opts.chatId } : {}),
+            ...(opts.threadId !== undefined ? { threadId: opts.threadId } : {}),
+            onSession: (id) => {
+              childSessionId = id
+              opts.onSession?.(id)
+            },
+          })
+          if (child.exitCode !== 0) return { error: child.stderr.trim().slice(-2000) || `subagent exited ${child.exitCode}` }
+          let childSteps = 0
+          if (childSessionId !== '') {
+            const loaded = loadSession(vfs, childSessionId)
+            if (!('error' in loaded)) childSteps = loaded.session.steps
+          }
+          return { text: child.stdout.trim().slice(-8000), steps: childSteps }
+        }
+  const deps = {
+    vfs,
+    shell: opts.shell,
+    cwd: opts.cwd,
+    skills: skillBodies,
+    customTools,
+    ...(opts.jobShell ? { jobs: new JobManager(opts.jobShell, vfs) } : {}),
+    ...(delegate ? { delegate, delegateDepth: depth } : { delegateDepth: depth }),
+    ...(opts.chatId !== undefined ? { chatId: opts.chatId } : {}),
+    ...(opts.threadId !== undefined ? { threadId: opts.threadId } : {}),
+  }
   // strip a .json suffix so --resume x.json does not save x.json.json (P1-5)
   const id = resumeId !== null ? resumeId.replace(/\.json$/, '') : sessionId()
   const startedAt = resumedStartedAt ?? new Date().toISOString()

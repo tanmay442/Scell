@@ -131,3 +131,14 @@ export function listSessions(vfs: Vfs): string[] {
     return []
   }
 }
+
+/** The agent's latest message: what Telegram replies and /status show. */
+export function lastAssistantText(vfs: Vfs, id: string): string | null {
+  const loaded = loadSession(vfs, id)
+  if ('error' in loaded) return null
+  for (let i = loaded.session.turns.length - 1; i >= 0; i--) {
+    const turn = loaded.session.turns[i]
+    if (turn.role === 'assistant' && turn.text.trim() !== '') return turn.text
+  }
+  return null
+}

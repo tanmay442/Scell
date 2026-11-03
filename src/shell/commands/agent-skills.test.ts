@@ -22,7 +22,7 @@ describe('skill loader', () => {
     expect(names).toContain('preview')
     expect(names).toContain('debug-tsc')
     expect(names).toContain('images')
-    expect(BUILTIN_SKILLS.length).toBe(4)
+    expect(BUILTIN_SKILLS.length).toBe(5)
   })
 
   it('home skills override builtins, project skills override home', () => {

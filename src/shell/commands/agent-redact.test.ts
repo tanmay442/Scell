@@ -18,6 +18,18 @@ describe('key redaction', () => {
     expect(redactSecrets('{"apiKey": "supersecretvalue"}')).not.toContain('supersecretvalue')
   })
 
+  it('masks GitHub, Slack, AWS, Google and xAI tokens', () => {
+    expect(redactSecrets('token ghp_1234567890abcdefghijklmnopqrstuvwxyz')).not.toContain('ghp_1234')
+    expect(redactSecrets('token gho_1234567890abcdefghijklmnopqrstuvwxyz')).not.toContain('gho_1234')
+    expect(redactSecrets('github_pat_abcdefghij1234567890')).not.toContain('github_pat_abc')
+    expect(redactSecrets('xoxb-1234-abcdefg-hijkl')).not.toContain('xoxb-1234')
+    expect(redactSecrets('AKIAIOSFODNN7EXAMPLE')).not.toContain('AKIAIOSFODNN7EXAMPLE')
+    expect(redactSecrets('AIzaSyAbcdefgh1234567890')).not.toContain('AIzaSyAb')
+    expect(redactSecrets('xai-abc123XYZ456')).not.toContain('xai-abc')
+    // ordinary words with similar prefixes are untouched
+    expect(redactSecrets('the ghouls gather')).toBe('the ghouls gather')
+  })
+
   it('leaves ordinary text alone', () => {
     expect(redactSecrets('hello world, no keys here')).toBe('hello world, no keys here')
   })

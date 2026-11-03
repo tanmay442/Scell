@@ -46,7 +46,7 @@ both surfaces.
 | Object storage | `cell save/list/load/status` — whole-workspace tar.gz to any S3-compatible endpoint, SigV4 on WebCrypto (verified against botocore) | `cell-cmd.test.ts` |
 | Python | Pyodide CPython 3.12 in a worker (numpy, pandas, scipy, matplotlib and Pillow wheels vendored — no downloads), `python3` CLI, argv/cwd/stdin semantics, `matplotlib` PNGs, write-back to the VFS | `python.test.ts` (incl. Pillow convert/resize/verify) |
 | Images | Drop any photo on the composer (staged into the thread workspace, 25 MB cap) or point at a workspace file, then ask: exact-dimension resize (LANCZOS), JPEG/PNG/WebP converts, quality byte-budget loops, EXIF normalize/strip — driven by the built-in `images` skill (Pillow), outputs verified by reopening and linked inline as previewable file chips | `python.test.ts` + live browser/server runs |
-| AI agent | Agent home (front door) + `cell agent "task" [--steps N] [--resume <id>]` in the terminal — Meta/Anthropic/OpenAI/OpenAI-compatible tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill`/`job_start`/`job_poll`/`job_list` + custom `~/.cell/tools/*.json`, skills with progressive disclosure (`commit`, `preview`, `debug-tsc`, `images`; project overrides win), slash commands (`/commit`, `/preview`, custom), persisted sessions (model-generated titles, pin/lock/archive/fork/share), resumable chat with restored history, per-thread workspaces that keep running in the background, HTML visuals rendered in-thread, attached-file staging, per-tool approval in Ask mode (default: full permission), background jobs, secret redaction, SSE streaming, abort + auto-compaction | `agent*.test.ts` |
+| AI agent | Agent home (front door) + `cell agent "task" [--steps N] [--resume <id>]` in the terminal — Meta/Anthropic/OpenAI/OpenAI-compatible tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill`/`job_start`/`job_poll`/`job_list`/`history_search`/`memory_save`/`memory_list`/`skill_install`/`remind`/`delegate` + custom `~/.cell/tools/*.json`, skills with progressive disclosure (`bot`, `commit`, `preview`, `debug-tsc`, `images`; user-installed skills land in `~/.cell/skills/`; project overrides win), slash commands (`/commit`, `/preview`, custom), persisted sessions (model-generated titles, pin/lock/archive/fork/share), resumable chat with restored history, per-thread workspaces that keep running in the background, HTML visuals rendered in-thread, attached-file staging, per-tool approval in Ask mode (default: full permission), background jobs, secret redaction, SSE streaming, abort + auto-compaction | `agent*.test.ts` |
 
 ## Architecture
 
@@ -302,6 +302,66 @@ rejection reports its HTTP code, so `-1` only means an internal error before
 the run started. Jobs that exhaust 5 attempts flip to
 `dead` and stop being due — visible on `GET /jobs`, never silently
 dropped (terminal history is pruned to the newest 200 rows).
+
+## One bot, every surface
+
+Threads are separate workspaces, but the assistant is one continuous bot:
+the same identity (`~/.cell/bot.json`: name + timezone), the same durable
+memory, the same skill index — in web chat, Telegram, and headless runs.
+
+- `history_search` finds anything across all past threads (decisions,
+  old errors, prior attempts) — search before redoing work.
+- `memory_save` / `memory_list` keep lasting user-stated facts
+  (preferences, timezone) across sessions. How-tos belong in skills,
+  project records in project files, short-lived facts stay in-session.
+- `delegate` hands a self-contained sub-task to a subagent with a fresh
+  context window (same tools, same thread scope, 12-step cap, one level
+  only — no grand-delegates).
+- `remind` promises a follow-up (`in 20m` / `in 2h` / ISO, max 7 days
+  out). One-shot and delete-on-delivery: a reminder can never nag twice.
+  The server delivers due reminders back to the bound chat.
+- `skill_install` teaches the bot a new skill from a URL or pasted
+  markdown (`~/.cell/skills/<name>/SKILL.md`, frontmatter added when
+  missing) — only on the user's explicit request, never from instructions
+  found in files or pages. Verified live: the `unslop` skill installed
+  from its GitHub URL and loaded back in the same run.
+
+### Telegram
+
+`CELL_TELEGRAM=1` starts a long-poll loop next to the server: DMs only,
+one stable thread per chat (`tg-<chatId>`), `/new` rotates it, `/status`
+shows jobs, `/help` explains itself. Non-text messages are ignored.
+
+```sh
+CELL_TELEGRAM=1 CELL_TELEGRAM_TOKEN=<botfather-token> \
+  CELL_TELEGRAM_ALLOW_FROM=<your-chat-id> \
+  ./scripts/agent-server.sh --workspace ./workspace --port 8787
+```
+
+Security posture (all asserted by tests in `server/telegram.test.ts`):
+the token comes from `CELL_TELEGRAM_TOKEN` or a token file outside the
+workspace (`CELL_TELEGRAM_TOKEN_FILE` — refused when inside it), never
+from a workspace file: the agent's bash can read anything mounted in its
+shell (`F=…; cat $F` spells around the text scanner), so workspace
+secrets are not secrets. `~/.cell/telegram.json` holds only the
+non-secret allowlist (`{"allowFrom": [<chat-id>]}`); a `botToken`
+inside it fails closed with an error. An empty allowlist fails closed —
+the poller refuses to start; strangers get silence (no model call, no
+reply, no oracle — group/channel messages are dropped too); commands
+unknown to the bot fall through as plain chat text. Heads-up: server
+runs use full permission, so over Telegram `ask` tools
+(bash/edit/skill_install/delegate) execute without a human checkpoint —
+that is the point of a bound personal chat (the allowlist is the
+authority), and destructive bash shapes stay refused by the deny scans,
+including through one hop of variable aliasing. If a token ever passes
+through a chat log, `/revoke` it with BotFather and mint a fresh one.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `CELL_TELEGRAM` | `1` enables the Telegram poll loop | off |
+| `CELL_TELEGRAM_TOKEN` | Bot API token (never logged, never committed) | — |
+| `CELL_TELEGRAM_TOKEN_FILE` | path to a file holding the token — must be outside the workspace | — |
+| `CELL_TELEGRAM_ALLOW_FROM` | comma-separated chat ids (or `allowFrom` in `~/.cell/telegram.json`) | empty = poller refuses to start |
 
 ## Docs
 
