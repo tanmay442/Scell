@@ -8,7 +8,8 @@
 
 export interface PythonPayload {
   buffer: Uint8Array
-  index: [path: string, offset: number, length: number][]
+  // entries may carry kind 'dir' (empty dirs invisible to listAllFiles)
+  index: [path: string, offset: number, length: number, kind?: 'file' | 'dir'][]
 }
 
 export interface PythonRunOptions {
@@ -80,7 +81,17 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   const { payload, cwd, env } = options
 
   // ---- filesystem in: the caller's snapshot ----
-  for (const [path, offset, length] of payload.index) {
+  for (const [path, offset, length, kind] of payload.index) {
+    if (kind === 'dir') {
+      // empty dirs are invisible to listAllFiles — materialize them
+      // explicitly or open() into them fails even though the VFS has them
+      try {
+        FS.mkdirTree(path)
+      } catch {
+        // exists
+      }
+      continue
+    }
     const dir = path.slice(0, path.lastIndexOf('/')) || '/'
     try {
       FS.mkdirTree(dir)
@@ -253,8 +264,10 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   // derived roots missed files created in brand-new top-level dirs, while
   // node_modules/.git never enter the payload and must never sync back.
   const input = new Map<string, { offset: number; length: number }>()
-  for (const [path, offset, length] of payload.index) {
-    input.set(path, { offset, length })
+  for (const [path, offset, length, kind] of payload.index) {
+    // dir entries exist only to materialize empty dirs — they are not
+    // files, so they must not enter the delete-detection set
+    if (kind !== 'dir') input.set(path, { offset, length })
   }
   const written: PythonWrittenFile[] = []
   const seen = new Set<string>()

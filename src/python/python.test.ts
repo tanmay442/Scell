@@ -53,17 +53,11 @@ beforeAll(async () => {
 }, 240_000)
 
 async function runIn(vfs: ReturnType<typeof createVfs>, code: string, opts?: Partial<Parameters<typeof runPython>[1]>) {
-  const encoder = new TextEncoder()
-  const buffer = new Uint8Array(1 << 22)
-  const index: [string, number, number][] = []
-  let offset = 0
-  for (const path of vfs.listAllFiles()) {
-    if (path.includes('/node_modules/') || path.includes('/.git/')) continue
-    const bytes = vfs.readBytes(path) ?? new Uint8Array(0)
-    buffer.set(bytes, offset)
-    index.push([path, offset, bytes.byteLength])
-    offset += bytes.byteLength
-  }
+  // the production payload builder (empty-dir entries included), with the
+  // same node_modules/.git exclusion the tests always had
+  const { buildRunPayload } = await import('../node/run')
+  const hide = vfs.listAllFiles().filter((path) => path.includes('/node_modules/') || path.includes('/.git/'))
+  const payload = buildRunPayload(vfs, hide)
   const out: { stream: string; text: string }[] = []
   const statuses: string[] = []
   const result: PythonRunResult = await runPython(pyodide, {
@@ -72,7 +66,7 @@ async function runIn(vfs: ReturnType<typeof createVfs>, code: string, opts?: Par
     argv: opts?.argv ?? [],
     cwd: opts?.cwd ?? '/home/user',
     env: opts?.env ?? {},
-    payload: { buffer, index },
+    payload,
     onOut: (stream, text) => out.push({ stream, text }),
     onStatus: (text) => statuses.push(text),
   })
@@ -485,6 +479,28 @@ describe('python runner write-back boundary', () => {
       expect(after.exists('/share/man/man1/ttx.1')).toBe(false)
       expect(after.exists('/etc/fake/x')).toBe(false)
       expect(after.read('/home/user/project/sub/real.txt')).toBe('legit')
+    },
+    180_000,
+  )
+})
+
+describe('python empty-dir sync', () => {
+  it(
+    'sees mkdir-created dirs and writes into them',
+    async () => {
+      const vfs = freshVfs()
+      vfs.mkdir('/home/user/many')
+      const { result, stdout } = await runIn(
+        vfs,
+        [
+          'import os',
+          'print("entries=" + str(sorted(os.listdir("/home/user"))))',
+          'open("/home/user/many/f0.txt", "w").write("x")',
+          'print("wrote-ok")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(stdout).toContain('wrote-ok')
     },
     180_000,
   )

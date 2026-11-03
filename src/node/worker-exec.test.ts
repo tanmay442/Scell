@@ -51,3 +51,21 @@ it('cowsay bin runs (yargs: deep require graphs, ESM-ish builds)', async () => {
   expect(result.stdout).toContain('< e2e-moo >')
   expect(result.stdout).toContain('---')
 }, 180000)
+
+it('empty dirs from the payload are visible to node fs', async () => {
+  const vfs2 = createVfs()
+  vfs2.mkdir('/home/user/emptydir')
+  vfs2.write(
+    '/home/user/check.js',
+    'const fs = require("fs");\n' +
+      'console.log("empty-exists=" + fs.existsSync("/home/user/emptydir"));\n' +
+      'console.log("is-dir=" + fs.statSync("/home/user/emptydir").isDirectory());\n' +
+      'fs.writeFileSync("/home/user/emptydir/made.js", "1");\n' +
+      'console.log("readdir=" + JSON.stringify(fs.readdirSync("/home/user/emptydir")));',
+  )
+  const result2 = await runInWorker(vfs2, '/home/user/check.js', [], '/home/user')
+  expect(result2.exitCode).toBe(0)
+  expect(result2.stdout).toContain('empty-exists=true')
+  expect(result2.stdout).toContain('is-dir=true')
+  expect(result2.stdout).toContain('readdir=["made.js"]')
+})

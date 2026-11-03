@@ -29,9 +29,14 @@ export interface NodeRunResult {
  * — structured-cloning a giant string map froze the tab whenever a real CLI
  * (13MB+ of JavaScript) was installed.
  */
+/** index entry: files carry their byte span; dirs (empty dirs invisible to
+ * listAllFiles) carry kind 'dir' with a dummy span so runtimes materialize
+ * them. Readers that ignore the 4th element keep working unchanged. */
+export type RunPayloadEntry = [path: string, offset: number, length: number, kind?: 'file' | 'dir']
+
 export interface RunPayload {
   buffer: Uint8Array
-  index: [path: string, offset: number, length: number][]
+  index: RunPayloadEntry[]
 }
 
 export function buildRunPayload(
@@ -58,6 +63,46 @@ export function buildRunPayload(
       if (bytes !== null) add(path, bytes)
     }
   }
+  // empty dirs are invisible to listAllFiles, so mkdir-only trees would
+  // never reach the worker (open('newdir/f') fails even though the dir
+  // exists in the VFS). Emit them explicitly; hidden subtrees stay out.
+  const hiddenDir = (dir: string): boolean => {
+    for (const h of hidden) {
+      if (h === dir || h.startsWith(`${dir}/`)) return true
+    }
+    return false
+  }
+  const ancestorWithFile = new Set<string>()
+  for (const [path] of index) {
+    let dir = path.slice(0, path.lastIndexOf('/')) || '/'
+    while (true) {
+      ancestorWithFile.add(dir)
+      if (dir === '/') break
+      dir = dir.slice(0, dir.lastIndexOf('/')) || '/'
+    }
+  }
+  const walkDirs = (dir: string): void => {
+    let names: string[]
+    try {
+      names = vfs.readDir(dir)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      const child = dir === '/' ? `/${name}` : `${dir}/${name}`
+      let isDir = false
+      try {
+        isDir = vfs.isDir(child)
+      } catch {
+        continue
+      }
+      if (isDir && !hiddenDir(child)) {
+        if (!ancestorWithFile.has(child)) index.push([child, 0, 0, 'dir'])
+        walkDirs(child)
+      }
+    }
+  }
+  walkDirs('/')
   for (const [path, content] of Object.entries(filesOverride)) add(path, encoder.encode(content))
   const buffer = new Uint8Array(offset)
   let position = 0

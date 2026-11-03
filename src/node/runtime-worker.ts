@@ -12,8 +12,8 @@ import { resolveId, NODE_BUILTINS, type ResolverFs } from './resolve'
 interface ExecRequest {
   type: 'exec'
   id: number
-  /** zero-copy workspace snapshot: one byte buffer + [path, offset, length] */
-  payload: { buffer: Uint8Array; index: [string, number, number][] }
+  /** zero-copy workspace snapshot: one byte buffer + [path, offset, length, kind?] */
+  payload: { buffer: Uint8Array; index: [string, number, number, ('file' | 'dir')?][] }
   /** user env from ~/.cell/env.json */
   env?: Record<string, string>
   entry: string
@@ -1028,7 +1028,13 @@ self.onmessage = async (event: MessageEvent<ExecRequest>) => {
   decoded.clear()
   overlay.clear()
   removed.clear()
-  for (const [path, offset, length] of msg.payload.index) {
+  for (const [path, offset, length, kind] of msg.payload.index) {
+    // dir entries materialize empty dirs (invisible to listAllFiles); they
+    // must NOT enter payloadIndex or statSync would report them as files
+    if (kind === 'dir') {
+      explicitDirs.add(path)
+      continue
+    }
     payloadIndex.set(path, [offset, length])
   }
 
