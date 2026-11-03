@@ -151,3 +151,36 @@ describe.skipIf(!hasBash())('node-shell', () => {
     }
   })
 })
+
+describe('node-shell session env', () => {
+  it('persists exports across execs on one shell (browser-shell semantics)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'node-shell-test-'))
+    try {
+      const shell = createNodeShell(root)
+      const first = await shell.exec('export FOO=persisted-value')
+      expect(first.exitCode).toBe(0)
+      const second = await shell.exec('echo "[$FOO]"')
+      expect(second.stdout).toBe('[persisted-value]\n')
+      // separate shells do not share env
+      const other = createNodeShell(root)
+      const third = await other.exec('echo "[$FOO]"')
+      expect(third.stdout).toBe('[]\n')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not leak the env dump into results or progress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'node-shell-test-'))
+    try {
+      const shell = createNodeShell(root)
+      const seen: string[] = []
+      const result = await shell.exec('echo hello', '/', (line) => seen.push(line))
+      expect(result.stdout).toBe('hello\n')
+      expect(seen.join('')).not.toContain('__CELL_ENV_')
+      expect(result.stdout).not.toContain('__CELL_ENV_')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})

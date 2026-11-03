@@ -1,6 +1,6 @@
 import type { Vfs } from '../../vfs/types'
 import { vfsPath } from '../../vfs/types'
-import { isProtectedPath, isWriteProtectedPath } from '../../vfs/protected-paths'
+import { isJobLogPath, isProtectedPath, isWriteProtectedPath } from '../../vfs/protected-paths'
 import { redactSecrets } from './agent-redact'
 import type { ShellLike } from './shell-types'
 
@@ -80,9 +80,14 @@ const TOOLS_DIR = '/home/user/.cell/tools'
 
 /** Paths the agent must never read/write through file tools: the whole
  * ~/.cell prefix (keys, sessions, registries, secrets) — see
- * src/vfs/protected-paths.ts for the policy. */
+ * src/vfs/protected-paths.ts for the policy. Job logs under ~/.cell/jobs/
+ * are the one readable exception: resumed runs need their predecessors'
+ * output (job tables themselves are in-memory per run). Writes there stay
+ * refused. */
 export function isDeniedPath(absPath: string): boolean {
-  return isProtectedPath(vfsPath.normalize(absPath))
+  const normalized = vfsPath.normalize(absPath)
+  if (isJobLogPath(normalized)) return false
+  return isProtectedPath(normalized)
 }
 
 /** Write/edit additionally refuse shell-auto-executed files (~/.bashrc):
@@ -158,7 +163,7 @@ export function bashDenyReason(command: string, cwd = '/home/user'): string | nu
 }
 
 const BUILTIN_DEFS: { name: string; description: string; approval: ApprovalPolicy }[] = [
-  { name: 'bash', description: 'Run a shell command in the workspace (bash-compatible). Returns stdout+stderr and the exit code. cd is per-call. Each step times out after 120s (exit 124, overridable with timeoutMs up to 600000); output past 20k chars is head+tail truncated with a receipt.', approval: 'ask' },
+  { name: 'bash', description: 'Run a shell command in the workspace (bash-compatible). Returns stdout+stderr and the exit code. Each call runs in a fresh shell: cd and exports do not persist between calls — chain with && instead. Each step times out after 120s (exit 124, overridable with timeoutMs up to 600000); output past 20k chars is head+tail truncated with a receipt.', approval: 'ask' },
   { name: 'read', description: 'Read a file from the filesystem. Text files are paged (offset/limit); pass base64:true for raw bytes of images/wasm/archives.', approval: 'auto' },
   { name: 'edit', description: 'Replace one exact block of text in a file. The old text must occur exactly once.', approval: 'ask' },
   { name: 'write', description: 'Create or overwrite a text file. Parent directories are created.', approval: 'ask' },
@@ -451,7 +456,12 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
         return { id: call.id, content: all.length === 0 ? '(no jobs)' : all.map((job) => `${job.id} ${job.status}${job.exitCode !== undefined ? ` exit ${job.exitCode}` : ''} — ${job.command}`).join('\n') }
       }
       const record = deps.jobs.get(String(call.input.id ?? ''))
-      if (record === undefined) return { id: call.id, content: `unknown job '${String(call.input.id ?? '')}'`, isError: true }
+      if (record === undefined) {
+        // job tables are in-memory per run (Unix semantics): after a resume
+        // the table is empty, but the predecessor's logs persist on disk —
+        // point there instead of dead-ending
+        return { id: call.id, content: `unknown job '${String(call.input.id ?? '')}' in this run (job tables do not survive resume — read ~/.cell/jobs/${String(call.input.id ?? '')}.log for its output)`, isError: true }
+      }
       const tail = record.output.slice(-4000)
       return { id: call.id, content: `${record.id} ${record.status}${record.exitCode !== undefined ? ` exit ${record.exitCode}` : ''}\n${tail || '(no output yet)'}` }
     }
@@ -543,7 +553,9 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
       const path = expand(String(call.input.path ?? '~'), deps.cwd)
       if (isDeniedPath(path)) return { id: call.id, content: `refused: agent key/config/registry paths are not listable (${path})`, isError: true }
       const names = vfs.readDir(path)
-      return { id: call.id, content: names.length === 0 ? '(empty)' : names.join('\n') }
+      // huge dirs would otherwise land whole in the transcript (and the
+      // saved session): same head+tail receipt as every other tool
+      return { id: call.id, content: names.length === 0 ? '(empty)' : truncateWithReceipt(names.join('\n'), AGENT_READ_MAX) }
     }
     return { id: call.id, content: `unknown tool ${call.name}`, isError: true }
   } catch (err) {

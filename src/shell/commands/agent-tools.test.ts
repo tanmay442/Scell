@@ -25,6 +25,19 @@ function vfsWithTools(): ReturnType<typeof createVfs> {
 }
 
 describe('tool registry', () => {
+  it('ls truncates huge directories with a receipt', async () => {
+    const vfs = createVfs()
+    for (let i = 0; i < 3000; i++) vfs.write(`/home/user/big/f${String(i).padStart(5, '0')}.txt`, 'x')
+    const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+    const result = await runTool(
+      { vfs, shell, cwd: '/home/user', skills: new Map(), customTools: new Map() },
+      { id: 'c1', name: 'ls', input: { path: '/home/user/big' } },
+    )
+    expect(result.isError).toBeFalsy()
+    expect(result.content).toMatch(/truncated \d+ chars/)
+    expect(result.content.length).toBeLessThan(40000)
+  })
+
   it('loads custom bash tools from ~/.cell/tools/*.json', () => {
     const vfs = vfsWithTools()
     const { tools, warnings } = loadCustomTools(vfs)
