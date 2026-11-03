@@ -82,7 +82,7 @@ export function telegramThreadFor(chatId: number, chats: Record<string, string>)
 }
 
 export interface TelegramCommand {
-  command: 'new' | 'status' | 'help'
+  command: 'new' | 'status' | 'help' | 'brief'
   arg: string
 }
 
@@ -91,8 +91,8 @@ export function parseTelegramCommand(text: string): TelegramCommand | null {
   const match = /^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim())
   if (!match) return null
   const command = match[1]
-  if (command !== 'new' && command !== 'status' && command !== 'help') return null
-  return { command, arg: (match[2] ?? '').trim() }
+  if (command !== 'new' && command !== 'status' && command !== 'help' && command !== 'brief') return null
+  return { command: command as TelegramCommand['command'], arg: (match[2] ?? '').trim() }
 }
 
 export type TelegramFetch = (url: string, init?: { method?: string; body?: string | FormData; headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{

@@ -11,6 +11,8 @@ import { createRateLimiter } from './ratelimit'
 import { withGateway, type GatewayContext } from './gateway'
 import { cancelJob, listJobs, markNotified, scheduleJob } from './jobs'
 import { collectFreshFiles, createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramApi, type TelegramAttachmentIn } from './telegram'
+import { dueReminders } from '../src/shell/commands/agent-reminders'
+import { listThreads, readThread } from './threads-read'
 import type { Vfs } from '../src/vfs/types'
 
 /** extension → mime for files sent back to Telegram chats */
@@ -445,6 +447,45 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: GatewayCon
     handleJobsList(res)
     return
   }
+  // read-only thread browser for the web UI's "On the server" section:
+  // Telegram chats, workers and headless runs never touch the browser
+  // VFS. Same auth as everything else (gateway); no secrets in output.
+  if (req.method === 'GET' && url.pathname === '/threads') {
+    const listed = listThreads(createDiskVfs(root), router.busyIds())
+    if ('error' in listed) {
+      ctx.report({ steps: 0, exitCode: 400 })
+      sendJson(res, 400, { error: listed.error })
+      log('GET', '/threads', 400)
+      return
+    }
+    sendJson(res, 200, { threads: listed })
+    log('GET', '/threads', 200)
+    return
+  }
+  {
+    const match = /^\/threads\/([^/]+)$/.exec(url.pathname)
+    if (req.method === 'GET' && match) {
+      let threadId = ''
+      try {
+        threadId = decodeURIComponent(match[1])
+      } catch {
+        ctx.report({ steps: 0, exitCode: 400 })
+        sendJson(res, 400, { error: 'bad thread id' })
+        log('GET', url.pathname, 400)
+        return
+      }
+      const detail = readThread(createDiskVfs(root), threadId, router.busyIds())
+      if ('code' in detail) {
+        ctx.report({ steps: 0, exitCode: detail.code })
+        sendJson(res, detail.code, { error: detail.error })
+        log('GET', url.pathname, detail.code)
+        return
+      }
+      sendJson(res, 200, detail)
+      log('GET', url.pathname, 200)
+      return
+    }
+  }
   if (req.method === 'POST' && url.pathname === '/jobs') {
     await handleJobsCreate(req, res)
     return
@@ -809,13 +850,20 @@ if (process.env.CELL_TELEGRAM === '1') {
         onText: (chatId, text, threadId, attachments) => runChat(chatId, text, threadId, attachments),
         onCommand: async (chatId, command, threadId) => {
           if (command.command === 'new') return `fresh thread started (${threadId}) — what are we working on?`
+          // per-thread view only: one chat learns nothing about other
+          // chats' jobs (not even their existence)
+          const live = listJobs(tgVfs).filter((j) => j.status === 'pending' && j.threadId === threadId)
           if (command.command === 'status') {
-            // per-thread view only: one chat learns nothing about other
-            // chats' jobs (not even their existence)
-            const live = listJobs(tgVfs).filter((j) => j.status === 'pending' && j.threadId === threadId)
             return live.length === 0 ? `thread ${threadId} — idle, no jobs running` : `thread ${threadId} — ${live.map((j) => `${j.id} ${j.status}`).join(', ')}`
           }
-          return `${chatLabel(chatId)} bound to thread ${threadId}. Send anything to work; /new starts fresh, /status shows jobs.`
+          if (command.command === 'brief') {
+            // on-demand catch-up brief (Hermes morning-brief shape): the
+            // agent assembles it from history + the pending work listed here
+            const dead = listJobs(tgVfs).filter((j) => j.status === 'dead' && j.threadId === threadId)
+            const dueCount = dueReminders(createDiskVfs(root)).filter((r) => r.chatId === String(chatId)).length
+            return runChat(chatId, `Write a brief for this chat: (1) what got done since we last talked (use history_search over this thread's sessions), (2) anything that failed or is still running, (3) up to three decisions you need from me as numbered questions. Keep it short and textable.\nPending jobs in this thread: ${live.length === 0 ? 'none' : live.map((j) => `${j.id}: ${j.prompt.slice(0, 120)}`).join(' | ')}\nFailed jobs: ${dead.length === 0 ? 'none' : dead.map((j) => j.id).join(', ')}\nDue reminders for this chat: ${dueCount}.`, threadId)
+          }
+          return `${chatLabel(chatId)} bound to thread ${threadId}. Send anything to work; /new starts fresh, /status shows jobs, /brief writes a catch-up brief.`
         },
       })
       void poller

@@ -54,6 +54,7 @@ import {
   ArrowsPointingOutIcon,
 } from '@heroicons/react/24/outline'
 import { agentActions, agentStore, COMPACT_AT_CHARS, threadWorkspace, type AgentConfigForm, type ChatEntry, type SessionInfo } from './agent-store'
+import { fetchServerThreads, fetchThreadDetail, discoverTelegramChats, setServerToken as setServerTokenValue, setServerUrl, serverToken, serverUrl, telegramServerCommand, testTelegramToken, type ServerThread, type ServerThreadDetail } from './server-threads'
 import { platform } from '../platform'
 import { groupItems, splitHtmlBlocks } from './agent-entries'
 import { splitFileRefs, fileKind } from './agent-files'
@@ -423,6 +424,157 @@ const Transcript = memo(function Transcript({ entries, running, workspace, onPre
   )
 })
 
+function ServerThreadsSection({ onOpenThread }: { onOpenThread: (thread: ServerThread) => void }) {
+  const [url, setUrl] = useState(serverUrl())
+  const [threads, setThreads] = useState<ServerThread[] | null>(null)
+  const [status, setStatus] = useState('Not connected — set the server URL, then refresh.')
+  const refresh = async () => {
+    setServerUrl(url)
+    setStatus('Connecting…')
+    const out = await fetchServerThreads()
+    if ('error' in out) {
+      setThreads(null)
+      setStatus(`Could not reach the server: ${out.error}`)
+      return
+    }
+    setThreads(out.threads)
+    setStatus(out.threads.length === 0 ? 'Connected — no server threads yet.' : `Connected — ${out.threads.length} thread(s).`)
+  }
+  const kindLabel = (kind: ServerThread['kind']) => kind === 'telegram' ? 'Telegram' : kind === 'worker' ? 'Worker' : 'Run'
+  return (
+    <SideNavSection title="On the server">
+      <VStack gap={1.5}>
+        <TextInput label="Server URL" value={url} onChange={setUrl} placeholder="http://localhost:8787" />
+        <Button label="Refresh" variant="ghost" size="sm" onClick={refresh} />
+        <Text type="supporting" color="secondary">{status}</Text>
+        {(threads ?? []).map((thread) => (
+          <SideNavItem
+            key={thread.threadId}
+            label={`${kindLabel(thread.kind)} · ${thread.title ?? thread.threadId}`}
+            icon={ChatBubbleLeftRightIcon}
+            size="sm"
+            onClick={() => onOpenThread(thread)}
+          />
+        ))}
+      </VStack>
+    </SideNavSection>
+  )
+}
+
+function ServerThreadDialog({ thread, onClose }: { thread: ServerThread; onClose: () => void }) {
+  const [detail, setDetail] = useState<ServerThreadDetail | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      const out = await fetchThreadDetail(thread.threadId)
+      if (cancelled) return
+      if ('error' in out) setError(out.error)
+      else setDetail(out.detail)
+    })()
+    return () => { cancelled = true }
+  }, [thread.threadId])
+  return (
+    <Dialog isOpen onOpenChange={(open) => { if (!open) onClose() }} purpose="form" width={720} padding={4}>
+      <DialogHeader title={detail?.title ?? thread.threadId} subtitle={`${thread.kind} thread · ${thread.messages} message(s)${thread.busy ? ' · running' : ''}`} />
+      <VStack gap={2}>
+        {error !== null ? <Text type="body" color="secondary">Could not load: {error}</Text> : null}
+        {detail === null && error === null ? <Text type="body" color="secondary">Loading…</Text> : null}
+        {(detail?.files ?? []).length > 0 ? (
+          <VStack gap={1}>
+            <Text type="label" weight="semibold">Files in this thread</Text>
+            {(detail?.files ?? []).map((file) => (
+              <Text key={file.name} type="supporting">{file.name} · {Math.max(1, Math.round(file.size / 1024))} KB</Text>
+            ))}
+          </VStack>
+        ) : null}
+        <VStack gap={1}>
+          <Text type="label" weight="semibold">Transcript (newest first)</Text>
+          {(detail?.transcript ?? []).slice(0, 60).map((line, i) => (
+            <Text key={i} type="supporting" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{line.slice(0, 600)}</Text>
+          ))}
+        </VStack>
+        <Text type="supporting" color="secondary">Read-only here — continue the conversation in Telegram (same thread), or resume it headless with --resume {detail?.sessionId ?? thread.threadId}.</Text>
+      </VStack>
+    </Dialog>
+  )
+}
+
+function ConnectorsDialog({ onClose }: { onClose: () => void }) {
+  const [token, setToken] = useState('')
+  const [allowFrom, setAllowFrom] = useState('')
+  const [serverUrlValue, setServerUrlValue] = useState(serverUrl())
+  const [serverTokenDraft, setServerTokenDraft] = useState(serverToken())
+  const [testResult, setTestResult] = useState<string | null>(null)
+  const [chats, setChats] = useState<Array<{ id: number; kind: string; text: string }> | null>(null)
+  const [chatsNote, setChatsNote] = useState<string | null>(null)
+  const test = async () => {
+    setTestResult('Checking…')
+    const out = await testTelegramToken(token)
+    setTestResult('username' in out ? `Token works — bot @${out.username}` : `Failed: ${out.error}`)
+  }
+  const discover = async () => {
+    setChatsNote('Reading recent updates… (message the bot first, then click again)')
+    const out = await discoverTelegramChats(token)
+    if ('error' in out) {
+      setChatsNote(`Failed: ${out.error}`)
+      setChats(null)
+      return
+    }
+    setChats(out.chats)
+    setChatsNote(out.chats.length === 0 ? 'No messages seen yet — send the bot anything, then click again.' : 'Pick your chat id for the allowlist:')
+  }
+  const save = () => {
+    setServerUrl(serverUrlValue)
+    setServerTokenValue(serverTokenDraft)
+    onClose()
+  }
+  return (
+    <Dialog isOpen onOpenChange={(open) => { if (!open) onClose() }} purpose="form" width={640} padding={4}>
+      <DialogHeader title="Connectors" subtitle="Telegram — the same bot on a second surface" />
+      <VStack gap={3}>
+        <VStack gap={1}>
+          <Text type="label" weight="semibold">1 · Bot token (from BotFather)</Text>
+          <TextInput label="Bot token" value={token} onChange={setToken} placeholder="123456:AAH…" />
+          <HStack gap={2}>
+            <Button label="Test token" variant="ghost" size="sm" onClick={test} />
+            {testResult !== null ? <Text type="supporting" color="secondary">{testResult}</Text> : null}
+          </HStack>
+          <Text type="supporting" color="secondary">The token stays in this dialog and the server env — it is never written to the workspace or committed.</Text>
+        </VStack>
+        <VStack gap={1}>
+          <Text type="label" weight="semibold">2 · Your chat id (allowlist)</Text>
+          <TextInput label="Chat id" value={allowFrom} onChange={setAllowFrom} placeholder="6520414687" />
+          <HStack gap={2}>
+            <Button label="Discover chats" variant="ghost" size="sm" onClick={discover} />
+          </HStack>
+          {chatsNote !== null ? <Text type="supporting" color="secondary">{chatsNote}</Text> : null}
+          {(chats ?? []).map((chat) => (
+            <HStack key={chat.id} gap={2} vAlign="center">
+              <Text type="supporting">{chat.id} · {chat.kind} · {chat.text}</Text>
+              <Button label="Use" variant="ghost" size="sm" onClick={() => setAllowFrom(String(chat.id))} />
+            </HStack>
+          ))}
+        </VStack>
+        <VStack gap={1}>
+          <Text type="label" weight="semibold">3 · Start the server</Text>
+          <Text type="supporting" style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{telegramServerCommand('./workspace', 8787, token, allowFrom)}</Text>
+          <Text type="supporting" color="secondary">Run that where the server lives (token via env, allowlist baked in). Prefer a token file outside the workspace for long-lived deploys — see README.</Text>
+        </VStack>
+        <VStack gap={1}>
+          <Text type="label" weight="semibold">4 · This panel reads the server</Text>
+          <TextInput label="Server URL" value={serverUrlValue} onChange={setServerUrlValue} placeholder="http://localhost:8787" />
+          <TextInput label="Server API token (CELL_API_TOKENS)" value={serverTokenDraft} onChange={setServerTokenDraft} placeholder="empty when auth is off" />
+          <HStack gap={2}>
+            <Button label="Save & close" variant="primary" size="sm" onClick={save} />
+            <Button label="Cancel" variant="ghost" size="sm" onClick={onClose} />
+          </HStack>
+        </VStack>
+      </VStack>
+    </Dialog>
+  )
+}
+
 function ContextRing({ chars }: { chars: number }) {
   const state = useSyncExternalStore(agentStore.subscribe, agentStore.get)
   const ratio = Math.min(1, chars / COMPACT_AT_CHARS)
@@ -689,6 +841,8 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
   const [settingsDraft, setSettingsDraft] = useState<AgentConfigForm | null>(null)
   const [renameTarget, setRenameTarget] = useState<{ id: string; value: string } | null>(null)
   const [previewPath, setPreviewPath] = useState<string | null>(null)
+  const [connectorsOpen, setConnectorsOpen] = useState(false)
+  const [serverThread, setServerThread] = useState<ServerThread | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null)
   const form = state.config
 
@@ -771,7 +925,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
             <SideNavItem label="New chat" icon={PlusIcon} size="sm" onClick={() => agentActions.clearChat()} />
             <SideNavItem label="Agent" icon={ChatBubbleLeftRightIcon} size="sm" isSelected />
             <SideNavItem label="Workspace" icon={CodeBracketIcon} size="sm" onClick={onOpenWorkspace} />
-            <SideNavItem label="Connectors (soon)" icon={LinkIcon} size="sm" isDisabled />
+            <SideNavItem label="Connectors" icon={LinkIcon} size="sm" onClick={() => setConnectorsOpen(true)} />
           </SideNavSection>
 
           <SideNavSection title="Sessions">
@@ -808,6 +962,8 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
             ) : null}
             </VStack>
           </SideNavSection>
+
+          <ServerThreadsSection onOpenThread={setServerThread} />
 
           {archivedSessions(state.sessions).length > 0 ? (
             <SideNavSection title="Archived" isHeaderHidden>
@@ -925,6 +1081,8 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
       </Dialog>
 
       <FilePreviewDialog path={previewPath} onClose={() => setPreviewPath(null)} onOpenWorkspace={onOpenWorkspace} />
+      {connectorsOpen ? <ConnectorsDialog onClose={() => setConnectorsOpen(false)} /> : null}
+      {serverThread !== null ? <ServerThreadDialog thread={serverThread} onClose={() => setServerThread(null)} /> : null}
 
       <Dialog isOpen={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }} purpose="form" width={420} padding={4}>
         {deleteTarget !== null ? (
