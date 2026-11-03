@@ -45,12 +45,16 @@ shift
 
 RESUME=""
 STEPS=""
+PULL=""
+PUSH=""
 WORKSPACE="${CELL_WORKSPACE_HOST:-$PWD/workspace}"
 NAME="run-$$"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --resume) RESUME="${2:-}"; [ -n "$RESUME" ] || usage 1; shift 2 ;;
+    --pull) PULL="${2:-}"; [ -n "$PULL" ] || usage 1; shift 2 ;;
+    --push) PUSH="${2:-}"; [ -n "$PUSH" ] || usage 1; shift 2 ;;
     --steps) STEPS="${2:-}"; [ -n "$STEPS" ] || usage 1; shift 2 ;;
     --workspace) WORKSPACE="${2:-}"; [ -n "$WORKSPACE" ] || usage 1; shift 2 ;;
     --name) NAME="${2:-}"; [ -n "$NAME" ] || usage 1; shift 2 ;;
@@ -64,7 +68,7 @@ WORKSPACE_ABS="$(cd "$WORKSPACE" && pwd)"
 CONTAINER="cell-agent-$NAME"
 
 ENV_ARGS=()
-for var in CELL_AGENT_KEY CELL_AGENT_LIVE_KEY CELL_PROVIDER CELL_MODEL CELL_BASE_URL; do
+for var in CELL_AGENT_KEY CELL_AGENT_LIVE_KEY CELL_PROVIDER CELL_MODEL CELL_BASE_URL CELL_SNAPSHOTS_DIR CELL_S3_ENDPOINT CELL_S3_REGION CELL_S3_BUCKET CELL_S3_ACCESS_KEY CELL_S3_SECRET_KEY CELL_S3_PREFIX; do
   if [ -n "${!var:-}" ]; then
     ENV_ARGS+=(-e "$var=${!var}")
   fi
@@ -76,6 +80,12 @@ if [ -n "$RESUME" ]; then
 fi
 if [ -n "$STEPS" ]; then
   RUN_ARGS+=(--steps "$STEPS")
+fi
+if [ -n "$PULL" ]; then
+  RUN_ARGS+=(--pull "$PULL")
+fi
+if [ -n "$PUSH" ]; then
+  RUN_ARGS+=(--push "$PUSH")
 fi
 
 exec docker run --rm -i \

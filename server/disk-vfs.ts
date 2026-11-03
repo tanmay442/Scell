@@ -196,6 +196,52 @@ export function createDiskVfs(root: string): Vfs {
   }
 }
 
+/** Canonical on-disk path of the workspace root itself (resolves a
+ * symlinked parent such as /tmp on macOS). Falls back to the lexical
+ * root when it cannot be resolved (e.g. not yet created). */
+export function workspaceBaseReal(root: string): string {
+  try {
+    return realpathSync(resolve(root))
+  } catch {
+    return resolve(root)
+  }
+}
+
+/** Canonical on-disk path for a VFS absolute path: the deepest existing
+ * ancestor is resolved through symlinks (a planted link is followed to its
+ * target) and the missing tail re-attached. Throws EINVAL when the
+ * canonical location escapes the workspace root. Unlike real(), which only
+ * checks, this returns the canonical path — spawn it, not the lexical one.
+ * No filesystem writes happen here; callers mkdir after the check so a
+ * `mkdir -p` can never create directories through an escaping link. */
+export function canonicalRealPath(root: string, path: string): string {
+  const normalized = vfsPath.normalize(path)
+  const base = resolve(root)
+  let baseReal: string
+  try {
+    baseReal = realpathSync(base)
+  } catch {
+    throw new Error(`EINVAL: path escapes workspace '${path}'`)
+  }
+  let existing = resolve(join(base, normalized === '/' ? '' : normalized.slice(1)))
+  const tail: string[] = []
+  while (existing !== base && !existsSync(existing)) {
+    tail.unshift(existing.slice(existing.lastIndexOf(sep) + 1))
+    existing = existing.slice(0, existing.lastIndexOf(sep)) || sep
+  }
+  let resolved: string
+  try {
+    resolved = realpathSync(existing)
+  } catch {
+    throw new Error(`EINVAL: path escapes workspace '${path}'`)
+  }
+  const final = tail.length > 0 ? join(resolved, ...tail) : resolved
+  if (final !== baseReal && !final.startsWith(`${baseReal}${sep}`)) {
+    throw new Error(`EINVAL: path escapes workspace '${path}'`)
+  }
+  return final
+}
+
 /** Resolve a VFS path to its real path under root (for shells, tools). */
 export function vfsToReal(root: string, path: string): string {
   const normalized = vfsPath.normalize(path)

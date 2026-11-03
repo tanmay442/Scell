@@ -1,20 +1,64 @@
+import { join } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { runAgent } from '../src/shell/commands/agent'
-import { createDiskVfs } from './disk-vfs'
-import { createNodeShell } from './node-shell'
+import { sessionId, loadSession } from '../src/shell/commands/agent-sessions'
+import { buildRunContext, noteThreadId, resolveCwd, resolveSessionForThread, resolveThreadForResume, type RunContext } from './bindings'
 import { ensureAgentConfig } from './bootstrap'
+import { createDiskVfs } from './disk-vfs'
+import { loadTokens } from './auth'
+import { createRateLimiter } from './ratelimit'
+import { withGateway, type GatewayContext } from './gateway'
+import { cancelJob, listJobs, scheduleJob } from './jobs'
+import { startJobTicker } from './ticker'
+import { createThreadRouter } from './threads'
+import { findInterruptedThreads, resumePromptFor } from './resume'
+import { LocalDirStore, S3StoreFromEnv, defaultSnapshotsDir, pushSnapshot, type SnapshotStore } from './snapshots'
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024
 
 const port = Number(process.env.CELL_PORT || '8787') || 8787
 const root = process.env.CELL_WORKSPACE || './cell-workspace'
-const vfs = createDiskVfs(root)
+const timeoutMs = Number(process.env.CELL_TIMEOUT_MS || '600000') || 600000
+const jobsIntervalMs = Number(process.env.CELL_JOBS_INTERVAL_MS || '30000') || 30000
 
 try {
-  ensureAgentConfig(vfs)
+  ensureAgentConfig(createDiskVfs(root))
 } catch (err) {
   process.stderr.write(`cell server: ${err instanceof Error ? err.message : String(err)}\n`)
   process.exit(2)
+}
+
+let tokens = loadTokensSafe()
+const limiter = createRateLimiter({
+  max: Number(process.env.CELL_RATE_MAX || '60') || 60,
+  windowMs: Number(process.env.CELL_RATE_WINDOW_MS || '60000') || 60000,
+})
+const usageDir = process.env.CELL_USAGE_DIR || join(root, '.cell', 'usage')
+const router = createThreadRouter()
+
+function loadTokensSafe() {
+  try {
+    return loadTokens()
+  } catch (err) {
+    process.stderr.write(`cell server: ${err instanceof Error ? err.message : String(err)}\n`)
+    process.exit(2)
+  }
+}
+
+function snapshotStore(): SnapshotStore {
+  if (process.env.CELL_S3_BUCKET) return S3StoreFromEnv()
+  return LocalDirStore(process.env.CELL_SNAPSHOTS_DIR || defaultSnapshotsDir(root))
+}
+
+/** Best-effort step count for the usage log (session file, -1 when unknown). */
+function readSteps(vfs: ReturnType<typeof createDiskVfs>, sessionIdValue: string): number {
+  try {
+    const loaded = loadSession(vfs, sessionIdValue)
+    if (!('error' in loaded) && typeof loaded.session.steps === 'number') return loaded.session.steps
+  } catch {
+    // usage stat only
+  }
+  return -1
 }
 
 function log(method: string, path: string, code: number): void {
@@ -38,7 +82,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-async function handleRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: GatewayContext): Promise<void> {
   let raw: string
   try {
     raw = await readBody(req)
@@ -76,61 +120,261 @@ async function handleRun(req: IncomingMessage, res: ServerResponse): Promise<voi
     return
   }
 
-  const controller = new AbortController()
-  let done = false
-  // 'close' on the request fires once the body is consumed, not on
-  // disconnect — the client-gone signal lives on the response
-  res.on('close', () => {
-    if (!done) controller.abort()
-  })
-
-  res.writeHead(200, {
-    'content-type': 'text/event-stream',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-  })
-
-  const send = (event: unknown) => {
-    if (!res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`)
+  // each run gets its own capabilities: the resume target's thread dir,
+  // or a fresh thread dir for a new session (see server/bindings.ts).
+  // Built before the SSE headers so a bad id/cwd still returns a real 400.
+  // Hoisted to consts: narrowing on `body` fields does not survive into
+  // the router callback closure.
+  const prompt: string = body.prompt
+  const resumeId: string | undefined = body.resumeId
+  const maxSteps: number | undefined = body.maxSteps
+  const requestedCwd: string | undefined = body.cwd
+  let runCtx: RunContext
+  let cwd: string
+  let threadId: string
+  try {
+    threadId = resumeId ? resolveThreadForResume(root, resumeId) : sessionId()
+    runCtx = buildRunContext(root, threadId)
+    cwd = resolveCwd(runCtx.cwd, requestedCwd ?? null)
+  } catch (err) {
+    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    log('POST', '/run', 400)
+    return
   }
 
-  const args = [body.prompt]
-  if (body.resumeId) args.push('--resume', body.resumeId)
-  const result = await runAgent(
-    vfs,
-    args,
-    {
-      cwd: body.cwd || '/home/user',
-      shell: createNodeShell(root),
-      jobShell: createNodeShell(root),
-      signal: controller.signal,
-      maxSteps: body.maxSteps ?? Number.POSITIVE_INFINITY,
-      onProgress: (line) => send({ type: 'progress', line }),
-    },
-  )
-  done = true
-  send({ type: 'done', exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr })
-  res.end()
-  log('POST', '/run', result.exitCode)
+  // one run per thread at a time: a second caller gets 409 before any
+  // SSE header is written, so the status code stays meaningful
+  const outcome = await router.runExclusive(threadId, async () => {
+    const controller = new AbortController()
+    let done = false
+    // 'close' on the request fires once the body is consumed, not on
+    // disconnect — the client-gone signal lives on the response
+    res.on('close', () => {
+      if (!done) controller.abort()
+    })
+
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    })
+
+    const send = (event: unknown) => {
+      if (!res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`)
+    }
+
+    let runSessionId = ''
+    const args = [prompt]
+    if (resumeId) args.push('--resume', resumeId)
+    const result = await runAgent(
+      runCtx.vfs,
+      args,
+      {
+        cwd,
+        shell: runCtx.shell,
+        jobShell: runCtx.jobShell,
+        signal: controller.signal,
+        maxSteps: maxSteps ?? Number.POSITIVE_INFINITY,
+        onProgress: (line) => send({ type: 'progress', line }),
+        onSession: (id) => {
+          runSessionId = id
+          noteThreadId(runCtx.vfs, id, threadId)
+        },
+      },
+    )
+    done = true
+    ctx.report({ steps: runSessionId !== '' ? readSteps(runCtx.vfs, runSessionId) : -1, exitCode: result.exitCode })
+    // sessionId/threadId let the client resume this exact thread later
+    // (schedule a continue-job, or POST /run with resumeId)
+    send({ type: 'done', exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, sessionId: runSessionId || undefined, threadId })
+    res.end()
+    log('POST', '/run', result.exitCode)
+  })
+  if (outcome.status === 'busy') {
+    sendJson(res, 409, { error: 'thread busy' })
+    log('POST', '/run', 409)
+  }
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+function handleJobsList(res: ServerResponse): void {
+  try {
+    sendJson(res, 200, { jobs: listJobs(createDiskVfs(root)), busy: router.busyIds() })
+  } catch (err) {
+    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) })
+  }
+  log('GET', '/jobs', 200)
+}
+
+async function handleJobsCreate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: { threadId?: unknown; prompt?: unknown; runAt?: unknown; kind?: unknown }
+  try {
+    body = JSON.parse(await readBody(req)) as typeof body
+  } catch {
+    sendJson(res, 400, { error: 'invalid JSON' })
+    log('POST', '/jobs', 400)
+    return
+  }
+  if (typeof body.threadId !== 'string' || body.threadId === '') {
+    sendJson(res, 400, { error: 'threadId must be a non-empty string' })
+    log('POST', '/jobs', 400)
+    return
+  }
+  if (typeof body.prompt !== 'string' || body.prompt === '') {
+    sendJson(res, 400, { error: 'prompt must be a non-empty string' })
+    log('POST', '/jobs', 400)
+    return
+  }
+  if (typeof body.runAt !== 'number' || !(body.runAt > 0)) {
+    sendJson(res, 400, { error: 'runAt must be epoch ms' })
+    log('POST', '/jobs', 400)
+    return
+  }
+  try {
+    const job = scheduleJob(createDiskVfs(root), {
+      threadId: body.threadId,
+      prompt: body.prompt,
+      runAt: body.runAt,
+      kind: body.kind === 'snapshot' ? 'snapshot' : 'continue',
+    })
+    sendJson(res, 201, { job })
+    log('POST', '/jobs', 201)
+  } catch (err) {
+    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    log('POST', '/jobs', 400)
+  }
+}
+
+function handleJobsDelete(pathname: string, res: ServerResponse): void {
+  const id = decodeURIComponent(pathname.slice('/jobs/'.length))
+  try {
+    if (!cancelJob(createDiskVfs(root), id)) {
+      sendJson(res, 404, { error: 'job not found' })
+      log('DELETE', pathname, 404)
+      return
+    }
+  } catch (err) {
+    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+    log('DELETE', pathname, 400)
+    return
+  }
+  sendJson(res, 200, { ok: true })
+  log('DELETE', pathname, 200)
+}
+
+async function handle(req: IncomingMessage, res: ServerResponse, ctx: GatewayContext): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost')
   if (req.method === 'GET' && url.pathname === '/health') {
+    // unauthenticated by design (load-balancer checks); carries no
+    // per-thread state — busy threads are visible on authed GET /jobs
     sendJson(res, 200, { ok: true })
     log('GET', '/health', 200)
     return
   }
   if (req.method === 'POST' && url.pathname === '/run') {
-    await handleRun(req, res)
+    await handleRun(req, res, ctx)
+    return
+  }
+  if (req.method === 'GET' && url.pathname === '/jobs') {
+    handleJobsList(res)
+    return
+  }
+  if (req.method === 'POST' && url.pathname === '/jobs') {
+    await handleJobsCreate(req, res)
+    return
+  }
+  if (req.method === 'DELETE' && url.pathname.startsWith('/jobs/')) {
+    handleJobsDelete(url.pathname, res)
     return
   }
   sendJson(res, 404, { error: 'not found' })
   log(req.method ?? '?', url.pathname, 404)
 }
 
+/** A fired job runs through the same per-thread capabilities as HTTP runs,
+ * serialized by the router: a busy thread skips this tick (throw to retry). */
+async function fireJob(job: { id: string; threadId: string; prompt: string; kind: string }): Promise<void> {
+  if (job.kind === 'snapshot') {
+    const pushed = await pushSnapshot(root, snapshotStore(), job.threadId, { slim: true })
+    process.stderr.write(`[job ${job.id}] snapshot ${job.threadId}: ${pushed.skipped ? 'unchanged, skipped' : 'pushed'}\n`)
+    return
+  }
+  // continue jobs resume the thread's session; a thread with no session
+  // yet (scheduled before anything ran there) fails loudly, not silently
+  const session = resolveSessionForThread(root, job.threadId)
+  if (session === null) throw new Error(`job ${job.id}: thread ${job.threadId} has no session to continue`)
+  const outcome = await router.runExclusive(job.threadId, async () => {
+    const runCtx = buildRunContext(root, job.threadId)
+    const result = await runAgent(
+      runCtx.vfs,
+      [job.prompt, '--resume', session],
+      {
+        cwd: runCtx.cwd,
+        shell: runCtx.shell,
+        jobShell: runCtx.jobShell,
+        signal: AbortSignal.timeout(timeoutMs),
+        maxSteps: Number.POSITIVE_INFINITY,
+        onProgress: (line) => process.stderr.write(`[job ${job.id}] ${line}\n`),
+        onSession: (id) => noteThreadId(runCtx.vfs, id, job.threadId),
+      },
+    )
+    if (result.exitCode !== 0) throw new Error(`job ${job.id} exit ${result.exitCode}: ${result.stderr.slice(0, 500)}`)
+  })
+  if (outcome.status === 'busy') throw new Error(`job ${job.id}: thread ${job.threadId} busy — retrying next tick`)
+}
+
+const stopJobs = startJobTicker({
+  vfs: createDiskVfs(root),
+  intervalMs: jobsIntervalMs,
+  onDue: fireJob,
+  onError: (err, job) => {
+    process.stderr.write(`job ${job.id} attempt failed: ${err instanceof Error ? err.message : String(err)}\n`)
+  },
+})
+void stopJobs
+
+// interrupted runs from a dead server become continue-jobs; the ticker
+// picks them up — the server resumes work without a human message
+if (process.env.CELL_RESUME_ON_BOOT !== 'false') {
+  try {
+    const bootVfs = createDiskVfs(root)
+    for (const sessionId of findInterruptedThreads(bootVfs)) {
+      // the job needs the THREAD dir (where the files are), not the
+      // session stem: a killed resume-run's session id differs from the
+      // thread id it was working in — the sidecar maps between them
+      const threadId = resolveThreadForResume(root, sessionId)
+      scheduleJob(bootVfs, {
+        threadId,
+        prompt: resumePromptFor(sessionId),
+        runAt: Date.now(),
+        kind: 'continue',
+      })
+      process.stderr.write(`cell server: requeued interrupted thread ${threadId}\n`)
+    }
+  } catch (err) {
+    process.stderr.write(`cell server: resume scan failed: ${err instanceof Error ? err.message : String(err)}\n`)
+  }
+}
+
+const handleWithGateway = withGateway(
+  async (req, res, ctx) => {
+    await handle(req, res, ctx)
+  },
+  {
+    tokens,
+    limiter,
+    usageDir,
+    maxBodyBytes: MAX_BODY_BYTES,
+    usageModel: (body) => {
+      if (body !== null && typeof body === 'object' && typeof (body as { model?: unknown }).model === 'string') {
+        return (body as { model: string }).model
+      }
+      return process.env.CELL_MODEL || 'default'
+    },
+  },
+)
+
 const server = createServer((req, res) => {
-  handle(req, res).catch(() => {
+  handleWithGateway(req, res).catch(() => {
     try {
       if (!res.headersSent) sendJson(res, 500, { error: 'internal error' })
       else res.end()

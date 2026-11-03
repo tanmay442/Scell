@@ -207,9 +207,22 @@ curl http://localhost:8787/health
 Agent runs stream as SSE `data:` lines (one JSON object per line):
 
 ```
-data: {"type":"step","step":1,"output":"…"}
-data: {"type":"done","sessionId":"agent-abc123"}
+data: {"type":"progress","line":"…"}
+data: {"type":"done","exitCode":0,"stdout":"…","stderr":""}
 ```
+
+Every run is confined to its own thread dir (`/home/user/threads/<id>`)
+plus a shared `~/.cell` mount — it cannot name other threads' files.
+One run per thread at a time: a second `POST /run` for a busy thread gets
+`409 {"error":"thread busy"}`.
+
+Routes: `GET /health` (no auth, `{ok:true}` only), `POST /run`
+`{prompt, resumeId?, maxSteps?, cwd?}`, `GET /jobs`, `POST /jobs`
+`{threadId, prompt, runAt, kind: 'continue'|'snapshot'}`, `DELETE /jobs/:id`.
+Interrupted runs (server died mid-run) are requeued as `continue` jobs on
+boot and picked up by the ticker — the server resumes work by itself.
+One-shot runs can `--pull <name>` a snapshot before starting and
+`--push <name>` after finishing (slim tar, skips when unchanged).
 
 | Env var | Purpose | Default |
 |---|---|---|
@@ -218,12 +231,21 @@ data: {"type":"done","sessionId":"agent-abc123"}
 | `CELL_PROVIDER` | `meta` \| `anthropic` \| `openai` \| `compat` | `meta` |
 | `CELL_MODEL` | model id override | provider default |
 | `CELL_AGENT_KEY` | api key written into `agent.json` | — |
-| `CELL_AGENT_LIVE_KEY` | meta key written into `agent.json` when provider is `meta` | — |
+| `CELL_AGENT_LIVE_KEY` | meta key fallback when no api key is set | — |
 | `CELL_BASE_URL` | base URL for `compat` provider | — |
-| `CELL_TIMEOUT_MS` | per-step model timeout (ms) | server default |
+| `CELL_TIMEOUT_MS` | whole-run timeout (ms) | `600000` |
+| `CELL_API_TOKENS` | `id:token,…` for `Authorization: Bearer`; empty = open | — |
+| `CELL_RATE_MAX` / `CELL_RATE_WINDOW_MS` | per-token rate limit | `60` / `60000` |
+| `CELL_USAGE_DIR` | JSONL usage log dir | `<workspace>/.cell/usage` |
+| `CELL_JOBS_INTERVAL_MS` | job ticker poll interval | `30000` |
+| `CELL_RESUME_ON_BOOT` | requeue interrupted runs at boot | `true` |
+| `CELL_SNAPSHOTS_DIR` | local snapshot store | `<workspace>/../snapshots` |
+| `CELL_S3_*` | S3 snapshot backend (`ENDPOINT, BUCKET, ACCESS_KEY, SECRET_KEY`, optional `REGION, PREFIX`) | local store |
 
-Limits: no auth — bind to localhost or a private network. One box, no
-autoscaling — run one container per workspace.
+Limits: auth is a shared bearer token, not user accounts — localhost or a
+private network. One box, no autoscaling — run one container per workspace.
+Bash is not chrooted: the hard boundary is the VFS scope plus the existing
+deny-pattern scans; treat runs as semi-trusted code, not hostile tenants.
 
 ## Docs
 

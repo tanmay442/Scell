@@ -122,24 +122,28 @@ function isRecursiveForceRm(command: string): boolean {
 }
 
 /** First path-like token in a bash command that lands on denied agent
- * state, or null. Tokens are normalized (., .., ~) before the check so
- * spelling tricks do not walk around the file-tool deny-list. This is
- * still text scanning, not parsing: `$(cat ~/.cell/agent.json)` spelled
- * with variables or concatenation can evade it. The UI approval gate is
- * the real boundary; this keeps honest and semi-honest commands out. */
-export function bashDeniedPath(command: string): string | null {
-  for (const rawToken of command.split(/[\s'"`]+/)) {
-    const token = rawToken.replace(/[),;]+$/, '')
+ * state, or null. Tokens are normalized (., .., ~, $HOME) and resolved
+ * against the run's cwd before the check so spelling tricks (`$HOME/…`,
+ * `../../.cell/…` from a thread dir, `<redirect` prefixes) do not walk
+ * around the file-tool deny-list. This is still text scanning, not
+ * parsing: indirection through other variables (`F=…; cat $F`) or
+ * constructed strings can evade it. The UI approval gate is the real
+ * boundary; this keeps honest and semi-honest commands out. */
+export function bashDeniedPath(command: string, cwd = '/home/user'): string | null {
+  // $HOME/${HOME} expand to the same home the `~` shorthand means to bash
+  const dehomed = command.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, '/home/user')
+  for (const rawToken of dehomed.split(/[\s'"`]+/)) {
+    const token = rawToken.replace(/^[<>]+/, '').replace(/[),;]+$/, '')
     if (!token.includes('/')) continue
-    const expanded = expand(token, '/home/user')
+    const expanded = expand(token, cwd)
     if (isDeniedPath(expanded)) return expanded
   }
   return null
 }
 
 /** non-null when a bash command must be refused before it runs. */
-export function bashDenyReason(command: string): string | null {
-  const deniedPath = bashDeniedPath(command)
+export function bashDenyReason(command: string, cwd = '/home/user'): string | null {
+  const deniedPath = bashDeniedPath(command, cwd)
   if (deniedPath !== null) {
     return `refused: agent key/config/registry paths are not reachable from bash (${deniedPath})`
   }
@@ -366,7 +370,7 @@ export class JobManager {
   constructor(private shell: ShellLike, private vfs: Vfs) {}
 
   start(command: string, cwd: string): JobRecord {
-    const denied = bashDenyReason(command)
+    const denied = bashDenyReason(command, cwd)
     if (denied !== null) throw new Error(denied)
     // run-scoped unique id: a bare counter per run overwrote the
     // previous run's job-1 status/log while it could still write
@@ -460,7 +464,7 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     const custom = deps.customTools?.get(call.name)
     if (custom !== undefined) {
       const command = interpolateArgs(custom.run.command, call.input)
-      const denied = bashDenyReason(command)
+      const denied = bashDenyReason(command, deps.cwd)
       if (denied !== null) return { id: call.id, content: denied, isError: true }
       const timeoutMs = clampTimeout(call.input.timeoutMs)
       const result = await shell.exec(command, deps.cwd, undefined, { timeoutMs })
@@ -476,9 +480,9 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     if (call.name === 'bash') {
       const command = String(call.input.command ?? '')
-      const denied = bashDenyReason(command)
-      if (denied !== null) return { id: call.id, content: denied, isError: true }
       const cwd = call.input.cwd !== undefined ? expand(String(call.input.cwd), deps.cwd) : deps.cwd
+      const denied = bashDenyReason(command, cwd)
+      if (denied !== null) return { id: call.id, content: denied, isError: true }
       const timeoutMs = clampTimeout(call.input.timeoutMs)
       const result = await shell.exec(command, cwd, undefined, { timeoutMs })
       const combined = result.stdout !== '' && result.stderr !== '' ? `${result.stdout}\n${result.stderr}` : `${result.stdout}${result.stderr}`

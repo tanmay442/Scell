@@ -76,8 +76,11 @@ describe('agent bash under a protected shell', () => {
   it('the same corpus succeeds on an unprotected shell (human regression guard)', async () => {
     const vfs = seededVfs()
     const deps = depsFor(vfs, false)
-    expect(await bash(deps, 'cat $HOME/.cell/agent.json')).toContain(SECRET)
     expect(await bash(deps, 'cat ~/project/hello.txt')).toContain('hello world')
+    // the text scan (not the protected VFS) refuses key paths in BOTH modes:
+    // headless runs have no approval gate, so the scan is their only boundary
+    expect(await bash(deps, 'cat $HOME/.cell/agent.json')).toContain('not reachable from bash')
+    expect(await bash(deps, 'cat ../../.cell/agent.json', '/home/user/threads/abc')).toContain('not reachable from bash')
   })
 })
 

@@ -113,6 +113,17 @@ describe('deny-list path checks', () => {
     expect(bashDenyReason('cat ~/.cell/agent.json')).toMatch(/not reachable from bash/)
   })
 
+  it('bash deny scan expands $HOME and resolves against the run cwd', () => {
+    // F1: $HOME and ../../ from a thread dir must hit the same deny-list
+    expect(bashDeniedPath('cat $HOME/.cell/agent.json')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('cat ${HOME}/.cell/agent.json')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('cat "$HOME/.cell/agent.json"')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('cat <~/.cell/agent.json')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('cat ../../.cell/agent.json', '/home/user/threads/abc')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('cat .cell/agent.json', '/home/user/threads/abc')).toBeNull()
+    expect(bashDenyReason('cat $HOME/.cell/agent.json')).toMatch(/not reachable from bash/)
+  })
+
   it('rm recursive+force is refused in any spelling; plain rm -f is not', () => {
     expect(bashDenyReason('rm -rf build')).toMatch(/rm -rf/)
     expect(bashDenyReason('rm -fr build')).toMatch(/rm -rf/)
