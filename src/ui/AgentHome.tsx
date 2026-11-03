@@ -427,7 +427,7 @@ const Transcript = memo(function Transcript({ entries, running, workspace, onPre
 function ServerThreadsSection({ onOpenThread }: { onOpenThread: (thread: ServerThread) => void }) {
   const [url, setUrl] = useState(serverUrl())
   const [threads, setThreads] = useState<ServerThread[] | null>(null)
-  const [status, setStatus] = useState('Not connected — set the server URL, then refresh.')
+  const [status, setStatus] = useState('Set the server URL, then refresh — see Connectors for setup.')
   const refresh = async () => {
     setServerUrl(url)
     setStatus('Connecting…')
@@ -444,7 +444,7 @@ function ServerThreadsSection({ onOpenThread }: { onOpenThread: (thread: ServerT
   return (
     <SideNavSection title="On the server">
       <VStack gap={1.5}>
-        <TextInput label="Server URL" value={url} onChange={setUrl} placeholder="http://localhost:8787" />
+        <TextInput label="Server URL" value={url} onChange={setUrl} placeholder="http://host:port" />
         <Button label="Refresh" variant="ghost" size="sm" onClick={refresh} />
         <Text type="supporting" color="secondary">{status}</Text>
         {(threads ?? []).map((thread) => (
@@ -894,6 +894,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
           header={<SideNavHeading heading="Cell" subheading="agent on V8" icon={<Logo size={22} />} />}
           footer={
             <VStack gap={1}>
+              <ServerThreadsSection onOpenThread={setServerThread} />
               <SideNavSection title="Capabilities" isHeaderHidden>
                 <SideNavItem label="Skills" icon={SparklesIcon} size="sm" collapsible={{ defaultIsCollapsed: true }}>
                   <VStack gap={0.5}>
@@ -962,8 +963,6 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
             ) : null}
             </VStack>
           </SideNavSection>
-
-          <ServerThreadsSection onOpenThread={setServerThread} />
 
           {archivedSessions(state.sessions).length > 0 ? (
             <SideNavSection title="Archived" isHeaderHidden>

@@ -10,7 +10,7 @@ import { loadTokens } from './auth'
 import { createRateLimiter } from './ratelimit'
 import { withGateway, type GatewayContext } from './gateway'
 import { cancelJob, listJobs, markNotified, scheduleJob } from './jobs'
-import { collectFreshFiles, createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramApi, type TelegramAttachmentIn } from './telegram'
+import { collectFreshFiles, createTelegramApi, createTurnQueue, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramApi, type TelegramAttachmentIn } from './telegram'
 import { dueReminders } from '../src/shell/commands/agent-reminders'
 import { listThreads, readThread } from './threads-read'
 import type { Vfs } from '../src/vfs/types'
@@ -434,8 +434,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: GatewayCon
   const url = new URL(req.url ?? '/', 'http://localhost')
   if (req.method === 'GET' && url.pathname === '/health') {
     // unauthenticated by design (load-balancer checks); carries no
-    // per-thread state — busy threads are visible on authed GET /jobs
-    sendJson(res, 200, { ok: true })
+    // per-thread state — busy threads are visible on authed GET /jobs.
+    // The telegram flag (poller up or not) is public state, not a secret.
+    sendJson(res, 200, { ok: true, telegram: telegramPollerUp })
     log('GET', '/health', 200)
     return
   }
@@ -500,6 +501,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: GatewayCon
 
 /** Set by the Telegram block: lets jobs report back to the chat that
  * spawned them. Null on headless runs without Telegram. */
+/** True once the Telegram poll loop is up (public state for /health). */
+let telegramPollerUp = false
+
 let telegramJobNotify: { api: TelegramApi } | null = null
 
 export interface BackgroundSchedule {
@@ -710,18 +714,17 @@ if (process.env.CELL_TELEGRAM === '1') {
       // queued turn in order after the current one finishes. Main-thread
       // runs are triage-short, so the queue drains fast; workers run on
       // their own threads and never block the chat.
-      const MAX_QUEUED = 5
-      const pendingTurns = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[] }>>()
-      const runChat = async (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[] = [], fromQueue = false): Promise<string> => {
-        if (!fromQueue && router.isBusy(threadId)) {
-          const queued = pendingTurns.get(threadId) ?? []
-          if (queued.length >= MAX_QUEUED) {
-            return 'still catching up — hold that thought for a moment'
-          }
-          queued.push({ text, attachments })
-          pendingTurns.set(threadId, queued)
-          return `queued (position ${queued.length}) — still on the previous one, it runs next`
-        }
+      // per-chat FIFO turn queue: busy threads queue instead of dropping
+      const turnQueue = createTurnQueue(
+        (chatId, text, threadId, attachments, fromQueue) => executeChatTurn(chatId, text, threadId, attachments, fromQueue),
+        (chatId, text) => api.sendMessage(chatId, text),
+        (threadId) => router.isBusy(threadId),
+        (chatId, err) => process.stderr.write(`cell server: queued turn failed for chat ${chatId}: ${err instanceof Error ? err.message : String(err)}\n`),
+      )
+      const runChat = (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[] = []): Promise<string> =>
+        turnQueue.submit(chatId, threadId, text, attachments)
+      // single triage turn; the queue above handles busy/drain/order
+      const executeChatTurn = async (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[] = [], fromQueue = false): Promise<string> => {
         const runCtx = buildRunContext(root, threadId)
         const outcome = await router.runExclusive(threadId, async () => {
           const controller = new AbortController()
@@ -818,32 +821,15 @@ if (process.env.CELL_TELEGRAM === '1') {
             clearTimeout(timeout)
           }
         }, { timeoutMs })
-        if (outcome.status === 'busy') return 'still working on the last one — one moment'
+        // router race (isBusy said free, holder slipped in): drained turns
+        // raise the retry marker so the queue puts the message back at the
+        // front instead of dropping it; live turns just report busy
+        if (outcome.status === 'busy') {
+          if (fromQueue) throw new Error('__QUEUE_RETRY__')
+          return 'still working on the last one — one moment'
+        }
         if (outcome.status === 'timeout') return 'that took too long — try a smaller step'
-        // drain the FIFO: each queued message runs as its own resumed
-        // turn, in order, with its own reply straight to the chat.
-        // fromQueue bypasses the busy check (the router is free here;
-        // a new arrival mid-drain re-queues behind us, order preserved).
-        const firstReply = outcome.value
-        void (async () => {
-          for (;;) {
-            const next = pendingTurns.get(threadId)?.shift()
-            if (next === undefined) break
-            if (pendingTurns.get(threadId)?.length === 0) pendingTurns.delete(threadId)
-            try {
-              const reply = await runChat(chatId, next.text, threadId, next.attachments, true)
-              await api.sendMessage(chatId, reply)
-            } catch (err) {
-              try {
-                await api.sendMessage(chatId, `error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 1000))
-              } catch {
-                // delivery failed; the error is already logged below
-              }
-              process.stderr.write(`cell server: queued turn failed for chat ${chatId}: ${err instanceof Error ? err.message : String(err)}\n`)
-            }
-          }
-        })()
-        return firstReply
+        return outcome.value
       }
       const poller = startTelegramPoller(tgVfs, apiBase, loaded.config, {
         log: (message) => process.stderr.write(`cell server: ${message}\n`),
@@ -874,6 +860,7 @@ if (process.env.CELL_TELEGRAM === '1') {
       // (0600 file in a 0700 dir outside the workspace) stays preferred.
       delete process.env.CELL_TELEGRAM_TOKEN
       delete process.env.CELL_TELEGRAM_TOKEN_FILE
+      telegramPollerUp = true
       api
         .getMe()
         .then(

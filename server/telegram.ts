@@ -355,6 +355,78 @@ export interface TelegramPoller {
   handled: () => number
 }
 
+/** Per-chat FIFO turn queue (Grok/Hermes shape): a message arriving while
+ * its thread is busy QUEUES instead of dying — the drain runs each queued
+ * turn in order after the current one finishes. Same chat sequential,
+ * different chats fully parallel (the router underneath serializes). */
+export interface TurnQueue {
+  /** immediate reply ('Queued…' or the turn's own reply when idle) */
+  submit(chatId: number, threadId: string, text: string, attachments: TelegramAttachmentIn[]): Promise<string>
+}
+
+export function createTurnQueue(
+  runTurn: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[], fromQueue: boolean) => Promise<string>,
+  send: (chatId: number, text: string) => Promise<void>,
+  isBusy: (threadId: string) => boolean,
+  onError: (chatId: number, err: unknown) => void,
+  maxQueued = 5,
+): TurnQueue {
+  const pending = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[] }>>()
+  const draining = new Set<string>()
+  return {
+    async submit(chatId, threadId, text, attachments) {
+      if (!isBusy(threadId)) {
+        const reply = await runTurn(chatId, text, threadId, attachments, false)
+        drain(chatId, threadId)
+        return reply
+      }
+      const queued = pending.get(threadId) ?? []
+      if (queued.length >= maxQueued) return 'still catching up — hold that thought for a moment'
+      queued.push({ text, attachments })
+      pending.set(threadId, queued)
+      return `queued (position ${queued.length}) — still on the previous one, it runs next`
+    },
+  }
+  // one drain loop per thread: a drained turn completing starts nonew loop
+  function drain(chatId: number, threadId: string): void {
+    if (draining.has(threadId)) return
+    draining.add(threadId)
+    void (async () => {
+      try {
+        for (;;) {
+          // holder still running (router race): leave items queued — the
+          // holder's completion starts a fresh drain that picks them up
+          if (isBusy(threadId)) break
+          const next = pending.get(threadId)?.shift()
+          if (next === undefined) break
+          if (pending.get(threadId)?.length === 0) pending.delete(threadId)
+          try {
+            const reply = await runTurn(chatId, next.text, threadId, next.attachments, true)
+            await send(chatId, reply)
+          } catch (err) {
+            // router race: holder slipped in between the isBusy check and
+            // the run — back to the front, no user-visible error
+            if (err instanceof Error && err.message === '__QUEUE_RETRY__') {
+              const queue = pending.get(threadId) ?? []
+              queue.unshift(next)
+              pending.set(threadId, queue)
+              continue
+            }
+            try {
+              await send(chatId, `error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 1000))
+            } catch {
+              // delivery failed; reported below
+            }
+            onError(chatId, err)
+          }
+        }
+      } finally {
+        draining.delete(threadId)
+      }
+    })()
+  }
+}
+
 /** Long-poll loop. Returns a stopper; the loop never throws outward. */
 export function startTelegramPoller(
   vfs: Vfs,

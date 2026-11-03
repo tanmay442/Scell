@@ -36,19 +36,61 @@ const pillStyle: CSSProperties = {
   opacity: 0.92,
 }
 
+interface ServerStatus {
+  /** configured server URL, or '' when unset */
+  url: string
+  reachable: boolean
+  telegram: boolean
+  threads: number
+  busyThreads: number
+  workers: number
+  /** newest server thread, for the "latest work" line */
+  latest: string | null
+}
+
 interface DockData {
   jobsRunning: number
   jobsDone: number
   repoName: string | null
   branch: string | null
   changedFiles: string[]
+  server: ServerStatus | null
 }
 
-const EMPTY: DockData = { jobsRunning: 0, jobsDone: 0, repoName: null, branch: null, changedFiles: [] }
+const EMPTY: DockData = { jobsRunning: 0, jobsDone: 0, repoName: null, branch: null, changedFiles: [], server: null }
 
 async function pollDock(): Promise<DockData> {
   const { vfs } = platform()
   const agentBusy = _agentStoreRef.get().runningIds.length > 0
+  // headless server + connectors (best-effort, cached on failure): the
+  // dock is the always-visible indicator — sidebar has the full browser
+  let server: ServerStatus | null = lastServer
+  try {
+    const { serverUrl, fetchServerHealth, fetchServerThreads } = await import('./server-threads')
+    const url = serverUrl()
+    if (url === '') {
+      server = null
+    } else {
+      const [health, threads] = await Promise.all([fetchServerHealth(), fetchServerThreads()])
+      if ('error' in health || 'error' in threads) {
+        server = { url, reachable: false, telegram: lastServer?.telegram ?? false, threads: 0, busyThreads: 0, workers: 0, latest: lastServer?.latest ?? null }
+      } else {
+        const busy = threads.threads.filter((t) => t.busy)
+        server = {
+          url,
+          reachable: true,
+          telegram: health.telegram,
+          threads: threads.threads.length,
+          busyThreads: busy.length,
+          workers: threads.threads.filter((t) => t.kind === 'worker').length,
+          latest: threads.threads.length > 0 ? (threads.threads.map((t) => t.title ?? t.threadId).join(' · ').slice(0, 80)) : null,
+        }
+      }
+    }
+  } catch {
+    // keep last known server state; the dock must never wedge the UI
+  }
+  lastServer = server
   let jobsRunning = 0
   let jobsDone = 0
   try {
@@ -73,7 +115,7 @@ async function pollDock(): Promise<DockData> {
   let changedFiles: string[] = []
   if (agentBusy) {
     // do not mirror the VFS into MEMFS mid-run; keep last git snapshot
-    return { jobsRunning, jobsDone, ...lastGit }
+    return { jobsRunning, jobsDone, server, ...lastGit }
   }
   try {
     const repos = findGitRepos(vfs)
@@ -88,8 +130,10 @@ async function pollDock(): Promise<DockData> {
     }
   } catch { /* git is best-effort here */ }
   lastGit = { repoName, branch, changedFiles }
-  return { jobsRunning, jobsDone, repoName, branch, changedFiles }
+  return { jobsRunning, jobsDone, server, repoName, branch, changedFiles }
 }
+
+let lastServer: ServerStatus | null = null
 
 let lastGit: Pick<DockData, 'repoName' | 'branch' | 'changedFiles'> = { repoName: null, branch: null, changedFiles: [] }
 
@@ -194,10 +238,26 @@ export function StatusDock({ onOpenWorkspace }: { onOpenWorkspace?: () => void }
               {data.repoName ?? 'workspace'}{data.branch ? ` · ${data.branch}` : ''}
             </Text>
           </HStack>
+          {data.server !== null ? (
+            <HStack gap={2} vAlign="center">
+              <StatusDot variant={data.server.reachable ? 'accent' : 'neutral'} label={data.server.reachable ? 'server up' : 'server down'} />
+              <Text type="supporting" color="secondary">
+                {(() => { try { const u = new URL(data.server!.url); return `${u.host}` } catch { return data.server!.url } })()}
+                {data.server.reachable ? ` · ${data.server.threads} thread${data.server.threads === 1 ? '' : 's'}${data.server.busyThreads > 0 ? ` (${data.server.busyThreads} busy)` : ''}` : ' · unreachable'}
+              </Text>
+            </HStack>
+          ) : null}
           <HStack gap={2} vAlign="center">
             <LinkIcon width={14} />
-            <Text type="supporting" color="secondary">No connectors yet</Text>
+            <Text type="supporting" color="secondary">
+              {data.server !== null && data.server.reachable && data.server.telegram ? 'Telegram live' : data.server !== null && data.server.reachable ? 'No connectors yet' : 'Connectors — see sidebar'}
+            </Text>
           </HStack>
+          {data.server !== null && data.server.reachable && (data.server.workers > 0 || data.server.latest !== null) ? (
+            <Text type="supporting" color="secondary">
+              Latest: {data.server.workers > 0 ? `${data.server.workers} worker${data.server.workers === 1 ? '' : 's'} · ` : ''}{data.server.latest ?? '—'}
+            </Text>
+          ) : null}
         </VStack>
       </Card>
     </div>

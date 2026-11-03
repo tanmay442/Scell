@@ -24,11 +24,14 @@ export interface ServerThreadDetail extends ServerThread {
 const URL_KEY = 'cell.serverUrl'
 const TOKEN_KEY = 'cell.serverToken'
 
+// No hardcoded default: servers live on different hosts/ports per
+// setup. Empty until the user sets it (Connectors dialog or the server
+// section); the UI shows a placeholder and stays inert until then.
 export function serverUrl(): string {
   try {
-    return localStorage.getItem(URL_KEY) ?? 'http://localhost:8787'
+    return (localStorage.getItem(URL_KEY) ?? '').trim()
   } catch {
-    return 'http://localhost:8787'
+    return ''
   }
 }
 
@@ -71,8 +74,22 @@ async function authed(path: string, init?: RequestInit): Promise<{ ok: boolean; 
   return { ok: res.ok, status: res.status, body }
 }
 
+export async function fetchServerHealth(): Promise<{ ok: boolean; telegram: boolean } | { error: string }> {
+  try {
+    const url = serverUrl()
+    if (url === '') return { error: 'no server URL set' }
+    const res = await fetch(`${url}/health`)
+    if (!res.ok) return { error: `server HTTP ${res.status}` }
+    const body = (await res.json()) as { ok?: boolean; telegram?: boolean }
+    return { ok: body.ok === true, telegram: body.telegram === true }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 export async function fetchServerThreads(): Promise<{ threads: ServerThread[] } | { error: string }> {
   try {
+    if (serverUrl() === '') return { error: 'no server URL set' }
     const { ok, status, body } = await authed('/threads')
     if (!ok) return { error: `server ${status}: ${typeof body === 'object' && body !== null && 'error' in body ? String((body as { error: unknown }).error) : 'request failed'}` }
     const threads = (body as { threads?: unknown }).threads
@@ -85,6 +102,7 @@ export async function fetchServerThreads(): Promise<{ threads: ServerThread[] } 
 
 export async function fetchThreadDetail(threadId: string): Promise<{ detail: ServerThreadDetail } | { error: string }> {
   try {
+    if (serverUrl() === '') return { error: 'no server URL set' }
     const { ok, status, body } = await authed(`/threads/${encodeURIComponent(threadId)}`)
     if (!ok) return { error: `server ${status}: ${typeof body === 'object' && body !== null && 'error' in body ? String((body as { error: unknown }).error) : 'request failed'}` }
     return { detail: body as ServerThreadDetail }

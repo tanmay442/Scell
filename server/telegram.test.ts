@@ -436,3 +436,70 @@ describe('background worker scheduling', () => {
     expect(job?.status).toBe('pending')
   })
 })
+
+describe('turn queue (FIFO per chat)', () => {
+  it('queues while busy, drains in order, caps the queue', async () => {
+    const { createTurnQueue } = await import('./telegram')
+    const { createThreadRouter } = await import('./threads')
+    const router = createThreadRouter()
+    const order: string[] = []
+    const delivered: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let calls = 0
+    const runTurn = async (_c: number, text: string, threadId: string, _a: never[], _q: boolean) => {
+      const outcome = await router.runExclusive(threadId, async () => {
+        calls++
+        if (text === 'slow') await gate
+        order.push(text)
+        return `reply:${text}`
+      })
+      if (outcome.status !== 'ran') throw new Error('busy-race')
+      return outcome.value
+    }
+    const queue = createTurnQueue(runTurn, async (_c, text) => { delivered.push(text) }, (t) => router.isBusy(t), () => {})
+    const first = queue.submit(1, 'tg-1', 'slow', [])
+    await new Promise((r) => setTimeout(r, 100))
+    const q1 = await queue.submit(1, 'tg-1', 'second', [])
+    const q2 = await queue.submit(1, 'tg-1', 'third', [])
+    expect(q1).toMatch(/position 1/)
+    expect(q2).toMatch(/position 2/)
+    release()
+    expect(await first).toBe('reply:slow')
+    await new Promise((r) => setTimeout(r, 300))
+    expect(order).toEqual(['slow', 'second', 'third'])
+    expect(delivered).toEqual(['reply:second', 'reply:third'])
+    expect(calls).toBe(3)
+    // other threads are unaffected by tg-1's queue
+    expect(await queue.submit(1, 'tg-2', 'solo', [])).toBe('reply:solo')
+  })
+
+  it('refuses beyond the cap and survives handler errors', async () => {
+    const { createTurnQueue } = await import('./telegram')
+    const { createThreadRouter } = await import('./threads')
+    const router = createThreadRouter()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const runTurn = async (_c: number, text: string, threadId: string, _a: never[], _q: boolean) => {
+      const outcome = await router.runExclusive(threadId, async () => {
+        if (text === 'slow') await gate
+        if (text === 'boom') throw new Error('handler blew up')
+        return `ok:${text}`
+      })
+      if (outcome.status !== 'ran') throw new Error('busy-race')
+      return outcome.value
+    }
+    const errors: unknown[] = []
+    const delivered: string[] = []
+    const queue = createTurnQueue(runTurn, async (_c, text) => { delivered.push(text) }, (t) => router.isBusy(t), (c, e) => { errors.push([c, e]) }, 2)
+    const slow = queue.submit(1, 't', 'slow', [])
+    expect(await queue.submit(1, 't', 'a', [])).toMatch(/position 1/)
+    expect(await queue.submit(1, 't', 'boom', [])).toMatch(/position 2/)
+    expect(await queue.submit(1, 't', 'extra', [])).toMatch(/hold that thought/)
+    release()
+    expect(await slow).toBe('ok:slow')
+    await new Promise((r) => setTimeout(r, 300))
+    expect(delivered).toEqual(['ok:a', 'error: handler blew up'])
+    expect(errors.length).toBe(1)
+  })
+})

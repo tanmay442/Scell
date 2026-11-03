@@ -209,3 +209,14 @@ describe('exactly-once chat delivery', () => {
     markNotified(vfs, 'missing')
   })
 })
+
+describe('origin thread + delivery flags', () => {
+  it('round-trips originThreadId and validates it', () => {
+    const vfs = createVfs()
+    const job = scheduleJob(vfs, { threadId: 'tg-1-wabc', prompt: 'p', runAt: 1, kind: 'task', notifyChatId: '42', originThreadId: 'tg-1' })
+    expect(job.originThreadId).toBe('tg-1')
+    expect(() => scheduleJob(vfs, { threadId: 't', prompt: 'p', runAt: 1, kind: 'task', originThreadId: '..' })).toThrow()
+    const listed = listJobs(vfs).find((j) => j.id === job.id)
+    expect(listed?.originThreadId).toBe('tg-1')
+  })
+})
