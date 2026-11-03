@@ -6,3 +6,5 @@ vendor/
 .DS_Store
 nohup.out
 dist-server/
+cell-workspace/
+workspace/
