@@ -64,3 +64,19 @@ describe('threads-read', () => {
     expect(readThread(createVfs(), 'tg-42')).toEqual({ error: expect.any(String), code: 410 })
   })
 })
+
+describe('threads-read disclosure hardening', () => {
+  it('hides nested dotfiles and any nested .cell content', () => {
+    const vfs = createVfs()
+    vfs.mkdir('/home/user/threads/tg-9')
+    vfs.write('/home/user/threads/tg-9/notes.txt', 'ok')
+    vfs.write('/home/user/threads/tg-9/.env', 'SECRET=1')
+    vfs.write('/home/user/threads/tg-9/sub/.hidden', 'x')
+    vfs.write('/home/user/threads/tg-9/sub/.cell/evil.txt', 'x')
+    vfs.write('/home/user/threads/tg-9/.cell/rootcell.txt', 'x')
+    const detail = readThread(vfs, 'tg-9')
+    if ('error' in detail || 'code' in detail) throw new Error('unexpected error')
+    const names = detail.files.map((f) => f.name)
+    expect(names).toEqual(['notes.txt'])
+  })
+})

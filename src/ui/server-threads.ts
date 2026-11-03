@@ -150,7 +150,20 @@ export async function discoverTelegramChats(token: string): Promise<{ chats: Arr
 }
 
 /** Copy-paste server launch with the token + allowlist baked in. */
-export function telegramServerCommand(workspace: string, port: number, token: string, allowFrom: string): string {
+/** Copy-paste server launch, token-file first: the token never belongs
+ * in shell history on shared machines. The inline-token form is shown
+ * commented out for throwaway local runs (leading space + HISTCONTROL). */
+export function telegramServerCommand(workspace: string, port: number, token: string, allowFrom: string, tokenFile = '~/.cell-telegram-token'): string {
   const allow = allowFrom.trim() === '' ? '<your-chat-id>' : allowFrom.trim()
-  return `CELL_TELEGRAM=1 CELL_TELEGRAM_TOKEN=${token.trim() === '' ? '<botfather-token>' : token.trim()} CELL_TELEGRAM_ALLOW_FROM=${allow} ./scripts/agent-server.sh --workspace ${workspace} --port ${port}`
+  const trimmed = token.trim()
+  const lines = [
+    `# 1. save the token outside the workspace (0600 file in a 0700 dir):`,
+    `#    printf '%s' '${trimmed === '' ? '<botfather-token>' : trimmed}' > ${tokenFile} && chmod 600 ${tokenFile}`,
+    `CELL_TELEGRAM=1 CELL_TELEGRAM_TOKEN_FILE=${tokenFile} CELL_TELEGRAM_ALLOW_FROM=${allow} ./scripts/agent-server.sh --workspace ${workspace} --port ${port}`,
+  ]
+  if (trimmed !== '') {
+    lines.push(`# throwaway form only (leading space keeps it out of history with HISTCONTROL=ignorespace):`)
+    lines.push(`#  CELL_TELEGRAM=1 CELL_TELEGRAM_TOKEN=${trimmed} CELL_TELEGRAM_ALLOW_FROM=${allow} ./scripts/agent-server.sh --workspace ${workspace} --port ${port}`)
+  }
+  return lines.join('\n')
 }

@@ -447,7 +447,7 @@ describe('turn queue (FIFO per chat)', () => {
     let release!: () => void
     const gate = new Promise<void>((r) => { release = r })
     let calls = 0
-    const runTurn = async (_c: number, text: string, threadId: string, _a: never[], _q: boolean) => {
+    const runTurn = async (_c: number, text: string, threadId: string, _a: unknown[], _q: boolean) => {
       const outcome = await router.runExclusive(threadId, async () => {
         calls++
         if (text === 'slow') await gate
@@ -480,7 +480,7 @@ describe('turn queue (FIFO per chat)', () => {
     const router = createThreadRouter()
     let release!: () => void
     const gate = new Promise<void>((r) => { release = r })
-    const runTurn = async (_c: number, text: string, threadId: string, _a: never[], _q: boolean) => {
+    const runTurn = async (_c: number, text: string, threadId: string, _a: unknown[], _q: boolean) => {
       const outcome = await router.runExclusive(threadId, async () => {
         if (text === 'slow') await gate
         if (text === 'boom') throw new Error('handler blew up')

@@ -135,15 +135,28 @@ export function readThread(vfs: Vfs, threadId: string, busyIds: string[] = []): 
   let foldersTruncated = false
   try {
     const all = vfs.listAllFiles().filter((p) => p.startsWith(`${THREADS_DIR}/${threadId}/`))
-    const scoped = all
-      .map((p) => ({ path: p, stat: vfs.stat(p) }))
-      .filter((e): e is { path: string; stat: { type: 'file'; size: number; mtime: number } } => e.stat !== null && e.stat.type === 'file')
-      .sort((a, b) => b.stat.mtime - a.stat.mtime)
+    const scoped: Array<{ path: string; stat: { type: 'file'; size: number; mtime: number } }> = []
+    const isFileStat = (stat: { type: string; size: number; mtime: number } | null): stat is { type: 'file'; size: number; mtime: number } =>
+      stat !== null && stat.type === 'file'
+    // filter FIRST (dotfiles, nested .cell), then cap: filtered entries
+    // must not eat FILES_CAP slots, and nested secrets must never list
+    for (const path of all) {
+      if (path.includes('/.cell/')) continue
+      const base = path.split('/').pop() ?? ''
+      if (base.startsWith('.') || base === '') continue
+      let stat: ReturnType<Vfs['stat']>
+      try {
+        stat = vfs.stat(path)
+      } catch {
+        continue
+      }
+      if (!isFileStat(stat)) continue
+      scoped.push({ path, stat })
+    }
+    scoped.sort((a, b) => b.stat.mtime - a.stat.mtime)
     if (scoped.length > FILES_CAP) foldersTruncated = true
     for (const { path, stat } of scoped.slice(0, FILES_CAP)) {
-      const name = path.slice(`${THREADS_DIR}/${threadId}/`.length)
-      if (name.startsWith('.')) continue
-      files.push({ name, size: stat.size, mtime: stat.mtime })
+      files.push({ name: path.slice(`${THREADS_DIR}/${threadId}/`.length), size: stat.size, mtime: stat.mtime })
     }
   } catch {
     foldersTruncated = true
