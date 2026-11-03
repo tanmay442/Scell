@@ -510,26 +510,45 @@ describe('python empty-dir sync', () => {
  * (no external generator needed). Proves isolate-native document reading:
  * pypdf installs via micropip and extracts text with zero machine help. */
 function minimalPdf(lines: string[]): Uint8Array {
+  // byte-exact builder: offsets, xref and /Length are byte counts, and
+  // PDF string literals escape backslash and parens — non-ASCII and
+  // delimiter-heavy lines stay valid (the F4 hardening).
   const enc = new TextEncoder()
-  const textOps = lines.map((l, i) => `BT /F1 12 Tf 72 ${720 - i * 20} Td (${l}) Tj ET`).join('\n')
-  const objects: string[] = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
-    `<< /Length ${textOps.length} >>\nstream\n${textOps}\nendstream`,
-    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  const concat = (parts: Uint8Array[]): Uint8Array => {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
+    let at = 0
+    for (const p of parts) {
+      out.set(p, at)
+      at += p.length
+    }
+    return out
+  }
+  const pdfEscape = (text: string) => text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)')
+  const textOps = enc.encode(lines.map((l, i) => `BT /F1 12 Tf 72 ${720 - i * 20} Td (${pdfEscape(l)}) Tj ET`).join('\n'))
+  const objects: Uint8Array[] = [
+    enc.encode('<< /Type /Catalog /Pages 2 0 R >>'),
+    enc.encode('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+    enc.encode('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>'),
+    concat([enc.encode(`<< /Length ${textOps.length} >>\nstream\n`), textOps, enc.encode('\nendstream')]),
+    enc.encode('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'),
   ]
-  let out = '%PDF-1.4\n'
+  const header = enc.encode('%PDF-1.4\n')
+  const parts: Uint8Array[] = [header]
   const offsets: number[] = []
+  let at = header.length
   objects.forEach((body, i) => {
-    offsets.push(out.length)
-    out += `${i + 1} 0 obj\n${body}\nendobj\n`
+    const head = enc.encode(`${i + 1} 0 obj\n`)
+    const tail = enc.encode('\nendobj\n')
+    offsets.push(at)
+    parts.push(head, body, tail)
+    at += head.length + body.length + tail.length
   })
-  const xrefAt = out.length
-  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
-  for (const offset of offsets) out += `${String(offset).padStart(10, '0')} 00000 n \n`
-  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF`
-  return enc.encode(out)
+  const xrefAt = at
+  let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets) xref += `${String(offset).padStart(10, '0')} 00000 n \n`
+  xref += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF`
+  parts.push(enc.encode(xref))
+  return concat(parts)
 }
 
 describe('documents (isolate-native PDF)', () => {
@@ -577,6 +596,265 @@ describe('installPureWheel (isolate-safe packages)', () => {
       await installPureWheel(py, 'pypdf')
       const probe = await py.runPythonAsync('from pypdf import PdfReader\nPdfReader.__module__')
       expect(String(probe).trim()).toBe('pypdf._reader')
+    } finally {
+      ;(globalThis as { fetch: unknown }).fetch = realFetch
+    }
+  }, 300_000)
+})
+
+describe('installPureWheel hardening', () => {
+  it('refuses a hash-mismatched wheel without extracting', async () => {
+    const { installPureWheel } = await import('./runner')
+    const { loadPyodide } = await import('pyodide')
+    const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+    const realFetch = globalThis.fetch
+    const evil = new TextEncoder().encode('definitely-not-a-wheel')
+    ;(globalThis as { fetch: unknown }).fetch = async (url: unknown) => {
+      if (typeof url === 'string' && url.startsWith('/vendor/')) return new Response(evil, { status: 200 })
+      throw new Error('network blocked')
+    }
+    try {
+      await expect(installPureWheel(py, 'pypdf')).rejects.toThrow(/hash mismatch/)
+    } finally {
+      ;(globalThis as { fetch: unknown }).fetch = realFetch
+    }
+  }, 300_000)
+
+  it('refuses evil zip members (pth, sitecustomize, escape, foreign top-level)', async () => {
+    const { installWheelMembers } = await import('./runner')
+    const { loadPyodide } = await import('pyodide')
+    const { execSync } = await import('node:child_process')
+    const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+    const buildZip = async (names: string[]): Promise<Uint8Array> => {
+      const { writeFileSync } = await import('node:fs')
+      writeFileSync('/tmp/evil-members.json', JSON.stringify(names))
+      const hex = execSync('python3 /tmp/make-evil-zip.py').toString().trim()
+      return new Uint8Array(Buffer.from(hex, 'hex'))
+    }
+    const evilNames = ['pypdf/__init__.py', 'pypdf/evil.pth', 'sitecustomize.py', '../../ESC.py', 'numpy/__init__.py', '/abs.py', 'a/b/../../../c.py']
+    const evil = await buildZip(evilNames)
+    py.FS.mkdirTree('/tmp/wheels')
+    py.FS.writeFile('/tmp/wheels/evil.zip', evil)
+    await expect(installWheelMembers(py, '/tmp/wheels/evil.zip', 'pypdf', 'pypdf')).rejects.toThrow(/refusing wheel members/)
+    // and a clean wheel passes the same gate
+    const good = await buildZip(['pypdf/__init__.py', 'pypdf-6.21.4.dist-info/METADATA'])
+    py.FS.writeFile('/tmp/wheels/good.zip', good)
+    await installWheelMembers(py, '/tmp/wheels/good.zip', 'pypdf', 'os')
+  }, 300_000)
+
+  it('the os module sees the merged environment, MPLBACKEND defaults to AGG', async () => {
+    const vfs = freshVfs()
+    const { stdout } = await runIn(vfs, "import os\nprint(os.environ.get('MPLBACKEND'), os.environ.get('CUSTOM'))", { env: { CUSTOM: 'yes' } })
+    expect(stdout).toContain('AGG yes')
+  })
+
+  it('paths outside the payload can be created (artifacts dirs auto-made)', async () => {
+    const vfs = freshVfs()
+    const { result, vfs: after } = await runIn(
+      vfs,
+      "import os\nos.makedirs('/home/user/artifacts/deep/nest', exist_ok=True)\nopen('/home/user/artifacts/deep/nest/out.txt', 'w').write('made it')",
+    )
+    expect(result.exitCode).toBe(0)
+    expect(after.read('/home/user/artifacts/deep/nest/out.txt')).toBe('made it')
+  })
+})
+
+describe('python stdin (P0-7)', () => {
+  it(
+    'piped bytes reach the program instead of silent EOF',
+    async () => {
+      const vfs = freshVfs()
+      const out: { stream: string; text: string }[] = []
+      const encoder = new TextEncoder()
+      const buffer = new Uint8Array(1 << 22)
+      const result = await runPython(pyodide, {
+        code: "import sys\ndata = sys.stdin.read()\nprint(f'got:{data}')",
+        entry: '/home/user/script.py',
+        argv: [],
+        cwd: '/home/user',
+        env: {},
+        payload: { buffer, index: [] },
+        stdin: encoder.encode('piped-input\n'),
+        onOut: (stream, text) => out.push({ stream, text }),
+      })
+      expect(result.exitCode).toBe(0)
+      expect(out.map((o) => o.text).join('')).toContain('got:piped-input')
+    },
+    120_000,
+  )
+
+  it(
+    'absent stdin is clean EOF',
+    async () => {
+      const vfs = freshVfs()
+      void vfs
+      const out: { stream: string; text: string }[] = []
+      const buffer = new Uint8Array(1 << 22)
+      const result = await runPython(pyodide, {
+        code: "import sys\ndata = sys.stdin.read()\nprint(f'eof:{data == \"\"}')",
+        entry: '/home/user/script.py',
+        argv: [],
+        cwd: '/home/user',
+        env: {},
+        payload: { buffer, index: [] },
+        onOut: (stream, text) => out.push({ stream, text }),
+      })
+      expect(result.exitCode).toBe(0)
+      expect(out.map((o) => o.text).join('')).toContain('eof:True')
+    },
+    120_000,
+  )
+})
+
+describe('python images (Pillow)', () => {
+  it(
+    'converts JPG to PNG at exact dimensions and verifies by reopening',
+    async () => {
+      const vfs = freshVfs()
+      const { result, stdout, vfs: after } = await runIn(
+        vfs,
+        [
+          'from PIL import Image, ImageOps',
+          'import io',
+          '# source: a 400x300 photo-like JPEG with EXIF orientation',
+          'src = Image.new("RGB", (400, 300), (200, 40, 40))',
+          'src.save("/home/user/photo.jpg", "JPEG", quality=90)',
+          '# the skill recipe: normalize, exact resize, convert, verify',
+          'raw = Image.open("/home/user/photo.jpg")',
+          'print(f"IN format={raw.format} size={raw.size}")',
+          'img = ImageOps.exif_transpose(raw)',
+          'out = img.convert("RGB").resize((200, 100), Image.LANCZOS)',
+          'out.save("/home/user/photo-200x100.png", optimize=True)',
+          'check = Image.open("/home/user/photo-200x100.png")',
+          'check.load()',
+          'import os',
+          'print(f"OUT format={check.format} size={check.size} bytes={os.path.getsize(chr(47)+chr(104)+chr(111)+chr(109)+chr(101)+chr(47)+chr(117)+chr(115)+chr(101)+chr(114)+chr(47)+chr(112)+chr(104)+chr(111)+chr(116)+chr(111)+chr(45)+chr(50)+chr(48)+chr(48)+chr(120)+chr(49)+chr(48)+chr(48)+chr(46)+chr(112)+chr(110)+chr(103))}")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(stdout).toContain('IN format=JPEG size=(400, 300)')
+      expect(stdout).toMatch(/OUT format=PNG size=\(200, 100\) bytes=\d+/)
+      const bytes = after.readBytes('/home/user/photo-200x100.png')
+      expect(bytes).not.toBeNull()
+      // real PNG magic, not a renamed JPEG
+      expect(Array.from(bytes!.slice(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
+    },
+    180_000,
+  )
+
+  it(
+    'hits a byte budget by stepping quality down',
+    async () => {
+      const vfs = freshVfs()
+      const { result, stdout } = await runIn(
+        vfs,
+        [
+          'from PIL import Image',
+          'import io',
+          'img = Image.new("RGB", (1200, 900), (30, 120, 60))',
+          'max_bytes, quality = 15000, 90',
+          'final = 0',
+          'while True:',
+          '    buf = io.BytesIO()',
+          '    img.save(buf, "JPEG", quality=quality, optimize=True)',
+          '    final = len(buf.getvalue())',
+          '    if final <= max_bytes or quality <= 60:',
+          '        open("/home/user/small.jpg", "wb").write(buf.getvalue())',
+          '        break',
+          '    quality -= 10',
+          'print(f"BUDGET bytes={final} quality={quality}")',
+          'back = Image.open("/home/user/small.jpg")',
+          'back.load()',
+          'print(f"BACK format={back.format} size={back.size}")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      const bytes = Number(/bytes=(\d+)/.exec(stdout)?.[1] ?? Number.NaN)
+      expect(bytes).toBeLessThanOrEqual(15000)
+      expect(stdout).toContain('BACK format=JPEG size=(1200, 900)')
+    },
+    180_000,
+  )
+})
+
+describe('python runner write-back boundary', () => {
+  it(
+    'never syncs runtime-side-effect dirs (/share, /etc, ...) into the VFS',
+    async () => {
+      const vfs = freshVfs()
+      const { result, vfs: after } = await runIn(
+        vfs,
+        [
+          'import os',
+          'os.makedirs("/share/man/man1", exist_ok=True)',
+          'open("/share/man/man1/ttx.1", "w").write("phantom")',
+          'os.makedirs("/etc/fake", exist_ok=True)',
+          'open("/etc/fake/x", "w").write("phantom")',
+          'os.makedirs("/home/user/project/sub", exist_ok=True)',
+          'open("/home/user/project/sub/real.txt", "w").write("legit")',
+          'print("done")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(after.exists('/share/man/man1/ttx.1')).toBe(false)
+      expect(after.exists('/etc/fake/x')).toBe(false)
+      expect(after.read('/home/user/project/sub/real.txt')).toBe('legit')
+    },
+    180_000,
+  )
+})
+
+describe('python empty-dir sync', () => {
+  it(
+    'sees mkdir-created dirs and writes into them',
+    async () => {
+      const vfs = freshVfs()
+      vfs.mkdir('/home/user/many')
+      const { result, stdout } = await runIn(
+        vfs,
+        [
+          'import os',
+          'print("entries=" + str(sorted(os.listdir("/home/user"))))',
+          'open("/home/user/many/f0.txt", "w").write("x")',
+          'print("wrote-ok")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(stdout).toContain('wrote-ok')
+    },
+    180_000,
+  )
+})
+
+describe('installPureWheel hardening', () => {
+  it('refuses a hash-mismatched wheel without extracting', async () => {
+    const { installPureWheel } = await import('./runner')
+    const { loadPyodide } = await import('pyodide')
+    const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+    const realFetch = globalThis.fetch
+    const evil = new TextEncoder().encode('definitely-not-a-wheel')
+    ;(globalThis as { fetch: unknown }).fetch = async (url: unknown) => {
+      if (typeof url === 'string' && url.startsWith('/vendor/')) return new Response(evil, { status: 200 })
+      throw new Error('network blocked')
+    }
+    try {
+      await expect(installPureWheel(py, 'pypdf')).rejects.toThrow(/hash mismatch/)
+    } finally {
+      ;(globalThis as { fetch: unknown }).fetch = realFetch
+    }
+  }, 300_000)
+
+  it('refuses non-allowlisted names without touching the network', async () => {
+    const { installPureWheel } = await import('./runner')
+    const { loadPyodide } = await import('pyodide')
+    const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+    const realFetch = globalThis.fetch
+    let calls = 0
+    const failLoad = { ...py, loadPackage: async () => { calls++; throw new Error('no such package') } }
+    ;(globalThis as { fetch: unknown }).fetch = async () => { throw new Error('network must stay silent') }
+    try {
+      await expect(installPureWheel(failLoad as never, 'typosquat-xyz-123')).rejects.toThrow(/not allowlisted/)
+      expect(calls).toBe(1)
     } finally {
       ;(globalThis as { fetch: unknown }).fetch = realFetch
     }

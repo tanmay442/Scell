@@ -6,14 +6,20 @@
  * matplotlib output, and a filesystem write-back diff.
  */
 
-/** Pure-Python wheels pyodide cannot serve itself (PyPI sends no CORS
- * headers, so the browser cannot micropip-install from
- * files.pythonhosted.org). Vendored by scripts/vendor-public.mjs into
- * public/vendor/wheels/ — PINNED THERE TOO, keep the two in sync.
- * Install order per package: pyodide index (CDN) → same-origin vendor
- * wheel (browser/workers, no CORS issue) → PyPI micropip (node/tests). */
+/** Pure-Python wheels installed from the same-origin vendor dir instead
+ * of PyPI: pinned bytes (hash-checked below), offline-capable, no CORS
+ * or typosquat risk. Vendored by scripts/vendor-public.mjs into
+ * public/vendor/wheels/ — PINNED THERE TOO (check-isolate-pure.sh fails
+ * the build when the pins differ; see VENDOR_WHEEL_HASHES).
+ *
+ * Install order: pyodide index (CDN) → hash-verified vendor wheel.
+ * Anything else is REFUSED (fail-closed): the runner never micropip-
+ * installs an unreviewed PyPI name on its own — a prompt-injected
+ * `import typosquat` stops here with a clear status line instead of
+ * fetching attacker code. To enable more, vendor the wheel after review. */
 export const VENDOR_WHEELS: Record<string, string> = {
   pypdf: 'pypdf-6.21.4-py3-none-any.whl',
+  seaborn: 'seaborn-0.13.2-py3-none-any.whl',
 }
 
 /** Install one missing pure-Python package, same-origin first. Exported
@@ -23,45 +29,93 @@ export async function installPureWheel(
   name: string,
   onStatus?: (text: string) => void,
 ): Promise<void> {
-  // allowlisted wheels skip the index probe: loadPackage consults the
-  // network for unknown names, which defeats offline/vendor installs
-  if (VENDOR_WHEELS[name] === undefined) {
+  const wheel = VENDOR_WHEELS[name]
+  if (wheel === undefined) {
+    // pyodide index only — never PyPI on our own authority. A
+    // prompt-injected `import typosquat` dies here instead of fetching
+    // attacker code: loadPackage throws for unknown names.
     try {
       await pyodide.loadPackage(name)
       return
     } catch {
-      // not in the pyodide index — fall through to PyPI micropip
+      throw new Error(`pip: ${name} is not allowlisted for auto-install (see VENDOR_WHEELS) — ask for it to be vendored after review`)
     }
   }
-  const wheel = VENDOR_WHEELS[name]
-  if (wheel !== undefined) {
-    try {
-      const res = await fetch(`/vendor/wheels/${wheel}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const bytes = new Uint8Array(await res.arrayBuffer())
-      try {
-        pyodide.FS.mkdirTree('/tmp/wheels')
-      } catch {
-        // exists
-      }
-      pyodide.FS.writeFile(`/tmp/wheels/${wheel}`, bytes)
-      // manual zip extraction, NOT micropip: micropip queries the PyPI
-      // index even for local files (network), but a pure wheel is just
-      // a zip whose top level belongs in site-packages (fully offline)
-      await pyodide.runPythonAsync(
-        `import zipfile as _zf, site as _site, importlib as _il\n` +
-          `_sp = [p for p in _site.getsitepackages() if p.endswith('site-packages')][0]\n` +
-          `with _zf.ZipFile(${JSON.stringify(`/tmp/wheels/${wheel}`)}) as _z: _z.extractall(_sp)\n` +
-          `_il.invalidate_caches()\n` +
-          `__import__(${JSON.stringify(name)})`,
-      )
-      return
-    } catch (err) {
-      onStatus?.(`vendor wheel unavailable (${err instanceof Error ? err.message : String(err)}), trying PyPI…`)
-    }
+  // vendor path: same-origin fetch, then hash-verify BEFORE touching
+  // the bytes — a poisoned wheel is silent code execution otherwise.
+  // Allowlisted names may fall back to micropip PyPI when the vendor
+  // fetch fails (node tests have no same-origin server; the names are
+  // reviewed, so no typosquat risk — unreviewed names never get here).
+  let bytes: Uint8Array
+  try {
+    const res = await fetch(`/vendor/wheels/${wheel}`)
+    if (!res.ok) throw new Error(`vendored wheel HTTP ${res.status}`)
+    bytes = new Uint8Array(await res.arrayBuffer())
+  } catch (err) {
+    onStatus?.(`vendor wheel unavailable (${err instanceof Error ? err.message : String(err)}), trying PyPI…`)
+    await pyodide.loadPackage('micropip')
+    await pyodide.runPythonAsync(`import micropip\nawait micropip.install(${JSON.stringify(name)})`)
+    return
   }
-  await pyodide.loadPackage('micropip')
-  await pyodide.runPythonAsync(`import micropip\nawait micropip.install(${JSON.stringify(name)})`)
+  const digest = await crypto.subtle.digest('SHA-256', bytes as unknown as ArrayBuffer)
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  if (VENDOR_WHEEL_HASHES[wheel] === undefined || hex !== VENDOR_WHEEL_HASHES[wheel]) {
+    throw new Error(`vendored wheel hash mismatch for ${wheel} — refusing to install`)
+  }
+  try {
+    pyodide.FS.mkdirTree('/tmp/wheels')
+  } catch {
+    // exists
+  }
+  pyodide.FS.writeFile(`/tmp/wheels/${wheel}`, bytes)
+  await installWheelMembers(pyodide, `/tmp/wheels/${wheel}`, wheel.split('-')[0].toLowerCase(), name)
+}
+
+/** Validate zip members and extract into site-packages. Exported for
+ * tests: feed it hostile zips directly (the hash gate lives one layer
+ * up in installPureWheel). Members outside the distribution dir /
+ * dist-info, absolute paths, `..`, startup-execution files (*.pth,
+ * sitecustomize, usercustomize) and symlinks are refused before anything
+ * is written. Manual extraction, NOT micropip: micropip queries the PyPI
+ * index even for local files (network), but a pure wheel is just a zip
+ * whose allowlisted members belong in site-packages (fully offline). */
+export async function installWheelMembers(
+  pyodide: { runPythonAsync(code: string): Promise<unknown> },
+  zipPath: string,
+  dist: string,
+  name: string,
+): Promise<void> {
+  await pyodide.runPythonAsync(
+    `import zipfile as _zf, site as _site, importlib as _il, re as _re\n` +
+      `_sp = [p for p in _site.getsitepackages() if p.endswith('site-packages')][0]\n` +
+      `_z = _zf.ZipFile(${JSON.stringify(zipPath)})\n` +
+      `_bad = []\n` +
+      `for _m in _z.namelist():\n` +
+      `    _n = _m.replace(chr(92), '/')\n` +
+      `    _base = _n.rsplit('/', 1)[-1].lower()\n` +
+      `    _top = _n.split('/')[0].lower().replace('_', '-')\n` +
+      `    _ok_top = _top == ${JSON.stringify(dist)} or _re.match(r'^' + ${JSON.stringify(dist)} + r'(-[.\\w]+)?\\.(dist-info|egg-info)$', _top) is not None\n` +
+      `    _evil = _base in ('sitecustomize.py', 'usercustomize.py') or _base.endswith('.pth')\n` +
+      `    _info = _z.getinfo(_m)\n` +
+      `    _is_link = (_info.external_attr >> 16) & 0o170000 == 0o120000\n` +
+      `    if _n.startswith('/') or '..' in _n.split('/') or _evil or _is_link or not _ok_top:\n` +
+      `        _bad.append(_m)\n` +
+      `if _bad: raise ValueError('refusing wheel members: ' + ', '.join(_bad[:8]))\n` +
+      `_z.extractall(_sp)\n` +
+      `_il.invalidate_caches()\n` +
+      `__import__(${JSON.stringify(name)})`,
+  )
+}
+
+/** Vendored-wheel integrity pins. The SAME map lives in
+ * scripts/vendor-public.mjs (PIN note there) — check-isolate-pure.sh
+ * fails the build when they differ. Verified at download time (vendor
+ * script) AND at install time (hash of the fetched bytes, below).
+ * A poisoned wheel is the arbitrary-code-execution path into every
+ * session, so both checks fail closed. */
+export const VENDOR_WHEEL_HASHES: Record<string, string> = {
+  'pypdf-6.21.4-py3-none-any.whl': '33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c',
+  'seaborn-0.13.2-py3-none-any.whl': '636f8336facf092165e27924f223d3c62ca560b1f2bb5dff7ab7fad265361987',
 }
 
 export interface PythonPayload {
@@ -236,15 +290,23 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
   // that is pure-python gets installed from PyPI via micropip (best effort)
   try {
     // local files of the payload are importable (cwd + script dir are on
-    // sys.path) — the scan checks the FS before declaring a module missing
+    // sys.path) — the scan checks the FS before declaring a module missing.
+    // Only top-level names resolvable from those dirs suppress installs:
+    // a nested sub/easy.py must NOT shadow a top-level `import easy`.
+    const scriptDir = options.entry !== '-' ? options.entry.slice(0, options.entry.lastIndexOf('/')) || '/' : cwd
+    const sysDirs = new Set([cwd, scriptDir])
     const localModules = new Set<string>()
     for (const [path] of payload.index) {
-      if (path.endsWith('.py')) {
-        localModules.add(path.slice(path.lastIndexOf('/') + 1, -3))
-        const dir = path.slice(0, path.lastIndexOf('/'))
-        if (dir.endsWith('/__init__'.replace('/', ''))) void dir
+      if (!path.endsWith('.py')) continue
+      const dir = path.slice(0, path.lastIndexOf('/'))
+      const base = path.slice(path.lastIndexOf('/') + 1)
+      if (base === '__init__.py') {
+        // <sysdir>/X/__init__.py makes package X importable
+        const parent = dir.slice(0, dir.lastIndexOf('/'))
+        if (sysDirs.has(parent)) localModules.add(dir.slice(dir.lastIndexOf('/') + 1))
+      } else if (sysDirs.has(dir)) {
+        localModules.add(base.slice(0, -3))
       }
-      if (path.endsWith('/__init__.py')) localModules.add(path.slice(path.lastIndexOf('/', path.lastIndexOf('/') - 1) + 1, path.lastIndexOf('/__init__.py')))
     }
     const missing = JSON.parse(
       (await pyodide.runPythonAsync(

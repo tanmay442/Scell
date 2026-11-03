@@ -59,6 +59,22 @@ if [ -n "$bad_tests" ]; then
   flag "test file with node: import but no vitest import (see above)"
 fi
 
+# 6. vendored-wheel pins agree: every wheel filename and sha256 pinned
+# in runner.ts (VENDOR_WHEELS + VENDOR_WHEEL_HASHES) must appear verbatim
+# in vendor-public.mjs. Drift fails closed at runtime (hash mismatch
+# refuses install), but a silent mismatch kills the offline path —
+# catch it here instead.
+for wheel in $(grep -oE "[a-z0-9_]+-[0-9][a-zA-Z0-9_.!+-]*-py3-none-any\.whl" src/python/runner.ts | sort -u); do
+  if ! grep -q "$wheel" scripts/vendor-public.mjs; then
+    flag "wheel $wheel pinned in runner.ts but missing from vendor-public.mjs"
+  fi
+done
+for sha in $(grep -oE "'[0-9a-f]{64}'" src/python/runner.ts | tr -d "'" | sort -u); do
+  if ! grep -q "$sha" scripts/vendor-public.mjs; then
+    flag "wheel sha256 ${sha:0:12}… pinned in runner.ts but missing from vendor-public.mjs"
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "ISOLATE-GATE: FAILED — agent core must stay machine-free (see docs/ISOLATE_SEAM.md)"
   exit 1
