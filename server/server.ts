@@ -31,32 +31,59 @@ try {
 
 /** One server per workspace: a second process booting on the same root
  * would double-run jobs and resume the same threads (the router and the
- * queue are in-memory + read-modify-write). The lock is best-effort and
- * stale-safe: a dead pid's lock is taken over, a live pid refuses boot. */
+ * queue are in-memory + read-modify-write). Fencing-token lock below. */
 const lockPath = join(root, '.cell', 'server.lock')
 // Pids are meaningless across containers (every server is pid 1 in its own
-// pid namespace), so the lock is a fencing token: the holder rewrites its
-// token+heartbeat every beat, and any boot unconditionally takes over by
-// writing its own token. A deposed holder notices on its next beat (token
-// mismatch) and exits instead of running split-brain. Overlap between a
-// dying holder and its successor is bounded by one beat interval.
+// pid namespace), so the lock is a fencing token + heartbeat: the holder
+// rewrites its token every beat. A boot takes over a lock whose heartbeat
+// is frozen (holder dead: kill -9, crash) but WAITS while beats advance —
+// a live holder means a second instance, which is refused after 60s. A
+// deposed holder that is actually alive notices the token mismatch on its
+// next beat and exits instead of running split-brain.
 const LOCK_BEAT_MS = 10_000
+const LOCK_STALE_MS = 20_000
+const LOCK_WAIT_MS = 60_000
 const lockToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 let lockOurs = false
 function writeLock(): void {
   writeFileSync(lockPath, JSON.stringify({ token: lockToken, heartbeat: Date.now() }))
 }
+function lockHeartbeat(): number {
+  try {
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as { heartbeat?: unknown }
+    return typeof holder.heartbeat === 'number' ? holder.heartbeat : 0
+  } catch {
+    return 0
+  }
+}
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
 try {
   mkdirSync(join(root, '.cell'), { recursive: true })
-  try {
-    writeFileSync(lockPath, JSON.stringify({ token: lockToken, heartbeat: Date.now() }), { flag: 'wx' })
-  } catch (err) {
-    if ((err as { code?: string }).code !== 'EEXIST') throw err
-    // take over: a live previous holder stands down on its next beat
-    process.stderr.write('cell server: taking over the workspace lock (a live previous holder stands down on its next beat)\n')
-    writeLock()
+  const deadline = Date.now() + LOCK_WAIT_MS
+  for (;;) {
+    try {
+      writeFileSync(lockPath, JSON.stringify({ token: lockToken, heartbeat: Date.now() }), { flag: 'wx' })
+      lockOurs = true
+      break
+    } catch (err) {
+      if ((err as { code?: string }).code !== 'EEXIST') throw err
+    }
+    // lock exists: frozen heartbeat = dead holder, take over; advancing
+    // heartbeat = live holder, wait for it to go stale, then refuse
+    if (Date.now() - lockHeartbeat() >= LOCK_STALE_MS) {
+      process.stderr.write('cell server: taking over a frozen workspace lock (previous holder dead)\n')
+      writeLock()
+      lockOurs = true
+      break
+    }
+    if (Date.now() >= deadline) {
+      process.stderr.write(`cell server: workspace lock is held by a live server — refusing second instance on ${root} (waited 60s)\n`)
+      process.exit(2)
+    }
+    sleepSync(2000)
   }
-  lockOurs = true
 } catch (err) {
   process.stderr.write(`cell server: cannot take workspace lock: ${err instanceof Error ? err.message : String(err)}\n`)
   process.exit(2)
@@ -142,7 +169,10 @@ function sendJson(res: ServerResponse, code: number, body: unknown): void {
   res.end(`${JSON.stringify(body)}\n`)
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage, ctx?: GatewayContext): Promise<string> {
+  // the gateway already buffered + validated the body: reuse its bytes
+  // instead of concatenating the replayed stream a second time
+  if (ctx?.rawBody !== undefined) return ctx.rawBody
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
@@ -157,7 +187,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
 async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: GatewayContext): Promise<void> {
   let raw: string
   try {
-    raw = await readBody(req)
+    raw = await readBody(req, ctx)
   } catch {
     sendJson(res, 400, { error: 'body too large' })
     log('POST', '/run', 400)
@@ -257,22 +287,29 @@ async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: Gateway
     let runSessionId = ''
     const args = [prompt]
     if (resumeId) args.push('--resume', resumeId)
-    const result = await runAgent(
-      runCtx.vfs,
-      args,
-      {
-        cwd,
-        shell: runCtx.shell,
-        jobShell: runCtx.jobShell,
-        signal: controller.signal,
-        maxSteps: maxSteps ?? Number.POSITIVE_INFINITY,
-        onProgress: (line) => send({ type: 'progress', line }),
-        onSession: (id) => {
-          runSessionId = id
-          noteThreadId(runCtx.vfs, id, threadId)
+    // transport-level throws (DNS, refused connection) must still
+    // terminate the SSE stream with a done event, not a silent hang
+    let result: { stdout: string; stderr: string; exitCode: number }
+    try {
+      result = await runAgent(
+        runCtx.vfs,
+        args,
+        {
+          cwd,
+          shell: runCtx.shell,
+          jobShell: runCtx.jobShell,
+          signal: controller.signal,
+          maxSteps: maxSteps ?? Number.POSITIVE_INFINITY,
+          onProgress: (line) => send({ type: 'progress', line }),
+          onSession: (id) => {
+            runSessionId = id
+            noteThreadId(runCtx.vfs, id, threadId)
+          },
         },
-      },
-    )
+      )
+    } catch (err) {
+      result = { stdout: '', stderr: `agent failed before producing output: ${err instanceof Error ? err.message : String(err)}\n`, exitCode: 1 }
+    }
     done = true
     ctx.report({ steps: runSessionId !== '' ? readSteps(runCtx.vfs, runSessionId) : -1, exitCode: result.exitCode })
     // sessionId/threadId let the client resume this exact thread later
@@ -397,7 +434,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: GatewayCon
  * serialized by the router: a busy thread skips this tick (throw to retry). */
 async function fireJob(job: { id: string; threadId: string; prompt: string; kind: string }): Promise<void> {
   if (job.kind === 'snapshot') {
-    const pushed = await pushSnapshot(root, snapshotStore(), job.threadId, { slim: true })
+    // per-thread scope: the snapshot covers this thread's dir plus its
+    // session records — never sibling threads or unrelated global state
+    const session = resolveSessionForThread(root, job.threadId)
+    const scope = [threadVfsPath(job.threadId)]
+    if (session !== null) {
+      scope.push(`/home/user/.cell/sessions/${session}.json`, `/home/user/.cell/sessions/${session}.thread`)
+    }
+    const pushed = await pushSnapshot(root, snapshotStore(), job.threadId, { slim: true, scope })
     process.stderr.write(`[job ${job.id}] snapshot ${job.threadId}: ${pushed.skipped ? 'unchanged, skipped' : 'pushed'}\n`)
     return
   }

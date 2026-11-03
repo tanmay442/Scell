@@ -391,3 +391,74 @@ describe('python stdin (P0-7)', () => {
     120_000,
   )
 })
+
+describe('python images (Pillow)', () => {
+  it(
+    'converts JPG to PNG at exact dimensions and verifies by reopening',
+    async () => {
+      const vfs = freshVfs()
+      const { result, stdout, vfs: after } = await runIn(
+        vfs,
+        [
+          'from PIL import Image, ImageOps',
+          'import io',
+          '# source: a 400x300 photo-like JPEG with EXIF orientation',
+          'src = Image.new("RGB", (400, 300), (200, 40, 40))',
+          'src.save("/home/user/photo.jpg", "JPEG", quality=90)',
+          '# the skill recipe: normalize, exact resize, convert, verify',
+          'raw = Image.open("/home/user/photo.jpg")',
+          'print(f"IN format={raw.format} size={raw.size}")',
+          'img = ImageOps.exif_transpose(raw)',
+          'out = img.convert("RGB").resize((200, 100), Image.LANCZOS)',
+          'out.save("/home/user/photo-200x100.png", optimize=True)',
+          'check = Image.open("/home/user/photo-200x100.png")',
+          'check.load()',
+          'import os',
+          'print(f"OUT format={check.format} size={check.size} bytes={os.path.getsize(chr(47)+chr(104)+chr(111)+chr(109)+chr(101)+chr(47)+chr(117)+chr(115)+chr(101)+chr(114)+chr(47)+chr(112)+chr(104)+chr(111)+chr(116)+chr(111)+chr(45)+chr(50)+chr(48)+chr(48)+chr(120)+chr(49)+chr(48)+chr(48)+chr(46)+chr(112)+chr(110)+chr(103))}")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(stdout).toContain('IN format=JPEG size=(400, 300)')
+      expect(stdout).toMatch(/OUT format=PNG size=\(200, 100\) bytes=\d+/)
+      const bytes = after.readBytes('/home/user/photo-200x100.png')
+      expect(bytes).not.toBeNull()
+      // real PNG magic, not a renamed JPEG
+      expect(Array.from(bytes!.slice(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
+    },
+    180_000,
+  )
+
+  it(
+    'hits a byte budget by stepping quality down',
+    async () => {
+      const vfs = freshVfs()
+      const { result, stdout } = await runIn(
+        vfs,
+        [
+          'from PIL import Image',
+          'import io',
+          'img = Image.new("RGB", (1200, 900), (30, 120, 60))',
+          'max_bytes, quality = 15000, 90',
+          'final = 0',
+          'while True:',
+          '    buf = io.BytesIO()',
+          '    img.save(buf, "JPEG", quality=quality, optimize=True)',
+          '    final = len(buf.getvalue())',
+          '    if final <= max_bytes or quality <= 60:',
+          '        open("/home/user/small.jpg", "wb").write(buf.getvalue())',
+          '        break',
+          '    quality -= 10',
+          'print(f"BUDGET bytes={final} quality={quality}")',
+          'back = Image.open("/home/user/small.jpg")',
+          'back.load()',
+          'print(f"BACK format={back.format} size={back.size}")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      const bytes = Number(/bytes=(\d+)/.exec(stdout)?.[1] ?? Number.NaN)
+      expect(bytes).toBeLessThanOrEqual(15000)
+      expect(stdout).toContain('BACK format=JPEG size=(1200, 900)')
+    },
+    180_000,
+  )
+})

@@ -70,8 +70,18 @@ function readJobs(vfs: Vfs): JobSpec[] {
   }
 }
 
+/** terminal rows older than the newest 200 are dropped on write: the
+ * queue file is read-modify-written on every op, so history cannot grow
+ * without bound. GET /jobs stays small; dead jobs remain visible until
+ * they age out of the window. */
+const TERMINAL_HISTORY = 200
 function writeJobs(vfs: Vfs, jobs: JobSpec[]): void {
-  vfs.write(JOB_QUEUE_PATH, JSON.stringify(jobs))
+  const pending = jobs.filter((job) => job.status === 'pending')
+  const terminal = jobs
+    .filter((job) => job.status !== 'pending')
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, TERMINAL_HISTORY)
+  vfs.write(JOB_QUEUE_PATH, JSON.stringify([...pending, ...terminal]))
 }
 
 export function scheduleJob(

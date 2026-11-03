@@ -393,7 +393,7 @@ describe('agent harness review tests (runAgent-level, stubbed fetch)', () => {
       },
     ])
     const first = await runAgent(vfs, ['run it', '--steps', '1'], { cwd: '/home/user', shell })
-    expect(first.exitCode).toBe(0)
+    expect(first.exitCode).toBe(2)
     expect(first.stdout).toContain('step limit')
     const [sessionFile] = vfs.readDir('/home/user/.cell/sessions')
 
@@ -442,7 +442,7 @@ describe('agent harness review tests (runAgent-level, stubbed fetch)', () => {
       anthropicTools([{ id: 't1', name: 'bash', input: { command: 'echo hi' } }]),
     ])
     const result = await runAgent(vfs, ['loop forever', '--steps', '1'], { cwd: '/home/user', shell: okShell })
-    expect(result.exitCode).toBe(0)
+    expect(result.exitCode).toBe(2)
     expect(result.stdout).toContain('reached the 1-step limit')
     expect(result.stdout).toContain('--resume')
   })

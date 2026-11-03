@@ -4,6 +4,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { createDiskVfs } from './disk-vfs'
+import { vfsPath } from '../src/vfs/types'
 import { s3Fetch } from '../src/shell/commands/sigv4'
 
 /**
@@ -50,6 +51,10 @@ export interface PullResult {
 export interface SnapshotOptions {
   exclude?: RegExp[]
   slim?: boolean
+  /** VFS-absolute prefixes the snapshot covers (default: whole workspace).
+   * Restores only touch these paths — a per-thread snapshot never wipes
+   * sibling threads or rewind global state outside its grant. */
+  scope?: string[]
 }
 
 export interface SnapshotStore {
@@ -69,11 +74,24 @@ export function defaultSnapshotsDir(workspaceRoot: string): string {
   return resolve(join(resolve(workspaceRoot), '..', 'snapshots'))
 }
 
+/** paths slim snapshots never carry: dependency/vendor trees, VCS
+history, and caches/usage logs that regenerate or belong to operations.
+Sessions stay (resume needs them); scoped thread snapshots rarely contain
+these, whole-workspace pushes shed real megabytes here. */
+const SLIM_EXCLUDE = [
+  /(^|\/)node_modules(\/|$)/,
+  /(^|\/)\.git(\/|$)/,
+  /(^|\/)\.cache(\/|$)/,
+  /(^|\/)\.cell\/usage(\/|$)/,
+]
 function isExcluded(path: string, opts: SnapshotOptions | undefined): boolean {
   // pull scratch dirs (crashed-pull leftovers) are never part of a snapshot
   if (/(^|\/)\.snapshot-tmp-[^/]+(\/|$)/.test(path)) return true
   if (opts?.slim === true) {
-    if (path === '/node_modules' || path.startsWith('/node_modules/') || path.includes('/node_modules/')) return true
+    for (const pattern of SLIM_EXCLUDE) {
+      pattern.lastIndex = 0
+      if (pattern.test(path)) return true
+    }
   }
   const patterns = opts?.exclude ?? []
   for (const pattern of patterns) {
@@ -124,11 +142,24 @@ function runTar(args: string[], stdin: Uint8Array | null): Promise<{ stdout: str
 
 export function computeManifest(root: string, name: string, opts?: SnapshotOptions): SnapshotManifest {
   const vfs = createDiskVfs(root)
+  const scopes = (opts?.scope ?? []).map((s) => vfsPath.normalize(s))
+  const inScope = (path: string): boolean =>
+    scopes.length === 0 ||
+    scopes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))
   const files: SnapshotFileEntry[] = []
   // per-file hashing: never concatenates workspace contents into one string
   for (const path of vfs.listAllFiles()) {
+    if (!inScope(path)) continue
     if (isExcluded(path, opts)) continue
-    const data = vfs.readBytes(path)
+    // non-regular files (symlinks, fifos, sockets) are not preservable:
+    // skip them here (pull rejects archives that contain them, so a
+    // skipped link can never silently reappear as something else)
+    let data: Uint8Array | null
+    try {
+      data = vfs.readBytes(path)
+    } catch {
+      continue
+    }
     if (data === null) continue
     const sha256 = createHash('sha256').update(data).digest('hex')
     files.push({ path, sha256, size: data.byteLength })
@@ -216,7 +247,15 @@ function rejectNonRegularEntries(dir: string): void {
       if (stat.isFile() && stat.nlink > 1) {
         throw new Error(`snapshots: archive contains hard link '${member}' — snapshots do not preserve links, restore aborted`)
       }
-      if (stat.isDirectory()) walk(full, member)
+      if (stat.isDirectory()) {
+        walk(full, member)
+        continue
+      }
+      if (!stat.isFile()) {
+        // fifos, sockets, devices: extracting them would hang or mknod
+        // privileged nodes on restore — refuse the whole archive
+        throw new Error(`snapshots: archive contains non-regular file '${member}' — restore aborted`)
+      }
     }
   }
   walk(dir, '')
@@ -251,7 +290,22 @@ export async function pushSnapshot(
   return { manifest, skipped: false }
 }
 
-export async function pullSnapshot(root: string, store: SnapshotStore, name: string): Promise<PullResult> {
+/** Recursive move: rename() cannot place a directory onto an existing
+ * one, so scoped restores merge entry-by-entry instead. */
+function moveMerge(src: string, dest: string): void {
+  const stat = lstatSync(src)
+  if (!stat.isDirectory()) {
+    renameSync(src, dest)
+    return
+  }
+  mkdirSync(dest, { recursive: true })
+  for (const entry of readdirSync(src)) {
+    moveMerge(join(src, entry), join(dest, entry))
+  }
+  rmSync(src, { recursive: true, force: true })
+}
+
+export async function pullSnapshot(root: string, store: SnapshotStore, name: string, opts?: SnapshotOptions): Promise<PullResult> {
   ensureTarAvailable()
   const stored = parseStoredManifest(await store.get(manifestKey(name)))
   if (stored === null) {
@@ -275,6 +329,17 @@ export async function pullSnapshot(root: string, store: SnapshotStore, name: str
   try {
     writeFileSync(tarPath, tarBytes)
     const listed = await runTar(['--list', '--file', tarPath], null)
+    const scopes = (opts?.scope ?? []).map((s) => vfsPath.normalize(s))
+    const inScope = (member: string): boolean =>
+      scopes.length === 0 ||
+      scopes.some((prefix) => `/${member}` === prefix || `/${member}`.startsWith(`${prefix}/`))
+    for (const line of listed.stdout.split('\n')) {
+      const member = line.trim().replace(/^\.\//, '')
+      if (member === '' || member === '.') continue
+      if (!inScope(member)) {
+        throw new Error(`snapshots: archive member '${member}' is outside the restore scope — restore aborted`)
+      }
+    }
     assertSafeTarMembers(listed.stdout)
     // extract + validate + verify BEFORE touching the live workspace: a
     // tar that aborts mid-extract must not destroy existing state
@@ -285,12 +350,21 @@ export async function pullSnapshot(root: string, store: SnapshotStore, name: str
     if (!manifestsEqualFiles(stored, rebuilt)) {
       throw new Error(`snapshots: '${name}' tar contents do not match its manifest (stale or tampered store) — restore aborted`)
     }
-    for (const entry of readdirSync(base)) {
-      if (entry.startsWith('.snapshot-tmp-')) continue
-      rmSync(join(base, entry), { recursive: true, force: true })
-    }
-    for (const entry of readdirSync(extractDir)) {
-      renameSync(join(extractDir, entry), join(base, entry))
+    if (scopes.length === 0) {
+      for (const entry of readdirSync(base)) {
+        if (entry.startsWith('.snapshot-tmp-')) continue
+        rmSync(join(base, entry), { recursive: true, force: true })
+      }
+      for (const entry of readdirSync(extractDir)) {
+        renameSync(join(extractDir, entry), join(base, entry))
+      }
+    } else {
+      // scoped restore: delete exactly the covered paths, then merge-move
+      // the extract over them — sibling threads are never touched
+      for (const file of stored.files) {
+        rmSync(join(base, file.path.replace(/^\/+/, '')), { recursive: true, force: true })
+      }
+      moveMerge(extractDir, base)
     }
     return { status: 'restored', manifest: stored }
   } finally {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import type { Vfs, VfsFileMap, VfsStat } from '../src/vfs/types'
 import { vfsPath } from '../src/vfs/types'
@@ -66,6 +66,16 @@ export function createDiskVfs(root: string): Vfs {
     const kind = nodeAt(path)
     if (kind === null) return null
     if (kind === 'dir') throw new Error(`EISDIR: read of directory '${vfsPath.normalize(path)}'`)
+    // fail fast on fifos/sockets/devices: a blocking readFileSync here
+    // would hang the caller (agent step, snapshot hash) forever
+    try {
+      if (!lstatSync(real(path)).isFile()) {
+        throw new Error(`EINVAL: not a regular file '${vfsPath.normalize(path)}'`)
+      }
+    } catch (err) {
+      if ((err as Error).message.startsWith('EINVAL')) throw err
+      return null
+    }
     return new Uint8Array(readFileSync(real(path)))
   }
 

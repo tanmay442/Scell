@@ -122,8 +122,22 @@ function getThread(id: string): ThreadState {
       lastDecidedSummary: null,
     }
     threads.set(id, thread)
+    evictIdleThreads()
   }
   return thread
+}
+
+/** Bounded thread table: idle threads accumulate (entries are capped,
+ * threads were not). Only non-running, non-visible threads are evicted;
+ * reopening re-seeds from the persisted session, so nothing is lost. */
+function evictIdleThreads(): void {
+  while (threads.size > 30) {
+    const evictable = [...threads.keys()].find(
+      (key) => key !== visibleThreadId && !threads.get(key)?.running,
+    )
+    if (evictable === undefined) break
+    threads.delete(evictable)
+  }
 }
 
 function visibleThread(): ThreadState | null {
@@ -133,6 +147,9 @@ function visibleThread(): ThreadState | null {
 // ---- snapshot ---------------------------------------------------------------
 
 let entryId = 0
+
+/** binary uploads staged by the composer, flushed into the thread workspace on send */
+const pendingUploads: { name: string; bytes: Uint8Array }[] = []
 let snapshot: AgentSnapshot = {
   entries: [],
   running: false,
@@ -347,9 +364,25 @@ function loadConfigForm(): AgentConfigForm {
   }
 }
 
+/** Sidebar row cache: refresh() parses every session file, so unchanged
+ * sessions (same mtime+size) reuse their last-computed info instead of
+ * re-reading + re-parsing full transcripts. */
+const sessionInfoCache = new Map<string, { stamp: string; info: SessionInfo }>()
 function sessionInfo(vfs: ReturnType<typeof platform>['vfs'], id: string): SessionInfo {
+  const stat = vfs.stat(`/home/user/.cell/sessions/${id}.json`)
+  const stamp = stat === null ? 'missing' : `${stat.mtime}:${stat.size}`
+  const cached = sessionInfoCache.get(id)
+  if (cached !== undefined && cached.stamp === stamp) return cached.info
+  const remember = (info: SessionInfo): SessionInfo => {
+    sessionInfoCache.set(id, { stamp, info })
+    if (sessionInfoCache.size > 2000) {
+      const oldest = sessionInfoCache.keys().next()
+      if (oldest.done !== true) sessionInfoCache.delete(oldest.value)
+    }
+    return info
+  }
   const loaded = loadSession(vfs, id)
-  if ('error' in loaded) return { id, label: id }
+  if ('error' in loaded) return remember({ id, label: id })
   const flags = {
     ...(loaded.session.pinned ? { pinned: true } : {}),
     ...(loaded.session.archived ? { archived: true } : {}),
@@ -368,14 +401,17 @@ function sessionInfo(vfs: ReturnType<typeof platform>['vfs'], id: string): Sessi
   }
   const interruptedFlag = loaded.session.interrupted === true ? { interrupted: true } : {}
   const title = loaded.session.title?.trim()
-  if (title !== undefined && title !== '') return { id, label: title, title, ...flags, ...interruptedFlag }
+  if (title !== undefined && title !== '') return remember({ id, label: title, title, ...flags, ...interruptedFlag })
   const prompt = loaded.session.prompt.trim()
-  if (prompt !== '') return { id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt, ...flags, ...interruptedFlag }
-  return { id, label: id, ...flags, ...interruptedFlag }
+  // same-ms same-size rewrites could theoretically serve a stale label;
+  // mutateSession deletes the entry, so user edits always recompute
+  if (prompt !== '') return remember({ id, label: prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt, ...flags, ...interruptedFlag })
+  return remember({ id, label: id, ...flags, ...interruptedFlag })
 }
 
 /** Patch flags/title on a stored session, preserving its history. */
 function mutateSession(id: string, patch: Partial<{ title: string; pinned: boolean; archived: boolean; locked: boolean }>): void {
+  sessionInfoCache.delete(id)
   const { vfs } = platform()
   const loaded = loadSession(vfs, id)
   if ('error' in loaded) return
@@ -508,6 +544,15 @@ export const agentActions = {
     const next = current === '' ? text : `${current}${current.endsWith(' ') ? '' : ' '}${text}`
     storeDraft(visibleThreadId, next)
     set({ draft: next })
+  },
+
+  /** Stage binary uploads (images etc.) for the next send: text drafts
+   * cannot carry bytes, so files wait here and land in the thread
+   * workspace when the run starts (see run()). */
+  stageUpload(name: string, bytes: Uint8Array): void {
+    const clean = name.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80) || 'upload'
+    pendingUploads.push({ name: clean, bytes })
+    agentActions.appendDraft(`[upload: ${clean}]`)
   },
 
   /** Open a past session as the current thread. Any run already going
@@ -664,6 +709,19 @@ export const agentActions = {
     const cwd = workspace
     try {
       vfs.mkdir(workspace)
+      // flush staged uploads into the thread: binary files cannot ride in
+      // the text draft, so they land here where every tool can reach them
+      let prompt = text
+      if (pendingUploads.length > 0) {
+        vfs.mkdir(`${workspace}/uploads`)
+        const staged: string[] = []
+        for (const upload of pendingUploads.splice(0)) {
+          const dest = `${workspace}/uploads/${upload.name}`
+          vfs.writeBytes(dest, upload.bytes)
+          staged.push(dest)
+        }
+        prompt = `${text}\n[attached files on disk: ${staged.join(', ')}]`
+      }
       // pre-create the session file under this thread's id so the run
       // resumes into it and the workspace/session pairing is stable
       if ('error' in loadSession(vfs, thread.id)) {
@@ -681,7 +739,7 @@ export const agentActions = {
       }
       const shell = createShell(vfs, { protected: true, approve })
       const jobShell = createShell(vfs, { protected: true, approve })
-      const result = await runAgent(vfs, ['--resume', thread.id, text], {
+      const result = await runAgent(vfs, ['--resume', thread.id, prompt], {
         cwd,
         shell,
         jobShell,

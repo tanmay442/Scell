@@ -11,7 +11,7 @@ import { projectRoot } from './install'
  * (name + description from frontmatter); the model pulls the full body with
  * the load_skill tool when the task actually needs it.
  *
- * Three seed skills (commit, preview, debug-tsc) ship as real files under
+ * Seed skills (commit, preview, debug-tsc, images) ship as real files under
  * ~/.cell/skills/ via starter.ts, and as code fallbacks here so the harness
  * works in workspaces seeded before they existed. Both read the bodies
  * from src/vfs/skill-content.ts — one source, no drift.

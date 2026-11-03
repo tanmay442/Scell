@@ -21,7 +21,8 @@ describe('skill loader', () => {
     expect(names).toContain('commit')
     expect(names).toContain('preview')
     expect(names).toContain('debug-tsc')
-    expect(BUILTIN_SKILLS.length).toBe(3)
+    expect(names).toContain('images')
+    expect(BUILTIN_SKILLS.length).toBe(4)
   })
 
   it('home skills override builtins, project skills override home', () => {

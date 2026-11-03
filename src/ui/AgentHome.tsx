@@ -242,6 +242,12 @@ function makeFileResolver(workspace: string | null): (candidate: string) => stri
       walk(workspace, 0)
       cached = { at: now, files }
       walkCache.set(workspace, cached)
+      // bounded: one entry per workspace visited, evict oldest first
+      while (walkCache.size > 50) {
+        const oldest = walkCache.keys().next()
+        if (oldest.done === true) break
+        walkCache.delete(oldest.value)
+      }
     }
     return cached.files.find((filePath) => filePath.endsWith(`/${candidate}`)) ?? null
   }
@@ -553,9 +559,26 @@ function AgentComposer({ onOpenSettings }: { onOpenSettings: () => void }) {
   const needsKey = !state.keyAvailable && form.provider !== 'compat'
   const modelLabel = MODEL_PRESETS.find((preset) => preset.provider === form.provider && preset.model === form.model)?.label ?? (form.model || form.provider)
 
+  /** Binary files (images etc.) cannot ride in the text draft: they are
+   * staged as bytes and land in the thread workspace on send, with their
+   * paths appended to the prompt. Text files keep the inline treatment. */
+  const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'svg', 'avif', 'tiff']
   const attachFiles = async (files: FileList | null) => {
     if (files === null) return
     for (const file of [...files]) {
+      const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
+      const isImage = file.type.startsWith('image/') || IMAGE_EXTENSIONS.includes(ext)
+      if (isImage) {
+        if (file.size > 25_000_000) {
+          agentActions.appendDraft(`[file: ${file.name} — too large to attach (${Math.round(file.size / 1024 / 1024)} MB, 25 MB max)]`)
+          continue
+        }
+        try {
+          agentActions.stageUpload(file.name, new Uint8Array(await file.arrayBuffer()))
+        } catch {
+          agentActions.appendDraft(`[file: ${file.name} — could not read]`)}
+        continue
+      }
       if (file.size > 200_000) {
         agentActions.appendDraft(`[file: ${file.name} — too large to attach (${Math.round(file.size / 1024)} KB)]`)
         continue

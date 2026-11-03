@@ -168,21 +168,42 @@ describeIfTar('snapshots', () => {
 })
 
 describeIfTar('snapshot integrity (adversarial)', () => {
-  it('rejects archives containing symlinks, even to in-workspace targets', async () => {
+  it('skips symlinks on push but rejects archives that contain them', async () => {
+    const { symlinkSync, writeFileSync } = await import('node:fs')
+    const { spawnSync } = await import('node:child_process')
+    const { createHash } = await import('node:crypto')
     const root = mkdtempSync(join(tmpdir(), 'snap-evil-'))
     try {
       const vfs = createDiskVfs(root)
       vfs.mkdir('/home/user/threads/t')
       vfs.write('/home/user/threads/t/real.txt', 'real')
-      const { symlinkSync } = await import('node:fs')
       symlinkSync(join(root, 'home', 'user', 'threads', 't', 'real.txt'), join(root, 'home', 'user', 'threads', 't', 'evillink'))
-      const store = LocalDirStore(mkdtempSync(join(tmpdir(), 'snap-store-')))
-      await pushSnapshot(root, store, 'evil')
-      const fresh = mkdtempSync(join(tmpdir(), 'snap-fresh-'))
+      const storeDir = mkdtempSync(join(tmpdir(), 'snap-store-'))
+      const store = LocalDirStore(storeDir)
+      // push skips the link (manifest covers only regular files)
+      const pushed = await pushSnapshot(root, store, 'evil')
+      expect(pushed.manifest.files.map((f) => f.path)).toEqual(['/home/user/threads/t/real.txt'])
+      // a hand-built tar that DOES contain a symlink is rejected on pull
+      const fixture = mkdtempSync(join(tmpdir(), 'snap-fixture-'))
       try {
-        await expect(pullSnapshot(fresh, store, 'evil')).rejects.toThrow(/symlink/)
+        writeFileSync(join(fixture, 'real.txt'), 'real')
+        symlinkSync(join(fixture, 'real.txt'), join(fixture, 'evillink'))
+        const made = spawnSync('tar', ['--create', '--file', join(storeDir, 'crafty.tar'), '--directory', fixture, 'real.txt', 'evillink'])
+        expect(made.status).toBe(0)
+        const manifest = {
+          name: 'crafty',
+          createdAt: new Date().toISOString(),
+          files: [{ path: '/real.txt', sha256: createHash('sha256').update('real').digest('hex'), size: 4 }],
+        }
+        await store.put('crafty.manifest.json', new TextEncoder().encode(JSON.stringify(manifest)))
+        const fresh = mkdtempSync(join(tmpdir(), 'snap-fresh-'))
+        try {
+          await expect(pullSnapshot(fresh, store, 'crafty')).rejects.toThrow(/symlink/)
+        } finally {
+          rmSync(fresh, { recursive: true, force: true })
+        }
       } finally {
-        rmSync(fresh, { recursive: true, force: true })
+        rmSync(fixture, { recursive: true, force: true })
       }
     } finally {
       rmSync(root, { recursive: true, force: true })

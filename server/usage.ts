@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 export interface UsageRecord {
@@ -10,10 +10,21 @@ export interface UsageRecord {
   exitCode: number
 }
 
+/** rows rotate at ~10MB (one backup kept): the log is append-only and
+ * nothing in the server reads it back, so unbounded growth would be silent. */
+const ROTATE_BYTES = 10 * 1024 * 1024
 export async function logUsage(dir: string, record: UsageRecord): Promise<void> {
   try {
     await mkdir(dir, { recursive: true })
-    await appendFile(join(dir, 'usage.jsonl'), `${JSON.stringify(record)}\n`, 'utf8')
+    const path = join(dir, 'usage.jsonl')
+    try {
+      if ((await stat(path)).size >= ROTATE_BYTES) {
+        await rename(path, join(dir, 'usage.jsonl.1'))
+      }
+    } catch {
+      // missing file or failed rotate — just append
+    }
+    await appendFile(path, `${JSON.stringify(record)}\n`, 'utf8')
   } catch {
     // Best effort: usage logging must never break a request.
   }

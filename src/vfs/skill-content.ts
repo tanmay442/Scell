@@ -1,5 +1,5 @@
 /**
- * Single source for the three built-in skill bodies. starter.ts seeds
+ * Single source for the built-in skill bodies. starter.ts seeds
  * these as ~/.cell/skills/<name>/SKILL.md files; agent-skills.ts uses
  * the same content as in-code fallbacks for workspaces seeded before
  * the files existed. Edit here only — both consumers follow.
@@ -37,6 +37,67 @@ Verify a browser app the Cell way:
 2. Run \`cell preview [dir]\` — it opens the panel and bundles with esbuild-wasm.
 3. \`api/*.js\` files run as Vercel-style functions in the node isolate on every request.
 4. Edits hot-reload (~600ms debounce). Check the terminal for bundler errors (\`preview: cannot resolve …\` usually means \`npm install\` first).`,
+  },
+  {
+    name: 'images',
+    description: 'Edit raster images with Pillow: exact dimensions, format converts, byte budgets, EXIF normalize.',
+    body: `# images
+
+Raster images (JPG/PNG/WebP/GIF) are edited with Pillow, which is
+available in python3 in both runtimes (browser pyodide ships it, the
+server image installs it). No other tool is needed.
+
+## The pattern: open, normalize, transform, save, verify
+
+\`\`\`python
+from PIL import Image, ImageOps
+
+img = Image.open('photo.jpg')
+img = ImageOps.exif_transpose(img)  # honor phone rotation, then drop EXIF
+img = img.convert('RGB')            # JPEG has no alpha; convert first
+\`\`\`
+
+## Recipes
+
+- Exact dimensions (government-spec style):
+  \`img.resize((600, 600), Image.LANCZOS)\` — LANCZOS, not default NEAREST.
+- Fit inside a box keeping aspect ratio: \`img.thumbnail((800, 800), Image.LANCZOS)\`
+  (in-place, never enlarges).
+- Convert format: \`img.save('out.png')\` / \`img.save('out.jpg', quality=85, optimize=True)\`.
+- Hit a byte budget (e.g. under 200 KB): save to a buffer, lower quality
+  until it fits, shrink longest side by 10% only if quality 60 still misses.
+  Check the returned byte count against the budget yourself — the function
+  writes its best effort even when the budget is unreachable:
+  \`\`\`python
+  import io
+  def save_under(img, path, max_bytes, fmt='JPEG'):
+      scale, quality = 1.0, 90
+      while True:
+          w, h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+          frame = img if scale >= 1.0 else img.resize((w, h), Image.LANCZOS)
+          buf = io.BytesIO()
+          frame.save(buf, fmt, quality=quality, optimize=True)
+          if len(buf.getvalue()) <= max_bytes or (quality <= 60 and scale < 0.15):
+              open(path, 'wb').write(buf.getvalue())
+              return len(buf.getvalue()), quality, frame.size
+          quality, scale = (quality - 10, scale) if quality > 60 else (90, scale * 0.9)
+  \`\`\`
+- Strip metadata for uploads: convert to RGB + save without \`exif=\` keeps
+  no EXIF. Verify with \`img.getexif()\` after reopening (should be empty).
+- Verify every output by reopening it and printing format, size, and byte
+  length — never report dimensions you did not read back.
+- If \`from PIL import Image\` fails with \`ModuleNotFoundError\` (older server
+  image): run \`apt-get update && apt-get install -y python3-pil\` (or
+  \`pip install Pillow\`), then retry. In the browser this never happens.
+
+## Rules
+
+- Read the input's real dimensions first (never trust the filename).
+- Always \`exif_transpose\` phone photos before measuring anything.
+- PNG for graphics/text (crisp), JPEG for photos (small). WebP when the
+  recipient accepts it.
+- Animated GIF input: \`img.seek()\`/\`img.n_frames\` — say so and process
+  frame 0 unless asked otherwise.`,
   },
   {
     name: 'debug-tsc',

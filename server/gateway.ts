@@ -11,6 +11,9 @@ export interface GatewayReport {
 export interface GatewayContext {
   tokenId: string
   report: (stats: GatewayReport) => void
+  /** exact request bytes the gateway already buffered (avoids a second
+   * read+concat downstream for large bodies) */
+  rawBody: string
 }
 
 export type GatewayInner = (
@@ -62,7 +65,7 @@ export function withGateway(
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   return async (req, res) => {
     if (isHealth(req)) {
-      await inner(req, res, { tokenId: 'health', report: () => {} })
+      await inner(req, res, { tokenId: 'health', report: () => {}, rawBody: '' })
       return
     }
     const auth = checkAuth(opts.tokens, req.headers.authorization ?? null)
@@ -110,6 +113,7 @@ export function withGateway(
       report: (next) => {
         stats = next
       },
+      rawBody: raw,
     })
     await logUsage(opts.usageDir, {
       at: new Date().toISOString(),

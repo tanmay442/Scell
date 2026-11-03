@@ -3,6 +3,9 @@ WORKDIR /srv/cell
 # only the two runtime deps the server bundle requires (fflate, semver);
 # everything else in package.json is browser/build tooling
 RUN npm install --omit=dev --no-audit --no-fund fflate@0.8.3 semver@7.8.5
+# python3 + Pillow: the agent's `images` skill (exact dimensions, format
+# converts, byte budgets) runs the same scripts as the browser pyodide path
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pil && apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
 COPY dist-server/ ./dist-server/
 ENV CELL_WORKSPACE=/workspace CELL_PORT=8787
 EXPOSE 8787

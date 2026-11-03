@@ -83,6 +83,7 @@ const BASE_SYSTEM_PROMPT = `You are Cell, a general-purpose AI agent who lives i
 - /tmp is volatile scratch: never persisted and invisible to python/node runs. Keep anything that matters in your workspace.
 - curl goes through the browser, so CORS blocks many sites. When a fetch fails, say so plainly instead of guessing what the page said.
 - Tool output past 20k chars arrives head+tail truncated with an explicit receipt; exit codes ride an untruncatable '[exit N]' trailer (124 = timed out).
+- Raster images (JPG/PNG/WebP/GIF): Pillow is available in python3 in this workspace — use the images skill for exact dimensions, format converts, EXIF normalize, and byte budgets. Read input dimensions first with it, verify outputs by reopening them.
 - Preview browser apps with: cell preview [dir] (the bundler path, not a server).
 
 ## Linking files
@@ -555,7 +556,9 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
 
   transcript.push(`agent: reached the ${maxSteps}-step limit — continue with \`cell agent --resume ${id} "keep going"\``)
   persist(maxSteps, true)
-  return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 0 }
+  // unfinished work is not success: non-zero so SSE done events, usage
+  // rows, job retries, and shells all record it as incomplete
+  return { stdout: `${transcript.join('\n')}\n`, stderr: '', exitCode: 2 }
 }
 
 /** Race an approval against its timeout; timeout resolves false. */
