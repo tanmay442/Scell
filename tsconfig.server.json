@@ -13,6 +13,7 @@
   ],
   "include": [
     "server/**/*.ts",
+    "src/vfs/scope.ts",
     "src/vfs/types.ts",
     "src/vfs/vfs.ts",
     "src/vfs/skill-content.ts",

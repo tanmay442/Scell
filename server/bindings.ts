@@ -1,6 +1,6 @@
 import { canonicalRealPath, createDiskVfs, workspaceBaseReal } from './disk-vfs'
 import { createNodeShell } from './node-shell'
-import { scopeVfs } from './scope'
+import { scopeVfs } from '../src/vfs/scope'
 import { ensureAgentConfig } from './bootstrap'
 import { sessionId } from '../src/shell/commands/agent-sessions'
 import type { ShellLike } from '../src/shell/commands/shell-types'

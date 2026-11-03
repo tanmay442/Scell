@@ -5,6 +5,9 @@ import type { SessionTurn } from '../shell/commands/agent-sessions'
 import { listSessions, loadSession, saveSession, sessionId } from '../shell/commands/agent-sessions'
 import { loadSkills } from '../shell/commands/agent-skills'
 import { registryEntries, type ToolCall } from '../shell/commands/agent-tools'
+import { projectRoot } from '../shell/commands/install'
+import { scopeVfs } from '../vfs/scope'
+import { getActivePath } from './workspace-store'
 
 /**
  * Agent state for the Agent home (front door). Module-level store:
@@ -767,9 +770,24 @@ export const agentActions = {
           steps: 0,
         })
       }
-      const shell = createShell(vfs, { protected: true, approve })
-      const jobShell = createShell(vfs, { protected: true, approve })
-      const result = await runAgent(vfs, ['--resume', thread.id, prompt], {
+      // thread confinement (browser): every tool the agent touches — file
+      // tools, bash, python, node, git — operates on this scoped view, so
+      // other threads are not nameable. Mounted alongside the thread dir:
+      // ~/.cell (config/sessions/skills registries) and the project the
+      // user is working in (starter project by default, IDE-open project
+      // when set). Same boundary as the headless server's bindings.
+      const mounts: Record<string, string> = { '/home/user/.cell': '/home/user/.cell' }
+      const mountRoot = (root: string | null): void => {
+        if (root === null) return
+        if (root === workspace || root.startsWith(`${workspace}/`) || workspace.startsWith(`${root}/`)) return
+        mounts[root] = root
+      }
+      mountRoot(projectRoot(vfs, getActivePath() ?? HOME))
+      if (vfs.isDir('/home/user/project')) mountRoot('/home/user/project')
+      const scoped = scopeVfs(vfs, workspace, mounts)
+      const shell = createShell(scoped, { protected: true, approve })
+      const jobShell = createShell(scoped, { protected: true, approve })
+      const result = await runAgent(scoped, ['--resume', thread.id, prompt], {
         cwd,
         shell,
         jobShell,

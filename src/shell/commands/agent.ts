@@ -348,7 +348,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const { skills, warnings: skillWarnings } = loadSkills(vfs, opts.cwd)
   const skillBodies = new Map(skills.map((skill) => [skill.name, `# ${skill.name}\n\n${skill.body}`]))
 
-  const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nYour workspace for this thread is ${opts.cwd} — your own folder. Create files, projects and artifacts there by default (paths relative to it work in every tool); the rest of the filesystem, including other projects under ~, stays reachable by absolute path or cd when a task points there.\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
+  const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nYour workspace for this thread is ${opts.cwd} — your own folder. Create files, projects and artifacts there by default (paths relative to it work in every tool). The open project and ~/.cell registries stay reachable by absolute path; other threads' folders are not visible to you and do not exist as far as your tools are concerned.\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
 
   const state: ProviderState = resumeId !== null ? emptyProviderState() : newProviderState(expanded.prompt)
   if (resumeId !== null) {

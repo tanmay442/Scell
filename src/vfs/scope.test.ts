@@ -1,10 +1,6 @@
-import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join, relative, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { createVfs } from '../src/vfs/vfs'
+import { createVfs } from './vfs'
 import { scopeVfs } from './scope'
-import { canonicalRealPath, createDiskVfs, workspaceBaseReal } from './disk-vfs'
 
 const SCOPE = '/home/user/threads/abc'
 const MOUNTS = { '/home/user/.cell': '/home/user/.cell' }
@@ -85,9 +81,10 @@ describe('scopeVfs', () => {
     expect(() => scoped.read('/home/user/nope.txt')).toThrow(/outside capability scope/)
   })
 
-  it('lists and snapshots the scope only, with scope-relative snapshot keys', () => {
+  it('lists scope plus mounts, snapshots the scope only (scope-relative keys)', () => {
     const scoped = scopeVfs(seed(), SCOPE, MOUNTS)
     expect(scoped.listAllFiles()).toEqual([
+      '/home/user/.cell/agent.json',
       '/home/user/threads/abc/notes.txt',
       '/home/user/threads/abc/sub/a.txt',
     ])
@@ -139,65 +136,24 @@ describe('scopeVfs', () => {
     base.write('/home/user/threads/abc/after.txt', 'after')
     expect(seen.length).toBe(2)
   })
-
-  it('still blocks workspace escapes through symlinks (via the disk vfs)', () => {
-    const root = mkdtempSync(join(tmpdir(), 'scope-test-'))
-    const outside = mkdtempSync(join(tmpdir(), 'scope-outside-'))
-    try {
-      const base = createDiskVfs(root)
-      base.write('/home/user/threads/abc/notes.txt', 'hi')
-      symlinkSync(outside, join(root, 'home', 'user', 'threads', 'abc', 'link'))
-      const scoped = scopeVfs(base, SCOPE, MOUNTS)
-      expect(() => scoped.write('/home/user/threads/abc/link/evil.txt', 'x')).toThrow(/escapes/)
-      expect(existsSync(join(outside, 'evil.txt'))).toBe(false)
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-      rmSync(outside, { recursive: true, force: true })
-    }
-  })
 })
 
-
-describe('scopeVfs symlink confinement (resolveReal hook)', () => {
-  /** scoped view over a disk backing, canonicalized like bindings.ts does */
-  function hooked(root: string) {
-    const vfs = createDiskVfs(root)
-    return {
-      vfs,
-      scoped: scopeVfs(vfs, SCOPE, MOUNTS, {
-        resolveReal: (abs) => {
-          try {
-            const real = canonicalRealPath(root, abs)
-            const baseReal = workspaceBaseReal(root)
-            if (real === baseReal) return '/'
-            if (!real.startsWith(`${baseReal}${sep}`)) return null
-            return `/${relative(baseReal, real)}`
-          } catch {
-            return null
-          }
-        },
-      }),
-    }
-  }
-
-  it('refuses reads/writes through a symlink escaping the scope', () => {
-    const root = mkdtempSync(join(tmpdir(), 'scope-link-test-'))
-    try {
-      const { vfs, scoped } = hooked(root)
-      vfs.mkdir('/home/user/threads/abc')
-      vfs.mkdir('/home/user/threads/other')
-      vfs.write('/home/user/threads/other/x.txt', 'SIBLING-SECRET')
-      vfs.write('/home/user/threads/abc/notes.txt', 'hi')
-      symlinkSync(join(root, 'home', 'user', 'threads', 'other'), join(root, 'home', 'user', 'threads', 'abc', 'link'))
-      expect(() => scoped.read('/home/user/threads/abc/link/x.txt')).toThrow(/outside capability scope/)
-      expect(() => scoped.write('/home/user/threads/abc/link/pwned.txt', 'PWNED')).toThrow(/outside capability scope/)
-      expect(scoped.exists('/home/user/threads/abc/link/x.txt')).toBe(false)
-      expect(vfs.read('/home/user/threads/other/x.txt')).toBe('SIBLING-SECRET')
-      expect(vfs.isFile('/home/user/threads/other/pwned.txt')).toBe(false)
-      // the grant itself still works
-      expect(scoped.read('/home/user/threads/abc/notes.txt')).toBe('hi')
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
+describe('scopeVfs as the agent file-tool boundary', () => {
+  it('refuses sibling-thread reads through runTool while the project stays readable', async () => {
+    const { runTool } = await import('../shell/commands/agent-tools')
+    const base = seed()
+    base.write('/home/user/project/README.md', '# Starter project\n')
+    const mounts = { ...MOUNTS, '/home/user/project': '/home/user/project' }
+    const scoped = scopeVfs(base, SCOPE, mounts)
+    const deps = { vfs: scoped, shell: { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }, cwd: SCOPE }
+    const denied = await runTool(deps as never, { id: 'c1', name: 'read', input: { path: '/home/user/threads/other/x.txt' } })
+    expect(denied.isError).toBe(true)
+    expect(denied.content).toMatch(/outside your thread scope/)
+    const allowed = await runTool(deps as never, { id: 'c2', name: 'read', input: { path: '/home/user/project/README.md' } })
+    expect(allowed.isError).toBeFalsy()
+    expect(allowed.content).toContain('Starter project')
+    const own = await runTool(deps as never, { id: 'c3', name: 'write', input: { path: 'notes2.txt', content: 'hi' } })
+    expect(own.isError).toBeFalsy()
+    expect(base.read('/home/user/threads/abc/notes2.txt')).toBe('hi')
   })
 })

@@ -1,5 +1,5 @@
-import type { Vfs, VfsFileMap, VfsStat } from '../src/vfs/types'
-import { vfsPath } from '../src/vfs/types'
+import type { Vfs, VfsFileMap, VfsStat } from './types'
+import { vfsPath } from './types'
 
 /**
  * Capability-scoped Vfs: a chroot-style view that exposes only the paths a
@@ -28,10 +28,12 @@ import { vfsPath } from '../src/vfs/types'
  *   - Everything that reveals or mutates data (read, readBytes, isText,
  *     stat, readDir, write, writeBytes, mkdir, delete, rename) throws
  *     `EINVAL: outside capability scope '<path>'` outside the grant.
- *   - listAllFiles/snapshot cover the scope only (mounts excluded);
- *     snapshot keys are scope-relative (no leading slash, e.g.
- *     'artifacts/chart.html'); restore accepts scope-relative keys, rejects
- *     absolute or `..`-escaping keys, and replaces only the scope contents.
+ *   - listAllFiles covers the scope plus mounts (under their scoped names)
+ *     so git discovery, python payloads and skill registries keep working;
+ *     snapshot covers the scope root only, with scope-relative keys (no
+ *     leading slash, e.g. 'artifacts/chart.html'); restore accepts
+ *     scope-relative keys, rejects absolute or `..`-escaping keys, and
+ *     replaces only the scope contents.
  *   - watch forwards underlying events that fall inside the grant,
  *     translated back to scoped paths; events outside the grant are dropped.
  *   - The scope root itself cannot be deleted or renamed away (EPERM);
@@ -170,8 +172,19 @@ export function scopeVfs(vfs: Vfs, dir: string, mounts?: Record<string, string>,
       vfs.rename(need(from), need(to))
     },
     listAllFiles() {
-      // underlying order is sorted; filtering preserves it
-      return vfs.listAllFiles().filter((path) => under(scopeRoot, path))
+      // underlying order is sorted; mapping preserves it (deduped: a
+      // backing path can surface only under one scoped name)
+      // mounts ARE included: git discovery, python payloads and skill
+      // registries all enumerate through here, and mounts are granted
+      const seen = new Set<string>()
+      const out: string[] = []
+      for (const backing of vfs.listAllFiles()) {
+        const scoped = scopedEvent(backing)
+        if (scoped === null || seen.has(scoped)) continue
+        seen.add(scoped)
+        out.push(scoped)
+      }
+      return out
     },
     snapshot() {
       const out: VfsFileMap = {}

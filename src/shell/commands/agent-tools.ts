@@ -559,6 +559,15 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
     }
     return { id: call.id, content: `unknown tool ${call.name}`, isError: true }
   } catch (err) {
-    return { id: call.id, content: err instanceof Error ? err.message : String(err), isError: true }
+    // thread confinement surfaces as EINVAL from the scoped VFS: restate
+    // it as a refusal the agent understands, like the deny-list messages
+    if (err instanceof Error) {
+      const scopeMatch = /^EINVAL: outside capability scope '([^']*)'$/.exec(err.message)
+      if (scopeMatch !== null) {
+        return { id: call.id, content: `refused: ${scopeMatch[1]} is outside your thread scope`, isError: true }
+      }
+      return { id: call.id, content: err.message, isError: true }
+    }
+    return { id: call.id, content: String(err), isError: true }
   }
 }

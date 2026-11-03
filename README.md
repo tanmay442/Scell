@@ -21,10 +21,10 @@ model-generated titles, skills, tools, model settings, a status dock with
 agent/jobs/review state) where a general-purpose agent works for you. Ask
 it anything — questions are answered directly; when work needs doing it
 has bash, files, git, python and a live preview. Every thread works in
-its own workspace folder (`~/threads/<session-id>/`), threads keep
-running in the background when you switch away, generated files are
-linked inline and open in a preview, and HTML visuals render in the
-thread itself. There is no step limit in the UI (the stop button is the
+its own workspace folder (`~/threads/<session-id>/`), invisible to other
+threads, threads keep running in the background when you switch away,
+generated files are linked inline and open in a preview, and HTML visuals
+render in the thread itself. There is no step limit in the UI (the stop button is the
 guardrail); the terminal's `cell agent "task"` takes `--steps N` only
 when you ask for one. The full IDE — editor, terminal, git, preview —
 is one click away under **Workspace**, and everything below describes
