@@ -80,6 +80,15 @@ export function listThreads(vfs: Vfs, busyIds: string[] = []): ThreadSummary[] |
   const out: ThreadSummary[] = []
   for (const threadId of dirs.sort()) {
     if (!isValidThreadId(threadId)) continue
+    // stray files (a dropped .keep, an editor backup) are not threads —
+    // without this check every file becomes an unopenable thread row
+    let isDir = false
+    try {
+      isDir = vfs.isDir(`${THREADS_DIR}/${threadId}`)
+    } catch {
+      isDir = false
+    }
+    if (!isDir) continue
     const mapped = sessions.get(threadId) ?? null
     let title: string | null = null
     let messages = 0

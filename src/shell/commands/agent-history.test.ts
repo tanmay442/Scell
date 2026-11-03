@@ -101,3 +101,17 @@ describe('agent-history redaction + count receipt', () => {
     expect(out.content).toMatch(/searched the 200 newest of 205 sessions/)
   })
 })
+
+describe('agent-history perf guards', () => {
+  it('skips oversized sessions with a receipt and memoizes repeats', async () => {
+    const { searchHistory, lastHistorySkippedBig } = await import('./agent-history')
+    const vfs = createVfs()
+    seed(vfs)
+    vfs.write('/home/user/.cell/sessions/agent-big.json', JSON.stringify({ id: 'agent-big', prompt: 'x'.repeat(300 * 1024) }))
+    const first = searchHistory(vfs, 'login')
+    expect(lastHistorySkippedBig()).toBe(1)
+    const second = searchHistory(vfs, 'login')
+    expect(second).toEqual(first)
+    expect(lastHistorySkippedBig()).toBe(1)
+  })
+})

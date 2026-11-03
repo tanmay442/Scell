@@ -937,3 +937,16 @@ describe('installPureWheel over local HTTP (production path shape)', () => {
     }
   }, 300_000)
 })
+
+describe('installPureWheel refusal cache', () => {
+  it('remembers refusals without re-hitting the index', async () => {
+    const { installPureWheel } = await import('./runner')
+    const { loadPyodide } = await import('pyodide')
+    const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+    let calls = 0
+    const failLoad = { ...py, loadPackage: async () => { calls++; throw new Error('no such package') } }
+    await expect(installPureWheel(failLoad as never, 'zz-evil-cached-1')).rejects.toThrow(/not allowlisted/)
+    await expect(installPureWheel(failLoad as never, 'zz-evil-cached-1')).rejects.toThrow(/not allowlisted/)
+    expect(calls).toBe(1)
+  }, 300_000)
+})

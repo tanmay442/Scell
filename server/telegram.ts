@@ -1,5 +1,8 @@
 import type { Vfs } from '../src/vfs/types'
-import { deleteReminder, dueReminders, noteFailedDelivery } from '../src/shell/commands/agent-reminders'
+import { deleteReminder as deleteStoredReminder, dueReminders, loadReminders, noteFailedDelivery } from '../src/shell/commands/agent-reminders'
+
+/** Re-exported so server.ts routes share one reminder store entry point. */
+export const deleteReminder = deleteStoredReminder
 
 /**
  * Telegram connector: the one global bot on a second surface. Long-poll
@@ -82,16 +85,18 @@ export function telegramThreadFor(chatId: number, chats: Record<string, string>)
 }
 
 export interface TelegramCommand {
-  command: 'new' | 'status' | 'help' | 'brief'
+  command: 'new' | 'status' | 'help' | 'brief' | 'cancel' | 'reminders' | 'forget'
   arg: string
 }
 
 /** /cmd and /cmd@botname forms; unknown /commands fall through as chat text. */
 export function parseTelegramCommand(text: string): TelegramCommand | null {
-  const match = /^\/([a-z]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim())
+  const match = /^\/([A-Za-z]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/.exec(text.trim())
   if (!match) return null
-  const command = match[1]
-  if (command !== 'new' && command !== 'status' && command !== 'help' && command !== 'brief') return null
+  // commands are case-insensitive (/STATUS works like /status); unknown
+  // ones (incl. /cancel — see below) fall through as plain chat text
+  const command = match[1].toLowerCase()
+  if (command !== 'new' && command !== 'status' && command !== 'help' && command !== 'brief' && command !== 'cancel' && command !== 'reminders' && command !== 'forget') return null
   return { command: command as TelegramCommand['command'], arg: (match[2] ?? '').trim() }
 }
 
@@ -338,12 +343,32 @@ interface TelegramUpdate {
     caption?: string
     photo?: TelegramPhotoSize[]
     document?: TelegramDocument
+    voice?: unknown
+    video?: unknown
+    video_note?: unknown
+    sticker?: unknown
   }
 }
 
+export interface TelegramReminderSummary {
+  id: string
+  text: string
+  runAt: string
+}
+
+/** Pending reminders for one chat (the agent has no list/cancel tool,
+ * so the chat surface owns both). */
+export function listChatReminders(vfs: Vfs, chatId: number): TelegramReminderSummary[] {
+  return loadReminders(vfs)
+    .filter((r) => r.chatId === String(chatId))
+    .map((r) => ({ id: r.id, text: r.text, runAt: r.runAt }))
+}
+
 export interface TelegramPollHandlers {
-  /** chat text (+ downloaded photo/document bytes) → the agent's reply */
-  onText: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[]) => Promise<string>
+  /** chat text (+ downloaded photo/document bytes) → the agent's reply.
+   * The signal aborts when the turn budget expires; handlers should
+   * stop work promptly (the poller reports the timeout to the chat). */
+  onText: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[], signal: AbortSignal) => Promise<string>
   /** /new /status /help */
   onCommand: (chatId: number, command: TelegramCommand, threadId: string) => Promise<string | null>
   log?: (message: string) => void
@@ -355,13 +380,27 @@ export interface TelegramPoller {
   handled: () => number
 }
 
+export interface TelegramPollOptions {
+  /** per-turn ceiling (default 10 min): the poller stops waiting and
+   * tells the chat, instead of wedging behind one hung turn */
+  turnTimeoutMs?: number
+}
+
 /** Per-chat FIFO turn queue (Grok/Hermes shape): a message arriving while
  * its thread is busy QUEUES instead of dying — the drain runs each queued
  * turn in order after the current one finishes. Same chat sequential,
  * different chats fully parallel (the router underneath serializes). */
 export interface TurnQueue {
-  /** immediate reply ('Queued…' or the turn's own reply when idle) */
-  submit(chatId: number, threadId: string, text: string, attachments: TelegramAttachmentIn[]): Promise<string>
+  /** immediate reply ('Queued…' or the turn's own reply). The optional
+   * signal aborts a hung turn (the poller's turn budget). */
+  submit(chatId: number, threadId: string, text: string, attachments: TelegramAttachmentIn[], signal?: AbortSignal): Promise<string>
+  /** kick the drain after a holder finishes: queued turns never run
+   * unless something starts the drain, so every run completion must
+   * call this (otherwise old turns stall until the next message — and
+   * a newer message would then run first, inverting the order) */
+  kick(chatId: number, threadId: string): void
+  /** queued-but-unrun turns for a thread (for /new handoff messaging) */
+  queuedCount(threadId: string): number
 }
 
 /** Internal race signal: the router was free at check time but busy at
@@ -375,31 +414,43 @@ export class QueueRaceError extends Error {
 }
 
 export function createTurnQueue(
-  runTurn: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[], fromQueue: boolean) => Promise<string>,
+  runTurn: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[], fromQueue: boolean, signal?: AbortSignal) => Promise<string>,
   send: (chatId: number, text: string) => Promise<void>,
   isBusy: (threadId: string) => boolean,
   onError: (chatId: number, err: unknown) => void,
   maxQueued = 5,
 ): TurnQueue {
-  const pending = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[]; __races?: number }>>()
+  const pending = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[]; __races?: number; signal?: AbortSignal }>>()
   const draining = new Set<string>()
+  const kick = (chatId: number, threadId: string): void => {
+    drain(chatId, threadId)
+  }
   return {
-    async submit(chatId, threadId, text, attachments) {
+    async submit(chatId, threadId, text, attachments, signal) {
       if (!isBusy(threadId)) {
-        const reply = await runTurn(chatId, text, threadId, attachments, false)
-        drain(chatId, threadId)
-        return reply
+        // finally, not after: a throwing idle turn must still start the
+        // drain or queued turns strand until the next message arrives
+        try {
+          return await runTurn(chatId, text, threadId, attachments, false, signal)
+        } finally {
+          drain(chatId, threadId)
+        }
       }
       const queued = pending.get(threadId) ?? []
       if (queued.length >= maxQueued) return 'still catching up — hold that thought for a moment'
-      queued.push({ text, attachments })
+      queued.push({ text, attachments, ...(signal !== undefined ? { signal } : {}) })
       pending.set(threadId, queued)
       return `queued (position ${queued.length}) — still on the previous one, it runs next`
+    },
+    kick,
+    queuedCount(threadId) {
+      return pending.get(threadId)?.length ?? 0
     },
   }
   // one drain loop per thread: a drained turn completing starts nonew loop
   function drain(chatId: number, threadId: string): void {
     if (draining.has(threadId)) return
+    if (!pending.get(threadId)?.length) return
     draining.add(threadId)
     void (async () => {
       try {
@@ -414,7 +465,7 @@ export function createTurnQueue(
           // not spin forever — dead-letter through onError after the cap
           let races = (next as { __races?: number }).__races ?? 0
           try {
-            const reply = await runTurn(chatId, next.text, threadId, next.attachments, true)
+            const reply = await runTurn(chatId, next.text, threadId, next.attachments, true, (next as { signal?: AbortSignal }).signal)
             await send(chatId, reply)
           } catch (err) {
             // router race: holder slipped in between the isBusy check and
@@ -451,7 +502,9 @@ export function startTelegramPoller(
   config: TelegramBotConfig,
   handlers: TelegramPollHandlers,
   fetchImpl: TelegramFetch = defaultFetch,
+  opts: TelegramPollOptions = {},
 ): TelegramPoller {
+  const turnTimeoutMs = opts.turnTimeoutMs ?? 600_000
   const allowed = new Set(config.allowFrom)
   const state = loadState(vfs)
   const api = createTelegramApi(apiBase, fetchImpl)
@@ -521,6 +574,21 @@ export function startTelegramPoller(
     }
   }
 
+  /** Download with one retry on a fresh file path: Telegram paths can
+   * expire between getFile and download, and the user-facing error must
+   * be human, never a raw HTTP code. */
+  async function downloadFresh(fileId: string, label: string): Promise<Uint8Array> {
+    try {
+      return await api.downloadFile(await api.getFilePath(fileId))
+    } catch (first) {
+      try {
+        return await api.downloadFile(await api.getFilePath(fileId))
+      } catch {
+        throw first instanceof Error ? first : new Error(`telegram download failed: ${label}`)
+      }
+    }
+  }
+
   async function handleUpdate(update: TelegramUpdate): Promise<void> {
     const message = update.message
     if (!message || message.chat.type !== 'private') return
@@ -531,7 +599,16 @@ export function startTelegramPoller(
       return
     }
     // photos, documents (PDFs, files), or plain text — captions count as
-    // the message text; anything else (stickers, voice, video) is ignored
+    // the message text. Voice/video get one human reply (not silence,
+    // not a loop); stickers stay silent (replies would be a spam vector).
+    if (message.voice !== undefined || message.video !== undefined || message.video_note !== undefined) {
+      try {
+        await api.sendMessage(chatId, "I can't listen to audio or watch video — send text or a photo instead")
+      } catch {
+        // best-effort guidance only
+      }
+      return
+    }
     const photo = message.photo !== undefined && message.photo.length > 0 ? pickPhoto(message.photo) : null
     const document = message.document
     const text = (message.text ?? message.caption ?? '').trim()
@@ -554,25 +631,50 @@ export function startTelegramPoller(
         // download attachments BEFORE the model turn: the handler stages
         // them into the thread workspace next to the prompt
         const attachments: TelegramAttachmentIn[] = []
+        const tooBig = (n: number): string => `that file is too big (${(n / 1048576).toFixed(1)} MB, cap 12 MB) — try compressing or splitting it`
         if (message.photo !== undefined && message.photo.length > 0 && photo === null) {
-          reply = `that photo is too big (cap ${MAX_ATTACHMENT_BYTES} bytes) — send a smaller one`
+          reply = tooBig(message.photo.reduce((a, p) => Math.max(a, p.file_size ?? 0), 0))
         }
         if (photo !== null) {
-          const path = await api.getFilePath(photo.file_id)
-          const bytes = await api.downloadFile(path)
-          attachments.push({ name: `photo-${photo.width}x${photo.height}.jpg`, mime: 'image/jpeg', bytes })
+          try {
+            attachments.push({ name: `photo-${photo.width}x${photo.height}.jpg`, mime: 'image/jpeg', bytes: await downloadFresh(photo.file_id, 'photo') })
+          } catch {
+            reply = 'could not fetch that photo — please resend it'
+          }
         }
         if (document !== undefined) {
           if ((document.file_size ?? 0) > MAX_ATTACHMENT_BYTES) {
-            reply = `that file is too big (${document.file_size} bytes, cap ${MAX_ATTACHMENT_BYTES}) — send a smaller one`
+            reply = tooBig(document.file_size ?? 0)
           } else {
-            const path = await api.getFilePath(document.file_id)
-            const bytes = await api.downloadFile(path)
-            const name = sanitizeAttachmentName(document.file_name ?? 'document', `upload-${Date.now().toString(36)}`)
-            attachments.push({ name, mime: document.mime_type ?? 'application/octet-stream', bytes })
+            try {
+              const bytes = await downloadFresh(document.file_id, 'document')
+              const name = sanitizeAttachmentName(document.file_name ?? 'document', `upload-${Date.now().toString(36)}`)
+              attachments.push({ name, mime: document.mime_type ?? 'application/octet-stream', bytes })
+            } catch {
+              reply = 'could not fetch that file — please resend it'
+            }
           }
         }
-        reply = reply ?? (await handlers.onText(chatId, text, threadId, attachments))
+        // turn timeout: a hung handler must not wedge the whole poller.
+        // The signal tells the run to stop; the timeout reply goes to the
+        // chat either way. Late completions are dropped (never delivered
+        // twice) — the next message starts fresh.
+        if (reply === null) {
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), turnTimeoutMs)
+          try {
+            reply = await Promise.race([
+              handlers.onText(chatId, text, threadId, attachments, controller.signal),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`turn took longer than ${Math.round(turnTimeoutMs / 1000)}s — try a smaller step`)), turnTimeoutMs + 1000),
+              ),
+            ])
+          } catch (err) {
+            reply = err instanceof Error ? err.message : String(err)
+          } finally {
+            clearTimeout(timeout)
+          }
+        }
       }
       stopTyping?.()
       if (reply !== null) {
@@ -622,7 +724,8 @@ export async function deliverDueReminders(
   let undeliverable = 0
   for (const reminder of dueReminders(vfs, now)) {
     if (reminder.chatId === null) {
-      undeliverable++
+      // headless/browser reminders have no chat to reach: skip silently
+      // (don't count them undeliverable — there's nothing to retry)
       continue
     }
     try {

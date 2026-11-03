@@ -11,7 +11,7 @@ import {
   telegramThreadFor,
   type TelegramFetch,
 } from './telegram'
-import { addReminder } from '../src/shell/commands/agent-reminders'
+import { addReminder, loadReminders } from '../src/shell/commands/agent-reminders'
 
 /** Fake Bot API: queued updates in, sent messages/files out, file store. */
 function mockApi() {
@@ -269,7 +269,9 @@ describe('telegram poller (mock Bot API)', () => {
     addReminder(vfs, { text: 'no chat', when: new Date(now - 1000).toISOString() }, now - 2000)
     addReminder(vfs, { text: 'future', when: new Date(now + 3600_000).toISOString(), chatId: '42' }, now)
     const out = await deliverDueReminders(vfs, sender, now)
-    expect(out).toEqual({ delivered: 1, undeliverable: 1 })
+    expect(out).toEqual({ delivered: 1, undeliverable: 0 })
+    // chatless reminders are skipped silently and never deleted
+    expect(loadReminders(vfs).length).toBe(2)
     expect(api.sent).toEqual([{ chatId: 42, text: 'reminder: ping me' }])
     // fired reminders are gone; nothing due anymore
     const again = await deliverDueReminders(vfs, sender, now)
@@ -418,7 +420,7 @@ describe('telegram deliverables', () => {
 
 describe('background worker scheduling', () => {
   it('spawns a worker thread with a notify task job', async () => {
-    const { scheduleBackgroundTask } = await import('./server')
+    const { scheduleBackgroundTask } = await import('./background')
     const { createDiskVfs } = await import('./disk-vfs')
     const { mkdtempSync } = await import('node:fs')
     const { tmpdir } = await import('node:os')
@@ -501,5 +503,116 @@ describe('turn queue (FIFO per chat)', () => {
     await new Promise((r) => setTimeout(r, 300))
     expect(delivered).toEqual(['ok:a', 'error: handler blew up'])
     expect(errors.length).toBe(1)
+  })
+})
+
+describe('telegram flood (queue under load)', () => {
+  it('processes 30 rapid messages to one chat in order, plus parallel chats', async () => {
+    const vfs = createVfs()
+    const api = mockApi()
+    const seen: string[] = []
+    const poller = startTelegramPoller(
+      vfs,
+      'https://api.telegram.org/botX',
+      { token: 'X', allowFrom: [42, 43] },
+      {
+        onText: async (chatId, text, _t, _a) => {
+          await new Promise((r) => setTimeout(r, 5))
+          seen.push(`${chatId}:${text}`)
+          return `ok:${text}`
+        },
+        onCommand: async () => 'x',
+      },
+      api.fetch,
+    )
+    for (let i = 0; i < 30; i++) api.pushText(42, `m${i}`)
+    for (let i = 0; i < 10; i++) api.pushText(43, `n${i}`)
+    await waitFor(() => api.sent.length >= 40, 15000)
+    const chat42 = seen.filter((s) => s.startsWith('42:')).map((s) => s.slice(3))
+    const chat43 = seen.filter((s) => s.startsWith('43:')).map((s) => s.slice(3))
+    expect(chat42).toEqual(Array.from({ length: 30 }, (_, i) => `m${i}`))
+    expect(chat43).toEqual(Array.from({ length: 10 }, (_, i) => `n${i}`))
+    expect(api.sent.length).toBe(40)
+    poller.stop()
+  }, 30000)
+})
+
+describe('turn queue kick + drain on holder finish', () => {
+  it('a queued turn runs after the holder finishes without a new message', async () => {
+    const { createTurnQueue } = await import('./telegram')
+    const { createThreadRouter } = await import('./threads')
+    const router = createThreadRouter()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const order: string[] = []
+    const runTurn = async (_c: number, text: string, threadId: string) => {
+      const outcome = await router.runExclusive(threadId, async () => {
+        if (text === 'holder') await gate
+        order.push(text)
+        return `ok:${text}`
+      })
+      if (outcome.status !== 'ran') throw new Error('busy-race')
+      return outcome.value
+    }
+    const sent: string[] = []
+    const queue = createTurnQueue(runTurn as never, async (_c, text) => { sent.push(text) }, (t) => router.isBusy(t), () => {})
+    const first = queue.submit(1, 'tg-9', 'holder', [])
+    await new Promise((r) => setTimeout(r, 50))
+    const queued = await queue.submit(1, 'tg-9', 'waiter', [])
+    expect(queued).toMatch(/position 1/)
+    // holder still running: waiter must NOT have run yet
+    expect(order).toEqual([])
+    release()
+    expect(await first).toBe('ok:holder')
+    // the kick on holder finish drains the waiter with no new message
+    await new Promise((resolve) => {
+      const start = Date.now()
+      const tick = () => (sent.length >= 1 || Date.now() - start > 5000 ? resolve(null) : setTimeout(tick, 20))
+      tick()
+    })
+    expect(order).toEqual(['holder', 'waiter'])
+    expect(sent).toEqual(['ok:waiter'])
+  })
+
+  it('parses /reminders, /forget and case-insensitive commands', async () => {
+    const { parseTelegramCommand } = await import('./telegram')
+    expect(parseTelegramCommand('/reminders')).toEqual({ command: 'reminders', arg: '' })
+    expect(parseTelegramCommand('/forget 2')).toEqual({ command: 'forget', arg: '2' })
+    expect(parseTelegramCommand('/STATUS')).toEqual({ command: 'status', arg: '' })
+    expect(parseTelegramCommand('/New')).toEqual({ command: 'new', arg: '' })
+    expect(parseTelegramCommand('/cancel')).toEqual({ command: 'cancel', arg: '' })
+  })
+})
+
+describe('turn timeout (hung handler)', () => {
+  it('stops waiting and tells the chat, without wedging the poller', async () => {
+    const vfs = createVfs()
+    const api = mockApi()
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const poller = startTelegramPoller(
+      vfs,
+      'https://api.telegram.org/botX',
+      { token: 'X', allowFrom: [42] },
+      {
+        onText: async () => {
+          await gate
+          return 'late reply'
+        },
+        onCommand: async () => 'x',
+      },
+      api.fetch,
+      { turnTimeoutMs: 200 },
+    )
+    api.pushText(42, 'hang please')
+    await waitFor(() => api.sent.length >= 1, 5000)
+    expect(api.sent[0].text).toMatch(/took longer than 0s|took longer/)
+    // a follow-up works fine afterwards — nothing wedged
+    release()
+    await new Promise((r) => setTimeout(r, 200))
+    api.pushText(42, 'are you there')
+    await waitFor(() => api.sent.length >= 2, 5000)
+    expect(api.sent[1].text).toBe('late reply')
+    poller.stop()
   })
 })

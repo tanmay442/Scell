@@ -3,7 +3,7 @@ import { vfsPath } from '../../vfs/types'
 import { isJobLogPath, isProtectedPath, isWriteProtectedPath } from '../../vfs/protected-paths'
 import { ScopeError } from '../../vfs/scope'
 import { redactSecrets } from './agent-redact'
-import { MAX_HISTORY_SCANNED, historySessionCount, searchHistory } from './agent-history'
+import { MAX_HISTORY_SCANNED, historySessionCount, lastHistorySkippedBig, searchHistory } from './agent-history'
 import { listMemoryFacts, saveMemoryFact } from './agent-memory'
 import { addReminder } from './agent-reminders'
 import { installSkill } from './agent-skill-install'
@@ -618,6 +618,8 @@ export async function runTool(deps: RunToolDeps, call: ToolCall): Promise<ToolRe
       const lines = hits.map((h) => `${h.sessionId}${h.title ? ` — ${h.title}` : ''}${h.startedAt ? ` (${h.startedAt})` : ''}\n  ${h.snippet}`)
       const total = historySessionCount(vfs)
       if (total > MAX_HISTORY_SCANNED) lines.push(`(searched the ${MAX_HISTORY_SCANNED} newest of ${total} sessions — older threads are skipped)`)
+      const skippedBig = lastHistorySkippedBig()
+      if (skippedBig > 0) lines.push(`(skipped ${skippedBig} oversized session file(s) — narrow the query if the answer hides there)`)
       return { id: call.id, content: truncateWithReceipt(lines.join('\n'), AGENT_READ_MAX) }
     }
     // subagents (Hermes delegate shape) may not write shared registries:

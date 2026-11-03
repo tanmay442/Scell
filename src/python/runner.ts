@@ -7,8 +7,10 @@
  */
 
 /** Pure-Python wheels installed from the same-origin vendor dir instead
- * of PyPI: pinned bytes (hash-checked below), offline-capable, no CORS
- * or typosquat risk. Vendored by scripts/vendor-public.mjs into
+ * of PyPI: pinned bytes (hash-checked below), offline deterministic, no
+ * index trust, no typosquat risk. (PyPI does send CORS headers today, so
+ * same-origin is about pinning and determinism, not reachability.)
+ * Vendored by scripts/vendor-public.mjs into
  * public/vendor/wheels/ — PINNED THERE TOO (check-isolate-pure.sh fails
  * the build when the pins differ; see VENDOR_WHEEL_HASHES).
  *
@@ -34,11 +36,17 @@ export async function installPureWheel(
   if (wheel === undefined) {
     // pyodide index only — never PyPI on our own authority. A
     // prompt-injected `import typosquat` dies here instead of fetching
-    // attacker code: loadPackage throws for unknown names.
+    // attacker code: loadPackage throws for unknown names. Refusals are
+    // memoized: one malicious script importing K evil names must not pay
+    // K index round-trips (amortized DoS on the CDN path).
+    if (refusedInstalls.has(name)) {
+      throw new Error(`pip: ${name} is not allowlisted for auto-install (see VENDOR_WHEELS) — ask for it to be vendored after review`)
+    }
     try {
       await pyodide.loadPackage(name)
       return
     } catch {
+      refusedInstalls.add(name)
       throw new Error(`pip: ${name} is not allowlisted for auto-install (see VENDOR_WHEELS) — ask for it to be vendored after review`)
     }
   }
@@ -107,6 +115,12 @@ export async function installWheelMembers(
  * script) AND at install time (hash of the fetched bytes, below).
  * A poisoned wheel is the arbitrary-code-execution path into every
  * session, so both checks fail closed. */
+/** Names already refused this process: pyodide-index misses are stable
+ * (the index doesn't change mid-run), so a K-evil-imports script pays
+ * one lookup instead of K. Vendored allowlist membership never changes
+ * at runtime either — no invalidation needed. */
+const refusedInstalls = new Set<string>()
+
 export const VENDOR_WHEEL_HASHES: Record<string, string> = {
   'pypdf-6.21.4-py3-none-any.whl': '33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c',
   'seaborn-0.13.2-py3-none-any.whl': '636f8336facf092165e27924f223d3c62ca560b1f2bb5dff7ab7fad265361987',

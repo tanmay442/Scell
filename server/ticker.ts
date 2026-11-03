@@ -11,38 +11,81 @@ export interface JobTickerOptions {
   jobTimeoutMs?: number
 }
 
+/** Raised when a job's thread is busy: retry later WITHOUT counting an
+ * attempt (contention is not failure). Exported for tests. */
+export class JobBusyError extends Error {
+  constructor(jobId: string, threadId: string) {
+    super(`job ${jobId}: thread ${threadId} busy — retrying next tick`)
+    this.name = 'JobBusyError'
+  }
+}
+
 export function startJobTicker(opts: JobTickerOptions): () => void {
   const { vfs, intervalMs, onDue, onError, jobTimeoutMs } = opts
   let stopped = false
   let chain: Promise<void> = Promise.resolve()
+  // in-flight set: a timed-out onDue keeps running while the router slot
+  // frees — refiring it immediately would run duplicates and burn all
+  // attempts during healthy overrun. Skip (don't refire, don't count).
+  const inFlight = new Set<string>()
 
   // NOTE: stop() prevents future polls but never cancels an in-flight
   // onDue — its completion (or failure) still lands normally.
   async function pollOnce(): Promise<void> {
     if (stopped) return
-    const due = dueJobs(vfs)
+    const due = dueJobs(vfs).filter((job) => !inFlight.has(job.id))
     for (const job of due) {
       if (stopped) return
+      // the entry leaves inFlight ONLY when onDue itself settles: a
+      // timeout wins the race below but the work keeps running, and
+      // deleting on race-settle would refire duplicates every tick
+      inFlight.add(job.id)
+      let tracked: Promise<void>
+      try {
+        // starts the work immediately (same as before); the delete
+        // handlers below own the in-flight entry from here on
+        tracked = onDue(job)
+        tracked.then(
+          () => inFlight.delete(job.id),
+          () => inFlight.delete(job.id),
+        )
+      } catch (err) {
+        // synchronous throw from onDue itself: not started, not in flight
+        inFlight.delete(job.id)
+        if (!(err instanceof JobBusyError)) {
+          noteAttempt(vfs, job.id)
+        }
+        try {
+          onError?.(err, job)
+        } catch {
+          // error reporter must never break the ticker chain
+        }
+        continue
+      }
       try {
         if (jobTimeoutMs === undefined) {
-          await onDue(job)
+          await tracked
         } else {
-          let rejectTimeout!: (err: Error) => void
-          const timeout = new Promise<never>((_, reject) => {
-            rejectTimeout = reject
-          })
-          const timer = setTimeout(
-            () => rejectTimeout(new Error(`job ${job.id} timed out after ${jobTimeoutMs}ms`)),
-            jobTimeoutMs,
-          )
+          let timer: ReturnType<typeof setTimeout> | undefined
           try {
-            await Promise.race([onDue(job), timeout])
+            await Promise.race([
+              tracked,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`job ${job.id} timed out after ${jobTimeoutMs}ms`)), jobTimeoutMs)
+              }),
+            ])
           } finally {
-            clearTimeout(timer)
+            if (timer !== undefined) clearTimeout(timer)
           }
         }
       } catch (err) {
-        noteAttempt(vfs, job.id)
+        // a busy thread is contention, not failure: retry later without
+        // burning an attempt. A timeout means the run was actually
+        // killed, so it still counts (at most one wasted attempt per
+        // healthy overrun, then the retry resumes and finishes).
+        if (!(err instanceof JobBusyError)) {
+          noteAttempt(vfs, job.id)
+        }
         try {
           onError?.(err, job)
         } catch {

@@ -3,10 +3,11 @@
 A complete development environment that lives entirely inside one browser tab.
 Filesystem, bash shell, TypeScript compiler, node runtime, Python data stack,
 npm, git, a live app preview and an AI agent harness — all running on V8
-(WebAssembly where it counts). **No server, no container, no kernel, no
-backend compute.** Clone a repo, install, edit with live typechecking, run,
+(WebAssembly where it counts). Clone a repo, install, edit with live typechecking, run,
 test, commit, push, convert images, preview the running app, snapshot the
-workspace — everything persists in the browser.
+workspace — everything persists in the browser. No server needed to use it.
+An optional headless server (same agent, real shell and disk) powers the
+Telegram bot and always-on runs — see below.
 
 ```
 pnpm install
@@ -44,7 +45,7 @@ both surfaces.
 | git | Real libgit2 1.9.4 (wasm-git). `.git` is a visible directory; clone/fetch/push over https — CORS-blocked hosts (github) go through a relay chain automatically; `pull` = fetch+merge | e2e: clone from a real git server + github through the relay |
 | App preview | `cell preview`: esbuild-wasm bundles the module graph in-page (exports maps, subpaths, tsx, images), Tailwind compiled live by the oxide runtime, `public/` served at root, Vercel-style `api/*.js` executed per request in the isolate, hot reload | browser e2e benchmarks (style + asset truth probes) |
 | Object storage | `cell save/list/load/status` — whole-workspace tar.gz to any S3-compatible endpoint, SigV4 on WebCrypto (verified against botocore) | `cell-cmd.test.ts` |
-| Python | Pyodide CPython 3.12 in a worker (numpy, pandas, scipy, matplotlib and Pillow wheels vendored — no downloads), `python3` CLI, argv/cwd/stdin semantics, `matplotlib` PNGs, write-back to the VFS | `python.test.ts` (incl. Pillow convert/resize/verify) |
+| Python | Pyodide CPython 3.12 in a worker. Vendored wheels, hash-pinned, installed offline: numpy, pandas, scipy, matplotlib, Pillow, plus pypdf and seaborn for documents and charts. `python3` CLI, argv/cwd/stdin semantics, `matplotlib` PNGs, write-back to the VFS | `python.test.ts` (incl. Pillow convert/resize/verify, pypdf extract, seaborn plot) |
 | Images | Drop any photo on the composer (staged into the thread workspace, 25 MB cap) or point at a workspace file, then ask: exact-dimension resize (LANCZOS), JPEG/PNG/WebP converts, quality byte-budget loops, EXIF normalize/strip — driven by the built-in `images` skill (Pillow), outputs verified by reopening and linked inline as previewable file chips | `python.test.ts` + live browser/server runs |
 | AI agent | Agent home (front door) + `cell agent "task" [--steps N] [--resume <id>]` in the terminal — Meta/Anthropic/OpenAI/OpenAI-compatible tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill`/`job_start`/`job_poll`/`job_list`/`history_search`/`memory_save`/`memory_list`/`skill_install`/`remind`/`delegate` + custom `~/.cell/tools/*.json`, skills with progressive disclosure (`bot`, `commit`, `preview`, `debug-tsc`, `images`; user-installed skills land in `~/.cell/skills/`; project overrides win), slash commands (`/commit`, `/preview`, custom), persisted sessions (model-generated titles, pin/lock/archive/fork/share), resumable chat with restored history, per-thread workspaces that keep running in the background, HTML visuals rendered in-thread, attached-file staging, per-tool approval in Ask mode (default: full permission), background jobs, secret redaction, SSE streaming, abort + auto-compaction | `agent*.test.ts` |
 
@@ -180,17 +181,66 @@ plus the live registry and github (internet required).
 | `~/.cell/storage.json` | S3-compatible endpoint for `cell save/load` snapshots |
 | `~/.gitconfig` `[cell] corsproxy` | custom git CORS relay list (`off` disables) |
 
-## Honest limits
+## What Cell is (and is not)
 
-Browsers are the physics: no `child_process`, no native binaries (packages
-that ship machine code — e.g. vercel, opencode — install but say so plainly;
-the server image instead ships `python3-pil` via apt for the `images` skill),
-no SSH remotes, no listening servers (preview + api functions replace them),
-ESM-with-top-level-await CLIs can't run in the CommonJS isolate, and network
-access obeys CORS (hence the git relay chain). Long-running processes cap at
-5 minutes per run. Composer attachments: images stage as bytes (25 MB max)
-into the thread workspace; other files inline as text (200 KB / 12k chars
-clipped). Everything else behaves like the real thing — including
+Cell is a web app dev environment first: TypeScript with live typechecking,
+node with npm/pnpm from the real registry, a bundler plus live preview,
+Python for data and images, git, and an agent that drives all of it from
+chat, the terminal, or Telegram. Two ways to run it:
+
+- **In the browser** (the default): everything runs in V8 isolates — the
+shell, the file tools, python, node, git, the bundler. Each thread sees
+only its own workspace folder. Nothing leaves the tab except registry,
+CDN and model traffic, and every one of those crossings is visible and
+scoped. This is the sandbox: per-thread confinement, verified by tests.
+- **Headless on a server** (opt-in, for Telegram and always-on work): the
+same agent loop with a disk-backed workspace and a real shell. Real bash
+and real processes are a deliberate choice here, not a leak — they buy
+`pip`/`apt`, full-speed compute, and system tools the isolates can't host.
+The trade is explicit: treat a server workspace as semi-trusted (one
+operator), keep secrets out of it (token files live outside the
+workspace, 0600 in a 0700 dir), and know the tool layer is still scoped
+per thread with deny scans on top.
+
+What Cell is not: not a multi-tenant hostile sandbox (threads are isolated
+from each other, but memory and history search are shared by design for one
+operator — two humans on one allowlist can read each other's threads); not
+a container or kernel replacement; not a CI runner, though the moving parts
+are all tested like one.
+
+**Workspace modes.** In the UI, Agent home is the front door and the full
+IDE (editor, terminal, git, preview) sits one click away under Workspace —
+same files, both sides. On the server, the workspace is a plain directory
+(`./workspace` by default): back it up, mount it into a container, point
+several bots at several workspaces. Threads are just folders; sessions are
+just JSON.
+
+## Budgets (what caps where)
+
+No single time limit — each executor has its own ceiling:
+
+| Executor | Ceiling | What happens past it |
+|---|---|---|
+| One python/node script run | 5 min | timeout error, partial output kept |
+| One bash step | 120 s default, raisable to 10 min | exit 124, `timeoutMs` up to 600000 |
+| One background job attempt | 10 min (`CELL_TIMEOUT_MS`) | retried, 5 attempts, then `dead` |
+| One Telegram triage turn | 12 steps | run ends; bigger work belongs in a background worker |
+| Queued Telegram turns | 5 per thread | extras get 'hold that thought' — first-in, first-run |
+| One approval wait (Ask mode) | 5 min | auto-denies |
+
+Size and count caps (same everywhere): Telegram attachments 12 MB in,
+45 MB deliverables out, 3 images max into vision (4 MB each); composer
+images 25 MB staged as bytes, other files inline as text (200 KB / 12k
+chars clipped); tool results 30k chars and job logs 40k with receipts;
+100 durable memories (oldest evicted silently), 40-char skill names, 50 reminders (7 days out
+max), 40-char skill names, history search covers the 200 newest sessions
+(says so when it skips), request bodies 4 MB (413), one run per thread
+(second caller gets 409).
+
+Browser constraints that remain: network access obeys CORS (hence the git
+relay chain); ESM-with-top-level-await CLIs can't run in the CommonJS
+isolate; packages that ship machine code install but say so plainly.
+Everything else behaves like the real thing — including
 the parts an agent would probe.
 
 ## Headless agent (single box)
@@ -206,8 +256,9 @@ Agent config lives at VFS `/home/user/.cell/agent.json`, i.e. on disk at
 is seeded from env (`CELL_PROVIDER` default `meta`, `CELL_MODEL`,
 `CELL_AGENT_KEY`, `CELL_BASE_URL`, and `CELL_AGENT_LIVE_KEY` as the meta
 key); when it exists the file wins. The image also ships `python3` +
-Pillow, so the `images` skill (exact dimensions, format converts,
-byte budgets) runs the same scripts as the browser pyodide path.
+the full data stack (Pillow, numpy, pandas, scipy, matplotlib), so the
+`images` and `documents` skills run the same scripts as the browser
+pyodide path.
 Note: `pnpm server:build` compiles into `dist-server/` (gitignored) —
 build before `docker build`, and rebuild after pulling new source.
 
@@ -244,7 +295,7 @@ plus a shared `~/.cell` mount — it cannot name other threads' files.
 One run per thread at a time: a second `POST /run` for a busy thread gets
 `409 {"error":"thread busy"}`.
 
-Routes: `GET /health` (no auth, `{ok:true}` only), `POST /run`
+Routes: `GET /health` (no auth; `{ok:true, telegram:true/false}` — the flag means the poll loop is up, not that the bot token works), `POST /run`
 `{prompt, resumeId?, maxSteps?, cwd?}` (400s validated: bad JSON, empty
 prompt, bad `resumeId`/`cwd`, non-finite `maxSteps`; 410 when the resume
 target's thread workspace was deleted), `GET /jobs` (includes `busy`
@@ -337,18 +388,36 @@ memory, the same skill index — in web chat, Telegram, and headless runs.
 ### Telegram
 
 `CELL_TELEGRAM=1` starts a long-poll loop next to the server: DMs only,
-one stable thread per chat (`tg-<chatId>`), `/new` rotates it, `/status`
-shows only that thread's jobs, `/help` explains itself. The main thread
-is a triage loop (12 steps): quick answers inline, bigger work goes to
+one stable thread per chat (`tg-<chatId>`). The main thread is a triage
+loop (12 steps): quick answers inline, bigger work goes to
 `background_task` workers that report back with results + files — the
 chat stays responsive throughout, and messages arriving mid-task queue
-(positioned, in order) instead of dying busy. Photos and documents (PDFs, files,
+(positioned, max 5, in order) instead of dying busy; queued turns run
+after the current one finishes. Photos and documents (PDFs, files,
 up to 12 MB) download into the thread's `uploads/` and ride the first
 model turn — images go to the model as vision input (never stored in
 session files), documents as staged files for tools. Anything the run
 creates or updates in the thread comes back to the chat (photos for
-images, documents for the rest, newest 5, 45 MB cap each). Stickers,
-voice and video are ignored; a caption counts as the message text.
+images, documents for the rest, newest 5, 45 MB cap each — oversize
+files are named, not silently dropped). Voice notes get one human
+reply (send text instead); stickers stay silent.
+
+Commands: `/new` starts a fresh thread (queued items finish on the old
+one first — it says so), `/status` shows the live turn plus this
+thread's jobs and workers (other chats' work stays invisible),
+`/brief` writes a catch-up brief, `/reminders` lists pending
+follow-ups, `/forget <n>` cancels one, `/cancel` is honest about what
+it can't stop, `/help` explains itself. Unknown `/commands` reach the
+model as plain chat text.
+
+Single-operator assumption: every allowlisted chat shares one
+workspace, one memory, and one searchable history. That is the design
+(one continuous bot), and it means a second human on the allowlist can
+read the first human's threads via `history_search`. Keep the allowlist
+to one operator (or their own devices) unless that sharing is intended.
+There is no web→Telegram handoff: browser threads live in the tab,
+server threads live on disk — the web UI browses server threads
+read-only, and a Telegram thread continues only on Telegram.
 
 ```sh
 CELL_TELEGRAM=1 CELL_TELEGRAM_TOKEN=<botfather-token> \
