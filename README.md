@@ -316,7 +316,15 @@ memory, the same skill index — in web chat, Telegram, and headless runs.
   project records in project files, short-lived facts stay in-session.
 - `delegate` hands a self-contained sub-task to a subagent with a fresh
   context window (same tools, same thread scope, 12-step cap, one level
-  only — no grand-delegates).
+  only — no grand-delegates; subagents cannot write shared memory or
+  install skills — they report back, the parent decides).
+- `background_task` hands long work to a background worker thread and
+  keeps the chat responsive: the worker runs with the full toolset in
+  its own thread and reports back with results + deliverables when done
+  (Telegram: loud push to the chat plus a transcript note in the origin
+  thread; failures report back too, never silence). The worker sees your
+  task text plus global history/memory — paste any other context it
+  needs. Exactly-once chat delivery (no double "done" after a crash).
 - `remind` promises a follow-up (`in 20m` / `in 2h` / ISO, max 7 days
   out). One-shot and delete-on-delivery: a reminder can never nag twice.
   The server delivers due reminders back to the bound chat.
@@ -330,7 +338,11 @@ memory, the same skill index — in web chat, Telegram, and headless runs.
 
 `CELL_TELEGRAM=1` starts a long-poll loop next to the server: DMs only,
 one stable thread per chat (`tg-<chatId>`), `/new` rotates it, `/status`
-shows jobs, `/help` explains itself. Photos and documents (PDFs, files,
+shows only that thread's jobs, `/help` explains itself. The main thread
+is a triage loop (12 steps): quick answers inline, bigger work goes to
+`background_task` workers that report back with results + files — the
+chat stays responsive throughout, and messages arriving mid-task queue
+(positioned, in order) instead of dying busy. Photos and documents (PDFs, files,
 up to 12 MB) download into the thread's `uploads/` and ride the first
 model turn — images go to the model as vision input (never stored in
 session files), documents as staged files for tools. Anything the run
