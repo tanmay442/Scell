@@ -132,8 +132,12 @@ export function collectFreshFiles(
   }
   for (const path of all) {
     if (!path.startsWith(`${threadDir}/`) || path.includes('/.cell/')) continue
+    // any dot-segment hides the file, not just a dot basename: agent
+    // dotfiles/dotdirs (.config/, editor backups, staged secrets) created
+    // mid-run must never ship back to the chat as "deliverables"
+    const rel = path.slice(threadDir.length + 1)
+    if (rel.split('/').some((segment) => segment.startsWith('.'))) continue
     const name = path.split('/').pop() ?? ''
-    if (name.startsWith('.')) continue
     let stat
     try {
       stat = vfs.stat(path)
@@ -144,7 +148,7 @@ export function collectFreshFiles(
     // oversize deliverables are NAMED, never silently dropped: the caller
     // tells the chat to ask for a split
     if (stat.size > maxBytes) {
-      skippedOversize.push(name)
+      skippedOversize.push(rel)
       continue
     }
     fresh.push({ path, name, size: stat.size, mtime: stat.mtime })
@@ -491,7 +495,13 @@ export function createTurnQueue(
             } catch {
               // delivery failed; reported below
             }
-            onError(chatId, err)
+            try {
+              onError(chatId, err)
+            } catch {
+              // the error reporter must never strand the queue: a throwing
+              // onError would abort the for(;;) loop and strand everything
+              // queued behind the failed turn
+            }
           }
         }
       } finally {
@@ -672,7 +682,7 @@ export function startTelegramPoller(
             reply = await Promise.race([
               handlers.onText(chatId, text, threadId, attachments, controller.signal),
               new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error(`turn took longer than ${Math.round(turnTimeoutMs / 1000)}s — try a smaller step`)), turnTimeoutMs + 1000),
+                setTimeout(() => reject(new Error(`turn took longer than ${Math.max(1, Math.round(turnTimeoutMs / 1000))}s — try a smaller step`)), turnTimeoutMs + 1000),
               ),
             ])
           } catch (err) {

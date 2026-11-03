@@ -89,6 +89,7 @@ export function listThreads(vfs: Vfs, busyIds: string[] = []): ThreadSummary[] |
       isDir = false
     }
     if (!isDir) continue
+    // dot-dirs are invisible even if the top-level name isn't dotted
     const mapped = sessions.get(threadId) ?? null
     let title: string | null = null
     let messages = 0
@@ -147,12 +148,14 @@ export function readThread(vfs: Vfs, threadId: string, busyIds: string[] = []): 
     const scoped: Array<{ path: string; stat: { type: 'file'; size: number; mtime: number } }> = []
     const isFileStat = (stat: { type: string; size: number; mtime: number } | null): stat is { type: 'file'; size: number; mtime: number } =>
       stat !== null && stat.type === 'file'
-    // filter FIRST (dotfiles, nested .cell), then cap: filtered entries
-    // must not eat FILES_CAP slots, and nested secrets must never list
+    // filter FIRST (any dot-segment, nested .cell), then cap: filtered
+    // entries must not eat FILES_CAP slots, and nested secrets must
+    // never list — a dot-DIR hides everything under it, not just dotfiles
     for (const path of all) {
       if (path.includes('/.cell/')) continue
-      const base = path.split('/').pop() ?? ''
-      if (base.startsWith('.') || base === '') continue
+      const rel = path.slice(`${THREADS_DIR}/${threadId}/`.length)
+      const segments = rel.split('/')
+      if (segments.some((segment) => segment.startsWith('.') || segment === '')) continue
       let stat: ReturnType<Vfs['stat']>
       try {
         stat = vfs.stat(path)

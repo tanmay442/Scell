@@ -915,7 +915,9 @@ if (process.env.CELL_TELEGRAM === '1') {
           if (command.command === 'forget') {
             const n = Number.parseInt(command.arg, 10)
             const pending = listChatReminders(tgVfs, chatId)
-            const target = Number.isFinite(n) && n >= 1 && n <= pending.length ? pending[n - 1] : pending.find((r) => r.id.endsWith(command.arg))
+            // numbered path first; suffix match needs 4+ chars so a 1-char
+            // guess can't silently cancel the wrong reminder
+            const target = Number.isFinite(n) && n >= 1 && n <= pending.length ? pending[n - 1] : command.arg.trim().length >= 4 ? pending.find((r) => r.id.endsWith(command.arg.trim())) : undefined
             if (!target) return 'usage: /forget <number from /reminders> — nothing cancelled'
             const ok = deleteReminder(tgVfs, target.id)
             return ok ? `cancelled: ${target.text}` : 'that reminder is already gone'

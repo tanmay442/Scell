@@ -46,7 +46,9 @@ export async function installPureWheel(
       await pyodide.loadPackage(name)
       return
     } catch {
-      refusedInstalls.add(name)
+      // capped: unbounded growth from adversarial import storms is
+      // pointless to memoize forever; worst case is a repeat lookup
+      if (refusedInstalls.size < MAX_REFUSED) refusedInstalls.add(name)
       throw new Error(`pip: ${name} is not allowlisted for auto-install (see VENDOR_WHEELS) — ask for it to be vendored after review`)
     }
   }
@@ -120,6 +122,7 @@ export async function installWheelMembers(
  * one lookup instead of K. Vendored allowlist membership never changes
  * at runtime either — no invalidation needed. */
 const refusedInstalls = new Set<string>()
+const MAX_REFUSED = 5000
 
 export const VENDOR_WHEEL_HASHES: Record<string, string> = {
   'pypdf-6.21.4-py3-none-any.whl': '33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c',
