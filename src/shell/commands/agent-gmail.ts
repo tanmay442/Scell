@@ -31,7 +31,7 @@ export interface GmailConfig {
   notifyChatId: string | null
   /** who may receive sent mail: exact addresses or @domains */
   allowSendTo: string[]
-  /** drafts-only mode (default true): gmail_send refuses without... */
+  /** drafts-only mode (default true): gmail_send refuses unless explicitly disabled */
   draftsOnly: boolean
 }
 
@@ -86,7 +86,10 @@ export function loadGmailConfig(vfs: { read(path: string): string | null }, env:
   const config = defaultGmailConfig()
   if (raw !== null) {
     try {
-      const parsed = JSON.parse(raw) as Partial<GmailConfig>
+      const parsed = JSON.parse(raw) as Partial<GmailConfig> & { clientSecret?: unknown; refreshToken?: unknown; client_secret?: unknown; refresh_token?: unknown }
+      if (typeof parsed.clientSecret === 'string' || typeof parsed.refreshToken === 'string' || typeof parsed.client_secret === 'string' || typeof parsed.refresh_token === 'string') {
+        return { error: `gmail: secrets do not belong in ${GMAIL_CONFIG_PATH} (persisted in IndexedDB + snapshots) — use env vars or the host secrets file` }
+      }
       if (typeof parsed.enabled === 'boolean') config.enabled = parsed.enabled
       if (typeof parsed.account === 'string') config.account = parsed.account
       if (Array.isArray(parsed.watchLabelIds) && parsed.watchLabelIds.every((l) => typeof l === 'string')) {
@@ -136,8 +139,8 @@ export async function exchangeOAuthCode(
   }
   let email = ''
   try {
-    const payload = JSON.parse(BufferCompat.from(body.id_token?.split('.')[1] ?? '', 'base64').toString()) as { email?: string }
-    if (typeof payload.email === 'string') email = payload.email
+    const payload = JSON.parse(BufferCompat.from(body.id_token?.split('.')[1] ?? '', 'base64').toString()) as { email?: string; email_verified?: boolean }
+    if (typeof payload.email === 'string' && payload.email_verified !== false) email = payload.email
   } catch {
     email = ''
   }
@@ -172,7 +175,7 @@ export class GmailApi {
     })
     if (!res.ok) {
       const text = await res.text()
-      const err: Error & { invalidGrant?: boolean } = new Error(`gmail token refresh failed: HTTP ${res.status}`)
+      const err: Error & { invalidGrant?: boolean } = new Error(`gmail token refresh failed: HTTP ${res.status} (invalid_grant check: ${/invalid_grant/.test(text) ? 'invalid_grant' : 'other'})`)
       // invalid_grant = revoked/expired/rotated: caller flips the
       // connector to needs_reauth instead of retrying forever
       if (/invalid_grant/.test(text)) err.invalidGrant = true
@@ -242,6 +245,7 @@ export class GmailApi {
   }
 
   async createDraft(to: string, subject: string, bodyText: string): Promise<{ id?: string; message?: { id?: string } }> {
+    if (/[\r\n]/.test(to) || /[\r\n]/.test(subject)) throw new Error('gmail createDraft: to/subject must not contain CRLF')
     const raw = BufferCompatB64(`To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${bodyText}`)
     return this.call('POST', '/drafts', { message: { raw } })
   }
@@ -280,7 +284,7 @@ export function extractMailBody(payload: {
   const parts = Array.isArray(payload.parts) ? (payload.parts as typeof payload[]) : []
   const textPart = parts.find((p) => {
     const h = Array.isArray(p.headers) ? p.headers : []
-    return h.some((x) => x.name.toLowerCase() === 'content-type' && x.value.includes('text/plain'))
+    return h.some((x) => x.name.toLowerCase() === 'content-type' && x.value.toLowerCase().includes('text/plain'))
   })
   if (textPart) {
     const direct = decode(textPart.body?.data)
@@ -296,6 +300,28 @@ export function extractMailBody(payload: {
 export function mailHeader(payload: { headers?: Array<{ name: string; value: string }> } | undefined, name: string): string {
   const found = (payload?.headers ?? []).find((h) => h.name.toLowerCase() === name.toLowerCase())
   return found?.value ?? ''
+}
+
+/** Split a header address list into individual emails (handles Name <a@b>, comma lists). */
+export function parseEmailAddresses(header: string): string[] {
+  return header
+    .split(',')
+    .map((part) => {
+      const trimmed = part.trim().toLowerCase()
+      if (trimmed === '') return ''
+      const angled = trimmed.match(/<([^>]+)>/)?.[1]?.trim() ?? trimmed
+      return angled
+    })
+    .filter((addr) => addr !== '' && addr.includes('@'))
+}
+
+/** Every recipient across To+Cc+Bcc must be allowlisted; empty set refuses. */
+export function allRecipientsAllowed(to: string, cc: string, bcc: string, allowList: string[]): { ok: true; recipients: string[] } | { ok: false; offending: string[]; recipients: string[] } {
+  const recipients = [...parseEmailAddresses(to), ...parseEmailAddresses(cc), ...parseEmailAddresses(bcc)]
+  if (recipients.length === 0) return { ok: false, offending: ['(no recipients)'], recipients }
+  const offending = recipients.filter((addr) => !isAllowedRecipient(addr, allowList))
+  if (offending.length > 0) return { ok: false, offending, recipients }
+  return { ok: true, recipients }
 }
 
 /** Recipient allowlist: exact address or @domain suffix match. */

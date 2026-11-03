@@ -22,6 +22,10 @@ const PATTERNS: { re: RegExp; replace: string }[] = [
   { re: /AKIA[0-9A-Z]{16}/g, replace: 'AKIA…[redacted]' },
   { re: /AIza[0-9A-Za-z_-]{8,}/g, replace: 'AIza…[redacted]' },
   { re: /xai-[A-Za-z0-9_-]{8,}/g, replace: 'xai-…[redacted]' },
+  // Google OAuth client secrets + tokens (client secret, access, refresh)
+  { re: /GOCSPX-[A-Za-z0-9_-]{8,}/g, replace: 'GOCSPX-…[redacted]' },
+  { re: /ya29\.[A-Za-z0-9._-]{8,}/g, replace: 'ya29.…[redacted]' },
+  { re: /1\/\/[A-Za-z0-9._-]{8,}/g, replace: '1//…[redacted]' },
   // Telegram bot tokens (123456:AAH-…) and bot API URLs embedding them:
   // pasted tokens must never persist into transcripts/sessions
   { re: /\b\d{5,}:[A-Za-z0-9_-]{20,}/g, replace: '[redacted-telegram-token]' },

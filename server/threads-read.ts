@@ -89,6 +89,7 @@ export function listThreads(vfs: Vfs, busyIds: string[] = []): ThreadSummary[] |
       isDir = false
     }
     if (!isDir) continue
+    if (threadId.startsWith('.')) continue
     // dot-dirs are invisible even if the top-level name isn't dotted
     const mapped = sessions.get(threadId) ?? null
     let title: string | null = null
