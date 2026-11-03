@@ -412,6 +412,26 @@ export function startTelegramPoller(
     return fallback
   }
 
+  /** `typing…` expires after ~10s: re-arm it through long model turns so
+   * the chat sees the bot is still working instead of silence */
+  function startTypingHeartbeat(chatId: number): () => void {
+    let stopped = false
+    void (async () => {
+      while (!stopped) {
+        await new Promise((resolve) => setTimeout(resolve, 8000))
+        if (stopped) return
+        try {
+          await api.sendTyping(chatId)
+        } catch {
+          return
+        }
+      }
+    })()
+    return () => {
+      stopped = true
+    }
+  }
+
   async function handleUpdate(update: TelegramUpdate): Promise<void> {
     const message = update.message
     if (!message || message.chat.type !== 'private') return
@@ -428,8 +448,10 @@ export function startTelegramPoller(
     const text = (message.text ?? message.caption ?? '').trim()
     if (photo === null && document === undefined && text === '') return
     const threadId = telegramThreadFor(chatId, state.chats)
+    let stopTyping: (() => void) | null = null
     try {
       await api.sendTyping(chatId)
+      stopTyping = startTypingHeartbeat(chatId)
       const command = parseTelegramCommand(text)
       let reply: string | null = null
       if (command !== null && command.command === 'new') {
@@ -463,11 +485,13 @@ export function startTelegramPoller(
         }
         reply = reply ?? (await handlers.onText(chatId, text, threadId, attachments))
       }
+      stopTyping?.()
       if (reply !== null) {
         await api.sendMessage(chatId, reply)
         handledCount++
       }
     } catch (err) {
+      stopTyping?.()
       try {
         await api.sendMessage(chatId, `error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 1000))
       } catch {
