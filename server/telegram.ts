@@ -364,6 +364,16 @@ export interface TurnQueue {
   submit(chatId: number, threadId: string, text: string, attachments: TelegramAttachmentIn[]): Promise<string>
 }
 
+/** Internal race signal: the router was free at check time but busy at
+ * run time. A typed error (never a string match) so agent/tool error text
+ * can never be confused with it. Retries are capped — see the drain loop. */
+export class QueueRaceError extends Error {
+  constructor() {
+    super('queue race: holder slipped in')
+    this.name = 'QueueRaceError'
+  }
+}
+
 export function createTurnQueue(
   runTurn: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[], fromQueue: boolean) => Promise<string>,
   send: (chatId: number, text: string) => Promise<void>,
@@ -371,7 +381,7 @@ export function createTurnQueue(
   onError: (chatId: number, err: unknown) => void,
   maxQueued = 5,
 ): TurnQueue {
-  const pending = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[] }>>()
+  const pending = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[]; __races?: number }>>()
   const draining = new Set<string>()
   return {
     async submit(chatId, threadId, text, attachments) {
@@ -400,17 +410,24 @@ export function createTurnQueue(
           const next = pending.get(threadId)?.shift()
           if (next === undefined) break
           if (pending.get(threadId)?.length === 0) pending.delete(threadId)
+          // retries for the router race: a holder that never frees must
+          // not spin forever — dead-letter through onError after the cap
+          let races = (next as { __races?: number }).__races ?? 0
           try {
             const reply = await runTurn(chatId, next.text, threadId, next.attachments, true)
             await send(chatId, reply)
           } catch (err) {
             // router race: holder slipped in between the isBusy check and
             // the run — back to the front, no user-visible error
-            if (err instanceof Error && err.message === '__QUEUE_RETRY__') {
-              const queue = pending.get(threadId) ?? []
-              queue.unshift(next)
-              pending.set(threadId, queue)
-              continue
+            if (err instanceof QueueRaceError) {
+              races++
+              if (races <= 3) {
+                const queue = pending.get(threadId) ?? []
+                queue.unshift({ ...next, __races: races })
+                pending.set(threadId, queue)
+                continue
+              }
+              // fall through: cap hit, report loudly like any other error
             }
             try {
               await send(chatId, `error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 1000))

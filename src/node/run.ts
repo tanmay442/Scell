@@ -124,6 +124,9 @@ export function runNodeProcess(vfs: Vfs, options: NodeRunOptions): Promise<NodeR
   return new Promise<NodeRunResult>((resolve) => {
     const payload = buildRunPayload(vfs, options.hidePaths ?? [], options.filesOverride ?? {})
 
+    // ISOLATE-GATE: worker-loader — same story as python-cmd.ts: nested
+    // Worker for browser/node; on Cloudflare Workers run runtime-worker.ts
+    // in-isolate (DO tenants are already isolated). See docs/ISOLATE_SEAM.md.
     let worker: Worker
     try {
       worker = new Worker(new URL('./runtime-worker.ts', import.meta.url), { type: 'module' })

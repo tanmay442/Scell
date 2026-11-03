@@ -77,6 +77,30 @@ export interface ImageAttachment {
   base64: string
 }
 
+/** Merge consecutive user-role messages (Anthropic rejects repeats with
+ * 400). Delivery mirrors and resume appends stack them; the wire must not
+ * depend on upstream turn hygiene. Exported for tests. */
+export function coalesceAnthropicUsers(
+  messages: Array<{ role: 'user' | 'assistant'; content: unknown }>,
+): Array<{ role: 'user' | 'assistant'; content: unknown }> {
+  const toBlocks = (content: unknown): Array<Record<string, unknown>> => {
+    if (typeof content === 'string') return [{ type: 'text', text: content }]
+    if (Array.isArray(content)) return content as Array<Record<string, unknown>>
+    return [{ type: 'text', text: String(content ?? '') }]
+  }
+  const out: Array<{ role: 'user' | 'assistant'; content: unknown }> = []
+  for (const message of messages) {
+    const tail = out[out.length - 1]
+    if (message.role === 'user' && tail !== undefined && tail.role === 'user') {
+      const blocks = [...toBlocks(tail.content), ...toBlocks(message.content)]
+      tail.content = blocks.length === 1 && blocks[0]['type'] === 'text' ? String(blocks[0]['text'] ?? '') : blocks
+      continue
+    }
+    out.push({ role: message.role, content: message.content })
+  }
+  return out
+}
+
 export function newProviderState(prompt: string, images: ImageAttachment[] = []): ProviderState {
   const anthropicContent: unknown =
     images.length === 0

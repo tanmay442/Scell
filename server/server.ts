@@ -10,7 +10,7 @@ import { loadTokens } from './auth'
 import { createRateLimiter } from './ratelimit'
 import { withGateway, type GatewayContext } from './gateway'
 import { cancelJob, listJobs, markNotified, scheduleJob } from './jobs'
-import { collectFreshFiles, createTelegramApi, createTurnQueue, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramApi, type TelegramAttachmentIn } from './telegram'
+import { collectFreshFiles, createTelegramApi, createTurnQueue, deliverDueReminders, loadTelegramConfig, QueueRaceError, startTelegramPoller, type TelegramApi, type TelegramAttachmentIn } from './telegram'
 import { dueReminders } from '../src/shell/commands/agent-reminders'
 import { listThreads, readThread } from './threads-read'
 import type { Vfs } from '../src/vfs/types'
@@ -830,7 +830,7 @@ if (process.env.CELL_TELEGRAM === '1') {
         // raise the retry marker so the queue puts the message back at the
         // front instead of dropping it; live turns just report busy
         if (outcome.status === 'busy') {
-          if (fromQueue) throw new Error('__QUEUE_RETRY__')
+          if (fromQueue) throw new QueueRaceError()
           return 'still working on the last one — one moment'
         }
         if (outcome.status === 'timeout') return 'that took too long — try a smaller step'

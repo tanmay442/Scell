@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "check:isolate": "bash scripts/check-isolate-pure.sh",
     "test": "vitest run",
     "e2e": "node scripts/e2e.mjs",
     "e2e:gdg": "node scripts/e2e-gdg.mjs",
