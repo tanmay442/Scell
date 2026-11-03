@@ -860,3 +860,52 @@ describe('installPureWheel hardening', () => {
     }
   }, 300_000)
 })
+
+describe('installPureWheel local shadowing', () => {
+  it('a nested sub/easy.py does not shadow a top-level import', async () => {
+    const vfs = freshVfs()
+    vfs.write('/home/user/sub/easy.py', 'X = 1\n')
+    const { statuses, result } = await runIn(vfs, 'import easy')
+    expect(result.exitCode).toBe(1)
+    expect(statuses.join('\n')).toMatch(/not allowlisted/)
+  })
+
+  it('a cwd-level easy.py suppresses the install and imports', async () => {
+    const vfs = freshVfs()
+    vfs.write('/home/user/easy.py', 'X = 42\n')
+    const { result, stdout, statuses } = await runIn(vfs, 'import easy\nprint(easy.X)')
+    expect(result.exitCode).toBe(0)
+    expect(stdout).toContain('42')
+    expect(statuses.join('\n')).not.toMatch(/pip installing easy/)
+  })
+})
+
+describe('installPureWheel over local HTTP (production path shape)', () => {
+  it('fetches, hash-verifies, member-gates and imports through a real URL', async () => {
+    const { installPureWheel } = await import('./runner')
+    const { loadPyodide } = await import('pyodide')
+    const { createServer } = await import('node:http')
+    const { readFile } = await import('node:fs/promises')
+    const server = createServer(async (req, res) => {
+      if (req.url === '/vendor/wheels/pypdf-6.21.4-py3-none-any.whl') {
+        const bytes = await readFile(new URL('../../public/vendor/wheels/pypdf-6.21.4-py3-none-any.whl', import.meta.url))
+        res.writeHead(200, { 'content-type': 'application/octet-stream' })
+        res.end(bytes)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+    try {
+      const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+      const statuses: string[] = []
+      await installPureWheel(py, 'pypdf', (t) => statuses.push(t), `http://127.0.0.1:${port}/vendor/wheels`)
+      const probe = await py.runPythonAsync('from pypdf import PdfReader\nPdfReader.__module__')
+      expect(String(probe)).toBe('pypdf._reader')
+    } finally {
+      server.close()
+    }
+  }, 300_000)
+})

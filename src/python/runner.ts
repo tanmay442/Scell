@@ -28,6 +28,7 @@ export async function installPureWheel(
   pyodide: { loadPackage(p: string): Promise<unknown>; runPythonAsync(code: string): Promise<unknown>; FS: { mkdirTree(p: string): void; writeFile(p: string, data: Uint8Array): void } },
   name: string,
   onStatus?: (text: string) => void,
+  wheelBaseUrl = '/vendor/wheels',
 ): Promise<void> {
   const wheel = VENDOR_WHEELS[name]
   if (wheel === undefined) {
@@ -43,20 +44,13 @@ export async function installPureWheel(
   }
   // vendor path: same-origin fetch, then hash-verify BEFORE touching
   // the bytes — a poisoned wheel is silent code execution otherwise.
-  // Allowlisted names may fall back to micropip PyPI when the vendor
-  // fetch fails (node tests have no same-origin server; the names are
-  // reviewed, so no typosquat risk — unreviewed names never get here).
-  let bytes: Uint8Array
-  try {
-    const res = await fetch(`/vendor/wheels/${wheel}`)
-    if (!res.ok) throw new Error(`vendored wheel HTTP ${res.status}`)
-    bytes = new Uint8Array(await res.arrayBuffer())
-  } catch (err) {
-    onStatus?.(`vendor wheel unavailable (${err instanceof Error ? err.message : String(err)}), trying PyPI…`)
-    await pyodide.loadPackage('micropip')
-    await pyodide.runPythonAsync(`import micropip\nawait micropip.install(${JSON.stringify(name)})`)
-    return
-  }
+  // No PyPI fallback, ever: allowlisted names install from pinned bytes
+  // or fail loudly (fail-closed beats fail-online for reviewed code).
+  // wheelBaseUrl exists for tests, which serve public/vendor over a
+  // local HTTP server — production always uses same-origin /vendor.
+  const res = await fetch(`${wheelBaseUrl}/${wheel}`)
+  if (!res.ok) throw new Error(`vendored wheel HTTP ${res.status} for ${wheel} — run scripts/vendor-public.mjs`)
+  const bytes = new Uint8Array(await res.arrayBuffer())
   const digest = await crypto.subtle.digest('SHA-256', bytes as unknown as ArrayBuffer)
   const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
   if (VENDOR_WHEEL_HASHES[wheel] === undefined || hex !== VENDOR_WHEEL_HASHES[wheel]) {
