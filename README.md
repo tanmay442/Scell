@@ -1,11 +1,12 @@
 # Cell
 
 A complete development environment that lives entirely inside one browser tab.
-Filesystem, bash shell, TypeScript compiler, node runtime, npm, git, a live
-app preview and an AI agent harness — all running on V8 (WebAssembly where it
-counts). **No server, no container, no kernel, no backend compute.** Clone a
-repo, install, edit with live typechecking, run, test, commit, push, preview
-the running app, snapshot the workspace — everything persists in the browser.
+Filesystem, bash shell, TypeScript compiler, node runtime, Python data stack,
+npm, git, a live app preview and an AI agent harness — all running on V8
+(WebAssembly where it counts). **No server, no container, no kernel, no
+backend compute.** Clone a repo, install, edit with live typechecking, run,
+test, commit, push, convert images, preview the running app, snapshot the
+workspace — everything persists in the browser.
 
 ```
 pnpm install
@@ -35,7 +36,7 @@ both surfaces.
 |---|---|---|
 | Filesystem | In-memory VFS, text + binary files, full user home (`~`), dotfiles, volatile `/tmp` | unit + e2e |
 | Persistence | Incremental IndexedDB saves (node_modules included), single-pass load, `navigator.storage.persist()`, flush on tab-hide; agent sessions persist after **every step** with a live-run flag, so a closed/crashed tab reopens threads with history intact and an "interrupted — send a message to continue" note; composer drafts and UI state (mode, editor tabs) survive reload too | e2e: deps survive reload; restart + mid-run kill verified |
-| bash | just-bash + session env, `~/.bashrc` sourced every command, shebang scripts, heredocs, pipes, subshells, `[[ ]]`, `set -e`, tar/gzip, sqlite3 | `bash-audit.test.ts` (17 assertions) |
+| bash | just-bash + session env, `~/.bashrc` sourced every command, shebang scripts, heredocs, pipes, subshells, `[[ ]]`, `set -e`, tar/gzip, sqlite3, `curl` (browser fetch, CORS applies) | `bash-audit.test.ts` (17 assertions) |
 | System identity | `uname`, `id`, `df`, `free`, `ps`, `uptime`, `hostname`, `which`, `man`, `less`, `/etc/os-release`, `/proc/*` | `bash-audit.test.ts` |
 | node | Fresh V8 worker per run, CommonJS resolver with walk-up, circular imports, shebangs, shell env → `process.env`, write-back to the VFS, 5 min ceiling | `worker-exec.test.ts` + e2e |
 | TypeScript | ts-rust (Rust port of TS 7) in WASM: live editor diagnostics, `tsc` CLI, TS runs directly on `node` | e2e |
@@ -43,7 +44,9 @@ both surfaces.
 | git | Real libgit2 1.9.4 (wasm-git). `.git` is a visible directory; clone/fetch/push over https — CORS-blocked hosts (github) go through a relay chain automatically; `pull` = fetch+merge | e2e: clone from a real git server + github through the relay |
 | App preview | `cell preview`: esbuild-wasm bundles the module graph in-page (exports maps, subpaths, tsx, images), Tailwind compiled live by the oxide runtime, `public/` served at root, Vercel-style `api/*.js` executed per request in the isolate, hot reload | browser e2e benchmarks (style + asset truth probes) |
 | Object storage | `cell save/list/load/status` — whole-workspace tar.gz to any S3-compatible endpoint, SigV4 on WebCrypto (verified against botocore) | `cell-cmd.test.ts` |
-| AI agent | Agent home (front door) + `cell agent "task"` in the terminal — Meta/Anthropic/OpenAI/OpenAI-compatible tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill`/`job_start`/`job_poll`/`job_list` + custom `~/.cell/tools/*.json`, skills with progressive disclosure, slash commands, persisted sessions (model-generated titles, pin/lock/archive/fork), resumable chat with restored history, HTML visuals rendered in-thread, per-tool approval in Ask mode (default: full permission), background jobs, secret redaction, SSE streaming, abort + auto-compaction | `agent*.test.ts` |
+| Python | Pyodide CPython 3.12 in a worker (numpy, pandas, scipy, matplotlib and Pillow wheels vendored — no downloads), `python3` CLI, argv/cwd/stdin semantics, `matplotlib` PNGs, write-back to the VFS | `python.test.ts` (incl. Pillow convert/resize/verify) |
+| Images | Drop any photo on the composer (staged into the thread workspace, 25 MB cap) or point at a workspace file, then ask: exact-dimension resize (LANCZOS), JPEG/PNG/WebP converts, quality byte-budget loops, EXIF normalize/strip — driven by the built-in `images` skill (Pillow), outputs verified by reopening and linked inline as previewable file chips | `python.test.ts` + live browser/server runs |
+| AI agent | Agent home (front door) + `cell agent "task" [--steps N] [--resume <id>]` in the terminal — Meta/Anthropic/OpenAI/OpenAI-compatible tool loop over `bash`/`read`/`edit`/`write`/`ls`/`load_skill`/`job_start`/`job_poll`/`job_list` + custom `~/.cell/tools/*.json`, skills with progressive disclosure (`commit`, `preview`, `debug-tsc`, `images`; project overrides win), slash commands (`/commit`, `/preview`, custom), persisted sessions (model-generated titles, pin/lock/archive/fork/share), resumable chat with restored history, per-thread workspaces that keep running in the background, HTML visuals rendered in-thread, attached-file staging, per-tool approval in Ask mode (default: full permission), background jobs, secret redaction, SSE streaming, abort + auto-compaction | `agent*.test.ts` |
 
 ## Architecture
 
@@ -79,6 +82,11 @@ How the pieces talk:
 - **`node app.ts`** → (ts-rust emit if TS) → the workspace snapshot is
   transferred as one zero-copy buffer → the worker runs CJS with a shared
   `require.cache` → output coalesced back → only touched files write back.
+- **`python3 script.py`** → same worker pattern through Pyodide: imports
+  resolve from vendored wheels (Pillow/matplotlib/numpy/pandas, offline),
+  anything else pure-python comes via micropip; written files land back in
+  the VFS (text and binary), so `Image.save(...)` output is immediately
+  readable, previewable, and committable.
 - **`git commit`** → VFS ⇄ libgit2 MEMFS two-way sync (binary-safe) → lg2
   runs → sync back → the GitPanel re-discovers repos by scanning for `.git`.
 - **`cell preview`** → bundle → document → CacheStorage → service worker
@@ -103,10 +111,16 @@ src/
   shell/          just-bash integration, session env, system commands
     commands/     node npm git tsc cell agent curl + registry/installer/untar
   node/           the V8 isolate runtime (payload, worker, resolver, transform)
+  python/         Pyodide runner (payload, worker, micropip fallback)
   lang/           ts-rust language service (worker) + diagnostics mapping
   preview/        esbuild bundler, document builder, SW, api runner
   terminal/ ui/   the IDE (xterm, CodeMirror, panels)
+server/           headless agent: disk VFS, real-bash shell, run-once CLI,
+                  HTTP+SSE server, gateway (auth/limits/usage), per-thread
+                  router, boot resume, job ticker, snapshot store, bindings
+Dockerfile.agent  node:22-slim + fflate/semver + python3-pil; CMD = server
 scripts/
+  agent-run.sh / agent-server.sh   one-shot and server containers
   e2e.mjs              main e2e over headless Chrome (raw CDP, no deps)
   e2e-gdg.mjs          benchmark: clone/build/preview the gdg-hbtu site
   e2e-scribe.mjs       repro: clone/build/preview the scribe site
@@ -158,20 +172,25 @@ plus the live registry and github (internet required).
 | `~/.cell/agent.json` | `{ "provider": "meta" \| "anthropic" \| "openai" \| "compat", "model": "…", "apiKey": "…", "baseURL": "…" (compat), "permission": "full" \| "ask" (default full), "thinking": "minimal".."xhigh" (meta reasoning effort) }` — seeded with meta defaults; in the browser the key must be in this file or the Agent panel (there is no host auth file in a tab); under Node/vitest meta also resolves `~/.pi/agent/auth.json` |
 | `~/.cell/env.json` | env vars for node processes and api functions (`{"GOOGLE_API_KEY": "…"}`) |
 | `~/.cell/tools/*.json` | custom agent tools: `{ "name", "description", "parameters", "run": { "kind": "bash", "command": "… {{arg}} …" } }` |
-| `~/.cell/skills/<name>/SKILL.md` | agent skills (frontmatter `name`+`description`, markdown body); project override at `<project>/.cell/skills/` |
+| `~/.cell/skills/<name>/SKILL.md` | agent skills (frontmatter `name`+`description`, markdown body); project override at `<project>/.cell/skills/`; builtins seeded automatically: `commit`, `preview`, `debug-tsc`, `images` (Pillow recipes) |
 | `~/.cell/commands/*.md` | agent slash commands (`/commit`, `/preview` seeds) |
 | `~/.cell/sessions/*.json` | agent sessions: transcript + resumable history + sidebar metadata (`title` model-generated, `pinned`, `archived`, `locked`); resume via the sidebar or `cell agent --resume <id>` |
+| `~/.cell/job-queue.json` | durable agent job table (`continue`/`snapshot`, 5-attempt cap then visible `dead`) — server ticker fires due jobs; terminal jobs live in-process |
+| `~/.cell/usage/` | server JSONL usage log (auto-rotates at ~10 MB) |
 | `~/.cell/storage.json` | S3-compatible endpoint for `cell save/load` snapshots |
 | `~/.gitconfig` `[cell] corsproxy` | custom git CORS relay list (`off` disables) |
 
 ## Honest limits
 
 Browsers are the physics: no `child_process`, no native binaries (packages
-that ship machine code — e.g. vercel, opencode — install but say so plainly),
+that ship machine code — e.g. vercel, opencode — install but say so plainly;
+the server image instead ships `python3-pil` via apt for the `images` skill),
 no SSH remotes, no listening servers (preview + api functions replace them),
 ESM-with-top-level-await CLIs can't run in the CommonJS isolate, and network
 access obeys CORS (hence the git relay chain). Long-running processes cap at
-5 minutes per run. Everything else behaves like the real thing — including
+5 minutes per run. Composer attachments: images stage as bytes (25 MB max)
+into the thread workspace; other files inline as text (200 KB / 12k chars
+clipped). Everything else behaves like the real thing — including
 the parts an agent would probe.
 
 ## Headless agent (single box)
@@ -186,7 +205,11 @@ Agent config lives at VFS `/home/user/.cell/agent.json`, i.e. on disk at
 `$CELL_WORKSPACE/home/user/.cell/agent.json`. When that file is missing it
 is seeded from env (`CELL_PROVIDER` default `meta`, `CELL_MODEL`,
 `CELL_AGENT_KEY`, `CELL_BASE_URL`, and `CELL_AGENT_LIVE_KEY` as the meta
-key); when it exists the file wins.
+key); when it exists the file wins. The image also ships `python3` +
+Pillow, so the `images` skill (exact dimensions, format converts,
+byte budgets) runs the same scripts as the browser pyodide path.
+Note: `pnpm server:build` compiles into `dist-server/` (gitignored) —
+build before `docker build`, and rebuild after pulling new source.
 
 Quick start:
 
@@ -208,8 +231,13 @@ Agent runs stream as SSE `data:` lines (one JSON object per line):
 
 ```
 data: {"type":"progress","line":"…"}
-data: {"type":"done","exitCode":0,"stdout":"…","stderr":""}
+data: {"type":"done","exitCode":0,"stdout":"…","stderr":"","sessionId":"…","threadId":"…"}
 ```
+
+The `done` event always arrives — even when the model transport throws
+(`exitCode: 1` + error text, no silent hang). Hitting the step budget is
+exit code 2 everywhere (terminal, SSE, usage rows, job retries):
+unfinished work is never reported as success.
 
 Every run is confined to its own thread dir (`/home/user/threads/<id>`)
 plus a shared `~/.cell` mount — it cannot name other threads' files.
@@ -217,12 +245,27 @@ One run per thread at a time: a second `POST /run` for a busy thread gets
 `409 {"error":"thread busy"}`.
 
 Routes: `GET /health` (no auth, `{ok:true}` only), `POST /run`
-`{prompt, resumeId?, maxSteps?, cwd?}`, `GET /jobs`, `POST /jobs`
-`{threadId, prompt, runAt, kind: 'continue'|'snapshot'}`, `DELETE /jobs/:id`.
+`{prompt, resumeId?, maxSteps?, cwd?}` (400s validated: bad JSON, empty
+prompt, bad `resumeId`/`cwd`, non-finite `maxSteps`; 410 when the resume
+target's thread workspace was deleted), `GET /jobs` (includes `busy`
+threads), `POST /jobs` (`threadId` must be a bare stem, `runAt` finite
+epoch ms, `kind` strictly `'continue'`/`'snapshot'`), `DELETE /jobs/:id`.
 Interrupted runs (server died mid-run) are requeued as `continue` jobs on
 boot and picked up by the ticker — the server resumes work by itself.
 One-shot runs can `--pull <name>` a snapshot before starting and
-`--push <name>` after finishing (slim tar, skips when unchanged).
+`--push <name>` after finishing (slim tar, skips when unchanged; request
+bodies over 4 MB get 413).
+
+Snapshots are per-thread by default on the server: a snapshot named for
+a thread covers that thread's dir plus its session records — restoring
+never touches sibling threads. Pull validates members (no absolute paths,
+no `..`, no symlinks,
+hardlinks, FIFOs, sockets, or devices), verifies tar bytes against the
+manifest hash, extracts to a scratch dir inside the workspace, and only
+then swaps the result in — a corrupt tar cannot destroy live state.
+Slim snapshots skip `node_modules`, `.git`, `.cache`, and `.cell/usage`.
+One caveat: non-regular files (symlinks, FIFOs) are skipped on push
+with no warning — snapshots preserve regular files and directories only.
 
 | Env var | Purpose | Default |
 |---|---|---|
@@ -244,14 +287,21 @@ One-shot runs can `--pull <name>` a snapshot before starting and
 
 Limits: auth is a shared bearer token, not user accounts — localhost or a
 private network. One box, no autoscaling — run one container per workspace
-(enforced by a fencing lock; a second server on the same workspace stands
-the first one down instead of double-running jobs). Bash is not chrooted:
-the hard boundary is the VFS scope plus the existing deny-pattern scans;
-treat runs as semi-trusted code, not hostile tenants. Rate-limit budget
-covers every authed request including 409s (backpressure by design); usage
-rows record real `steps`/`exitCode` (`-1` only when the run never started).
-Jobs that exhaust 5 attempts flip to `dead` and stop being due — visible on
-`GET /jobs`, never silently dropped.
+(enforced by a fencing-token lockfile: a second boot waits up to 60 s for
+the holder's heartbeat to go stale, takes over a dead holder, and refuses
+while a live holder keeps beating; the deposed holder exits instead of
+split-braining). Bash is not chrooted: the hard boundary is the VFS scope
+plus the existing deny-pattern scans (agent shells also inherit only a
+minimal env allowlist — no `CELL_*` keys or cloud credentials — and
+timeouts SIGKILL the whole process tree, including `setsid` escapees).
+Shell cwds are canonicalized, so a symlinked cwd outside the workspace is
+refused instead of executed. Treat runs as semi-trusted code, not hostile
+tenants. Rate-limit budget covers every authed request including 409s
+(backpressure by design); usage rows record real `steps`/`exitCode` — every
+rejection reports its HTTP code, so `-1` only means an internal error before
+the run started. Jobs that exhaust 5 attempts flip to
+`dead` and stop being due — visible on `GET /jobs`, never silently
+dropped (terminal history is pruned to the newest 200 rows).
 
 ## Docs
 

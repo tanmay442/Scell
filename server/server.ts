@@ -185,10 +185,14 @@ async function readBody(req: IncomingMessage, ctx?: GatewayContext): Promise<str
 }
 
 async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: GatewayContext): Promise<void> {
+  // usage rows for rejected requests carry the HTTP code (steps: 0);
+  // -1/-1 means the run started but never reported back
+  const reportHttp = (code: number) => ctx.report({ steps: 0, exitCode: code })
   let raw: string
   try {
     raw = await readBody(req, ctx)
   } catch {
+    reportHttp(400)
     sendJson(res, 400, { error: 'body too large' })
     log('POST', '/run', 400)
     return
@@ -197,31 +201,35 @@ async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: Gateway
   try {
     body = JSON.parse(raw === '' ? 'null' : raw) as typeof body
   } catch {
+    reportHttp(400)
     sendJson(res, 400, { error: 'invalid JSON' })
     log('POST', '/run', 400)
     return
   }
   if (body === null || typeof body !== 'object' || typeof body.prompt !== 'string' || body.prompt.trim() === '') {
+    reportHttp(400)
     sendJson(res, 400, { error: 'missing prompt: send JSON {"prompt": "..."}' })
     log('POST', '/run', 400)
     return
   }
   if (body.resumeId !== undefined && typeof body.resumeId !== 'string') {
+    reportHttp(400)
     sendJson(res, 400, { error: 'resumeId must be a string' })
     log('POST', '/run', 400)
     return
   }
   if (body.maxSteps !== undefined && (typeof body.maxSteps !== 'number' || !(body.maxSteps > 0))) {
+    reportHttp(400)
     sendJson(res, 400, { error: 'maxSteps must be a positive number' })
     log('POST', '/run', 400)
     return
   }
   if (body.cwd !== undefined && typeof body.cwd !== 'string') {
+    reportHttp(400)
     sendJson(res, 400, { error: 'cwd must be a string' })
     log('POST', '/run', 400)
     return
   }
-  const reportHttp = (code: number) => ctx.report({ steps: 0, exitCode: code })
 
   // each run gets its own capabilities: the resume target's thread dir,
   // or a fresh thread dir for a new session (see server/bindings.ts).
