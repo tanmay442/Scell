@@ -73,6 +73,9 @@ const outcome = await router.runExclusive(threadId, async () => {
   log('POST', '/run', result.exitCode)
 })
 if (outcome.status === 'busy') {
+  // (a 409 path here; a `{status:'timeout'}` arm exists too when runExclusive
+  // is called with `{timeoutMs}` — map it to 504 and let the abort unwind
+  // the run; the slot is freed even if the orphan settles later)
   sendJson(res, 409, { error: 'thread busy' })
   log('POST', '/run', 409)
   return

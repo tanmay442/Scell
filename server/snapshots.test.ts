@@ -166,3 +166,82 @@ describeIfTar('snapshots', () => {
     }
   })
 })
+
+describeIfTar('snapshot integrity (adversarial)', () => {
+  it('rejects archives containing symlinks, even to in-workspace targets', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'snap-evil-'))
+    try {
+      const vfs = createDiskVfs(root)
+      vfs.mkdir('/home/user/threads/t')
+      vfs.write('/home/user/threads/t/real.txt', 'real')
+      const { symlinkSync } = await import('node:fs')
+      symlinkSync(join(root, 'home', 'user', 'threads', 't', 'real.txt'), join(root, 'home', 'user', 'threads', 't', 'evillink'))
+      const store = LocalDirStore(mkdtempSync(join(tmpdir(), 'snap-store-')))
+      await pushSnapshot(root, store, 'evil')
+      const fresh = mkdtempSync(join(tmpdir(), 'snap-fresh-'))
+      try {
+        await expect(pullSnapshot(fresh, store, 'evil')).rejects.toThrow(/symlink/)
+      } finally {
+        rmSync(fresh, { recursive: true, force: true })
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to restore when tar bytes do not match the manifest', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'snap-mismatch-'))
+    try {
+      const vfs = createDiskVfs(root)
+      vfs.write('/a.txt', 'VERSION-ONE')
+      const store = LocalDirStore(mkdtempSync(join(tmpdir(), 'snap-store-')))
+      await pushSnapshot(root, store, 'v')
+      // swap: push v2 content, then rewind the manifest to the v1 bytes
+      const manifestKey = 'v.manifest.json'
+      const oldManifest = await store.get(manifestKey)
+      vfs.write('/a.txt', 'VERSION-TWO-ATTACKER')
+      await pushSnapshot(root, store, 'v')
+      if (oldManifest !== null) await store.put(manifestKey, oldManifest)
+      const fresh = mkdtempSync(join(tmpdir(), 'snap-fresh-'))
+      try {
+        await expect(pullSnapshot(fresh, store, 'v')).rejects.toThrow(/do not match/)
+      } finally {
+        rmSync(fresh, { recursive: true, force: true })
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('throws (instead of fresh) when the tar exists without a manifest', async () => {
+    const store = LocalDirStore(mkdtempSync(join(tmpdir(), 'snap-store-')))
+    try {
+      await store.put('orphan.tar', new Uint8Array([1, 2, 3]))
+      const fresh = mkdtempSync(join(tmpdir(), 'snap-fresh-'))
+      try {
+        await expect(pullSnapshot(fresh, store, 'orphan')).rejects.toThrow(/corrupt/)
+      } finally {
+        rmSync(fresh, { recursive: true, force: true })
+      }
+    } finally {
+      // store dir cleanup best-effort
+    }
+  })
+
+  it('leaves existing workspace files alone when the tar is corrupt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'snap-keep-'))
+    try {
+      const vfs = createDiskVfs(root)
+      vfs.write('/precious.txt', 'keep me')
+      const store = LocalDirStore(mkdtempSync(join(tmpdir(), 'snap-store-')))
+      await pushSnapshot(root, store, 'good')
+      // corrupt the stored tar behind a valid manifest
+      const fixedBytes = new TextEncoder().encode('not a tar at all')
+      await store.put('good.tar', fixedBytes)
+      await expect(pullSnapshot(root, store, 'good')).rejects.toThrow()
+      expect(vfs.read('/precious.txt')).toBe('keep me')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})

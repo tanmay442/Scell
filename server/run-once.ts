@@ -1,6 +1,7 @@
 import { runAgent } from '../src/shell/commands/agent'
 import { sessionId } from '../src/shell/commands/agent-sessions'
-import { buildRunContext, noteThreadId, resolveCwd, resolveThreadForResume } from './bindings'
+import { buildRunContext, noteThreadId, resolveCwd, resolveThreadForResume, threadVfsPath } from './bindings'
+import { createDiskVfs } from './disk-vfs'
 import { LocalDirStore, S3StoreFromEnv, defaultSnapshotsDir, pullSnapshot, pushSnapshot, type SnapshotStore } from './snapshots'
 
 interface RunOnceOptions {
@@ -71,6 +72,10 @@ async function main(): Promise<void> {
   // the thread id is the resume target for --resume, else a fresh session
   // id; the run is then confined to that thread dir (see bindings.ts)
   const threadId = opts.resumeId !== null ? resolveThreadForResume(opts.workspace, opts.resumeId) : sessionId()
+  if (opts.resumeId !== null && !createDiskVfs(opts.workspace).isDir(threadVfsPath(threadId))) {
+    process.stderr.write(`cell run-once: thread workspace ${threadVfsPath(threadId)} is gone (deleted after the session ran) — nothing to resume\n`)
+    process.exit(2)
+  }
   const ctx = buildRunContext(opts.workspace, threadId)
   const cwd = resolveCwd(ctx.cwd, opts.cwd)
   const controller = new AbortController()

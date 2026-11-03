@@ -1,7 +1,8 @@
 import type { Vfs } from '../src/vfs/types'
+import { isValidThreadId } from './bindings'
 
 export type JobKind = 'continue' | 'snapshot'
-export type JobStatus = 'pending' | 'done' | 'cancelled'
+export type JobStatus = 'pending' | 'done' | 'cancelled' | 'dead'
 
 export interface JobSpec {
   id: string
@@ -36,7 +37,7 @@ function normalizeJob(value: unknown): JobSpec | null {
   if (typeof value.runAt !== 'number' || Number.isNaN(value.runAt)) return null
   const kind: JobKind = value.kind === 'snapshot' ? 'snapshot' : 'continue'
   const status: JobStatus =
-    value.status === 'done' || value.status === 'cancelled' ? value.status : 'pending'
+    value.status === 'done' || value.status === 'cancelled' || value.status === 'dead' ? value.status : 'pending'
   const createdAt = typeof value.createdAt === 'number' ? value.createdAt : 0
   const attempts =
     typeof value.attempts === 'number' && value.attempts >= 0 ? Math.floor(value.attempts) : 0
@@ -77,6 +78,15 @@ export function scheduleJob(
   vfs: Vfs,
   spec: Omit<JobSpec, 'id' | 'createdAt' | 'status'> & { id?: string },
 ): JobSpec {
+  if (typeof spec.threadId !== 'string' || !isValidThreadId(spec.threadId)) {
+    throw new Error(`refused: threadId must be a bare session/thread stem, got '${String(spec.threadId)}'`)
+  }
+  if (typeof spec.runAt !== 'number' || !Number.isFinite(spec.runAt) || spec.runAt <= 0) {
+    throw new Error('refused: runAt must be finite epoch ms')
+  }
+  if (spec.kind !== 'continue' && spec.kind !== 'snapshot') {
+    throw new Error(`refused: unknown job kind '${String(spec.kind)}'`)
+  }
   try {
     const jobs = readJobs(vfs)
     const now = Date.now()
@@ -147,8 +157,13 @@ export function noteAttempt(vfs: Vfs, id: string): void {
   try {
     const jobs = readJobs(vfs)
     const job = jobs.find((entry) => entry.id === id)
-    if (!job) return
+    if (!job || job.status !== 'pending') return
     job.attempts = (job.attempts ?? 0) + 1
+    // attempts are capped, not silent: at the cap the job flips to `dead`
+    // so GET /jobs shows a row that will never run instead of a healthy
+    // looking `pending` job. Dead jobs are terminal (cancel/complete ignore
+    // them) — reschedule explicitly if the work still matters.
+    if (job.attempts >= MAX_ATTEMPTS) job.status = 'dead'
     writeJobs(vfs, jobs)
   } catch {
     // corrupt/missing file: nothing to record; stay silent

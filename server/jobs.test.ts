@@ -70,7 +70,7 @@ describe('jobs', () => {
     expect(dueJobs(vfs, now).some((job) => job.id === future.id)).toBe(false)
   })
 
-  it('skips jobs after 5 failed attempts', () => {
+  it('flips jobs to dead at the attempts cap instead of hiding them', () => {
     const vfs = createVfs()
     const job = scheduleJob(vfs, {
       threadId: 't',
@@ -79,9 +79,19 @@ describe('jobs', () => {
       kind: 'continue',
     })
     expect(dueJobs(vfs)).toHaveLength(1)
-    for (let i = 0; i < 5; i++) noteAttempt(vfs, job.id)
-    expect(dueJobs(vfs)).toEqual([])
+    for (let i = 0; i < 4; i++) noteAttempt(vfs, job.id)
     expect(listJobs(vfs)[0]?.status).toBe('pending')
+    noteAttempt(vfs, job.id)
+    expect(dueJobs(vfs)).toEqual([])
+    expect(listJobs(vfs)[0]).toMatchObject({ status: 'dead', attempts: 5 })
+  })
+
+  it('refuses poison job specs', () => {
+    const vfs = createVfs()
+    expect(() => scheduleJob(vfs, { threadId: '..', prompt: 'x', runAt: 1, kind: 'continue' })).toThrow()
+    expect(() => scheduleJob(vfs, { threadId: 't', prompt: 'x', runAt: Infinity, kind: 'continue' })).toThrow()
+    expect(() => scheduleJob(vfs, { threadId: 't', prompt: 'x', runAt: 1, kind: 'delete-everything' as 'continue' })).toThrow()
+    expect(listJobs(vfs)).toEqual([])
   })
 
   it('ticker fires a due job exactly once and stop() halts it', async () => {
@@ -128,5 +138,31 @@ describe('jobs', () => {
     expect(calls).toBeGreaterThanOrEqual(2)
     expect(onError).toHaveBeenCalledTimes(1)
     expect(listJobs(vfs)[0]).toMatchObject({ status: 'done', attempts: 1 })
+  })
+})
+
+describe('ticker timeouts', () => {
+  it('a hanging job does not wedge the queue when jobTimeoutMs is set', async () => {
+    const { createVfs } = await import('../src/vfs/vfs')
+    const { startJobTicker } = await import('./ticker')
+    const vfs = createVfs()
+    const { scheduleJob, listJobs } = await import('./jobs')
+    const order: string[] = []
+    scheduleJob(vfs, { threadId: 'hang', prompt: 'hang', runAt: Date.now(), kind: 'continue' })
+    scheduleJob(vfs, { threadId: 'quick', prompt: 'quick', runAt: Date.now(), kind: 'continue' })
+    const stop = startJobTicker({
+      vfs,
+      intervalMs: 10,
+      jobTimeoutMs: 30,
+      onDue: async (job) => {
+        if (job.threadId === 'hang') await new Promise(() => {})
+        order.push(job.threadId)
+      },
+    })
+    await sleep(300)
+    stop()
+    // the hanging job timed out (attempt recorded) and the other ran
+    expect(order).toContain('quick')
+    expect(listJobs(vfs).find((job) => job.threadId === 'hang')?.attempts ?? 0).toBeGreaterThan(0)
   })
 })

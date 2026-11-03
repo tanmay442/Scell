@@ -1,8 +1,9 @@
+import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { runAgent } from '../src/shell/commands/agent'
 import { sessionId, loadSession } from '../src/shell/commands/agent-sessions'
-import { buildRunContext, noteThreadId, resolveCwd, resolveSessionForThread, resolveThreadForResume, type RunContext } from './bindings'
+import { buildRunContext, isValidThreadId, noteThreadId, resolveCwd, resolveSessionForThread, resolveThreadForResume, threadVfsPath, type RunContext } from './bindings'
 import { ensureAgentConfig } from './bootstrap'
 import { createDiskVfs } from './disk-vfs'
 import { loadTokens } from './auth'
@@ -27,6 +28,77 @@ try {
   process.stderr.write(`cell server: ${err instanceof Error ? err.message : String(err)}\n`)
   process.exit(2)
 }
+
+/** One server per workspace: a second process booting on the same root
+ * would double-run jobs and resume the same threads (the router and the
+ * queue are in-memory + read-modify-write). The lock is best-effort and
+ * stale-safe: a dead pid's lock is taken over, a live pid refuses boot. */
+const lockPath = join(root, '.cell', 'server.lock')
+// Pids are meaningless across containers (every server is pid 1 in its own
+// pid namespace), so the lock is a fencing token: the holder rewrites its
+// token+heartbeat every beat, and any boot unconditionally takes over by
+// writing its own token. A deposed holder notices on its next beat (token
+// mismatch) and exits instead of running split-brain. Overlap between a
+// dying holder and its successor is bounded by one beat interval.
+const LOCK_BEAT_MS = 10_000
+const lockToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+let lockOurs = false
+function writeLock(): void {
+  writeFileSync(lockPath, JSON.stringify({ token: lockToken, heartbeat: Date.now() }))
+}
+try {
+  mkdirSync(join(root, '.cell'), { recursive: true })
+  try {
+    writeFileSync(lockPath, JSON.stringify({ token: lockToken, heartbeat: Date.now() }), { flag: 'wx' })
+  } catch (err) {
+    if ((err as { code?: string }).code !== 'EEXIST') throw err
+    // take over: a live previous holder stands down on its next beat
+    process.stderr.write('cell server: taking over the workspace lock (a live previous holder stands down on its next beat)\n')
+    writeLock()
+  }
+  lockOurs = true
+} catch (err) {
+  process.stderr.write(`cell server: cannot take workspace lock: ${err instanceof Error ? err.message : String(err)}\n`)
+  process.exit(2)
+}
+const lockBeat = setInterval(() => {
+  if (!lockOurs) return
+  try {
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as { token?: unknown }
+    if (holder.token !== lockToken) {
+      // deposed by a successor: stop everything rather than split-brain
+      process.stderr.write('cell server: workspace lock taken by a successor — standing down\n')
+      releaseLock()
+      process.exit(0)
+    }
+    writeLock()
+  } catch {
+    // next beat retries; a missed beat only risks a (self-healing) takeover race
+  }
+}, LOCK_BEAT_MS)
+if (typeof (lockBeat as unknown as { unref?: () => void }).unref === 'function') {
+  ;(lockBeat as unknown as { unref: () => void }).unref()
+}
+function releaseLock(): void {
+  if (!lockOurs) return
+  lockOurs = false
+  clearInterval(lockBeat)
+  try {
+    // only remove our own lock — never a successor's
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8')) as { token?: unknown }
+    if (holder.token === lockToken) rmSync(lockPath, { force: true })
+  } catch {
+    // best-effort: a stale lock is reaped by the next boot
+  }
+}
+process.on('SIGTERM', () => {
+  releaseLock()
+  process.exit(0)
+})
+process.on('SIGINT', () => {
+  releaseLock()
+  process.exit(0)
+})
 
 let tokens = loadTokensSafe()
 const limiter = createRateLimiter({
@@ -119,6 +191,7 @@ async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: Gateway
     log('POST', '/run', 400)
     return
   }
+  const reportHttp = (code: number) => ctx.report({ steps: 0, exitCode: code })
 
   // each run gets its own capabilities: the resume target's thread dir,
   // or a fresh thread dir for a new session (see server/bindings.ts).
@@ -137,9 +210,27 @@ async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: Gateway
     runCtx = buildRunContext(root, threadId)
     cwd = resolveCwd(runCtx.cwd, requestedCwd ?? null)
   } catch (err) {
+    reportHttp(400)
     sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
     log('POST', '/run', 400)
     return
+  }
+  if (resumeId) {
+    // resuming a thread whose dir was deleted would silently restart in
+    // an empty dir with all thread files gone — refuse loudly instead
+    try {
+      if (!createDiskVfs(root).isDir(threadVfsPath(threadId))) {
+        reportHttp(410)
+        sendJson(res, 410, { error: 'thread workspace is gone (deleted after the session ran)' })
+        log('POST', '/run', 410)
+        return
+      }
+    } catch (err) {
+      reportHttp(400)
+      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) })
+      log('POST', '/run', 400)
+      return
+    }
   }
 
   // one run per thread at a time: a second caller gets 409 before any
@@ -189,10 +280,17 @@ async function handleRun(req: IncomingMessage, res: ServerResponse, ctx: Gateway
     send({ type: 'done', exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, sessionId: runSessionId || undefined, threadId })
     res.end()
     log('POST', '/run', result.exitCode)
-  })
+  }, { timeoutMs })
   if (outcome.status === 'busy') {
+    reportHttp(409)
     sendJson(res, 409, { error: 'thread busy' })
     log('POST', '/run', 409)
+    return
+  }
+  if (outcome.status === 'timeout') {
+    reportHttp(504)
+    sendJson(res, 504, { error: 'thread timed out' })
+    log('POST', '/run', 504)
   }
 }
 
@@ -214,8 +312,8 @@ async function handleJobsCreate(req: IncomingMessage, res: ServerResponse): Prom
     log('POST', '/jobs', 400)
     return
   }
-  if (typeof body.threadId !== 'string' || body.threadId === '') {
-    sendJson(res, 400, { error: 'threadId must be a non-empty string' })
+  if (typeof body.threadId !== 'string' || !isValidThreadId(body.threadId)) {
+    sendJson(res, 400, { error: 'threadId must be a bare session/thread stem' })
     log('POST', '/jobs', 400)
     return
   }
@@ -224,8 +322,13 @@ async function handleJobsCreate(req: IncomingMessage, res: ServerResponse): Prom
     log('POST', '/jobs', 400)
     return
   }
-  if (typeof body.runAt !== 'number' || !(body.runAt > 0)) {
-    sendJson(res, 400, { error: 'runAt must be epoch ms' })
+  if (typeof body.runAt !== 'number' || !Number.isFinite(body.runAt) || !(body.runAt > 0)) {
+    sendJson(res, 400, { error: 'runAt must be finite epoch ms' })
+    log('POST', '/jobs', 400)
+    return
+  }
+  if (body.kind !== undefined && body.kind !== 'continue' && body.kind !== 'snapshot') {
+    sendJson(res, 400, { error: "kind must be 'continue' or 'snapshot'" })
     log('POST', '/jobs', 400)
     return
   }
@@ -318,13 +421,15 @@ async function fireJob(job: { id: string; threadId: string; prompt: string; kind
       },
     )
     if (result.exitCode !== 0) throw new Error(`job ${job.id} exit ${result.exitCode}: ${result.stderr.slice(0, 500)}`)
-  })
+  }, { timeoutMs })
   if (outcome.status === 'busy') throw new Error(`job ${job.id}: thread ${job.threadId} busy — retrying next tick`)
+  if (outcome.status === 'timeout') throw new Error(`job ${job.id}: thread ${job.threadId} timed out — retrying next tick`)
 }
 
 const stopJobs = startJobTicker({
   vfs: createDiskVfs(root),
   intervalMs: jobsIntervalMs,
+  jobTimeoutMs: timeoutMs,
   onDue: fireJob,
   onError: (err, job) => {
     process.stderr.write(`job ${job.id} attempt failed: ${err instanceof Error ? err.message : String(err)}\n`)

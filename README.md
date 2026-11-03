@@ -243,9 +243,15 @@ One-shot runs can `--pull <name>` a snapshot before starting and
 | `CELL_S3_*` | S3 snapshot backend (`ENDPOINT, BUCKET, ACCESS_KEY, SECRET_KEY`, optional `REGION, PREFIX`) | local store |
 
 Limits: auth is a shared bearer token, not user accounts — localhost or a
-private network. One box, no autoscaling — run one container per workspace.
-Bash is not chrooted: the hard boundary is the VFS scope plus the existing
-deny-pattern scans; treat runs as semi-trusted code, not hostile tenants.
+private network. One box, no autoscaling — run one container per workspace
+(enforced by a fencing lock; a second server on the same workspace stands
+the first one down instead of double-running jobs). Bash is not chrooted:
+the hard boundary is the VFS scope plus the existing deny-pattern scans;
+treat runs as semi-trusted code, not hostile tenants. Rate-limit budget
+covers every authed request including 409s (backpressure by design); usage
+rows record real `steps`/`exitCode` (`-1` only when the run never started).
+Jobs that exhaust 5 attempts flip to `dead` and stop being due — visible on
+`GET /jobs`, never silently dropped.
 
 ## Docs
 

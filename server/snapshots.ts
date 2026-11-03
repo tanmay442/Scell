@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
 import { createDiskVfs } from './disk-vfs'
@@ -70,6 +70,8 @@ export function defaultSnapshotsDir(workspaceRoot: string): string {
 }
 
 function isExcluded(path: string, opts: SnapshotOptions | undefined): boolean {
+  // pull scratch dirs (crashed-pull leftovers) are never part of a snapshot
+  if (/(^|\/)\.snapshot-tmp-[^/]+(\/|$)/.test(path)) return true
   if (opts?.slim === true) {
     if (path === '/node_modules' || path.startsWith('/node_modules/') || path.includes('/node_modules/')) return true
   }
@@ -193,6 +195,33 @@ async function createTarBytes(root: string, relativePaths: string[]): Promise<Ui
   }
 }
 
+/** Reject link members after extraction by inspecting the extracted tree
+ * directly (lstat, not tar output parsing): version-proof, and it catches
+ * pre-existing-link traversal that same-archive checks miss. Snapshots
+ * deliberately do not preserve symlinks or hardlinks. */
+function rejectNonRegularEntries(dir: string): void {
+  const walk = (current: string, rel: string) => {
+    for (const name of readdirSync(current)) {
+      const full = join(current, name)
+      const member = rel === '' ? name : `${rel}/${name}`
+      let stat
+      try {
+        stat = lstatSync(full)
+      } catch {
+        throw new Error(`snapshots: archive member '${member}' vanished during validation — store is corrupt`)
+      }
+      if (stat.isSymbolicLink()) {
+        throw new Error(`snapshots: archive contains symlink '${member}' — snapshots do not preserve links, restore aborted`)
+      }
+      if (stat.isFile() && stat.nlink > 1) {
+        throw new Error(`snapshots: archive contains hard link '${member}' — snapshots do not preserve links, restore aborted`)
+      }
+      if (stat.isDirectory()) walk(full, member)
+    }
+  }
+  walk(dir, '')
+}
+
 function assertSafeTarMembers(stdout: string): void {
   for (const line of stdout.split('\n')) {
     const member = line.trim().replace(/^\.\//, '')
@@ -225,23 +254,44 @@ export async function pushSnapshot(
 export async function pullSnapshot(root: string, store: SnapshotStore, name: string): Promise<PullResult> {
   ensureTarAvailable()
   const stored = parseStoredManifest(await store.get(manifestKey(name)))
-  if (stored === null) return { status: 'fresh' }
+  if (stored === null) {
+    if ((await store.get(tarKey(name))) !== null) {
+      throw new Error(`snapshots: '${tarKey(name)}' exists but '${manifestKey(name)}' is missing — store is corrupt`)
+    }
+    return { status: 'fresh' }
+  }
   const tarBytes = await store.get(tarKey(name))
   if (tarBytes === null) {
     throw new Error(`snapshots: manifest '${name}' exists but '${tarKey(name)}' is missing — store is corrupt`)
   }
-  const scratch = mkdtempSync(join(tmpdir(), 'cell-snapshot-'))
+  // scratch lives INSIDE the workspace root: rename() cannot cross the
+  // container/volume device boundary, and wipe/move stay on one filesystem.
+  // Concurrent pulls use distinct dirs; the wipe loop below skips them.
+  const base = resolve(root)
+  mkdirSync(base, { recursive: true })
+  const scratch = mkdtempSync(join(base, '.snapshot-tmp-'))
   const tarPath = join(scratch, 'snapshot.tar')
+  const extractDir = join(scratch, 'extract')
   try {
     writeFileSync(tarPath, tarBytes)
     const listed = await runTar(['--list', '--file', tarPath], null)
     assertSafeTarMembers(listed.stdout)
-    const base = resolve(root)
-    mkdirSync(base, { recursive: true })
+    // extract + validate + verify BEFORE touching the live workspace: a
+    // tar that aborts mid-extract must not destroy existing state
+    mkdirSync(extractDir, { recursive: true })
+    await runTar(['--extract', '--file', tarPath, '--directory', extractDir], null)
+    rejectNonRegularEntries(extractDir)
+    const rebuilt = computeManifest(extractDir, name)
+    if (!manifestsEqualFiles(stored, rebuilt)) {
+      throw new Error(`snapshots: '${name}' tar contents do not match its manifest (stale or tampered store) — restore aborted`)
+    }
     for (const entry of readdirSync(base)) {
+      if (entry.startsWith('.snapshot-tmp-')) continue
       rmSync(join(base, entry), { recursive: true, force: true })
     }
-    await runTar(['--extract', '--file', tarPath, '--directory', base], null)
+    for (const entry of readdirSync(extractDir)) {
+      renameSync(join(extractDir, entry), join(base, entry))
+    }
     return { status: 'restored', manifest: stored }
   } finally {
     rmSync(scratch, { recursive: true, force: true })

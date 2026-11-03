@@ -87,3 +87,28 @@ describe('createThreadRouter', () => {
     expect(outcome).toEqual({ status: 'ran', value: false })
   })
 })
+
+describe('createThreadRouter timeouts', () => {
+  it('frees the slot on timeout and aborts cooperative work', async () => {
+    const { createThreadRouter } = await import('./threads')
+    const router = createThreadRouter()
+    let aborted = false
+    const outcome = await router.runExclusive(
+      'slow',
+      (ctx) =>
+        new Promise<string>((resolve) => {
+          ctx.signal.addEventListener('abort', () => {
+            aborted = true
+          })
+          setTimeout(() => resolve('late'), 5000)
+        }),
+      { timeoutMs: 50 },
+    )
+    expect(outcome).toEqual({ status: 'timeout' })
+    expect(aborted).toBe(true)
+    expect(router.isBusy('slow')).toBe(false)
+    // the slot is reusable immediately after the timeout
+    const again = await router.runExclusive('slow', async () => 'fast')
+    expect(again).toEqual({ status: 'ran', value: 'fast' })
+  })
+})
