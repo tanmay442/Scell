@@ -10,7 +10,23 @@ import { loadTokens } from './auth'
 import { createRateLimiter } from './ratelimit'
 import { withGateway, type GatewayContext } from './gateway'
 import { cancelJob, listJobs, scheduleJob } from './jobs'
-import { createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller } from './telegram'
+import { collectFreshFiles, createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramAttachmentIn } from './telegram'
+
+/** extension → mime for files sent back to Telegram chats */
+function mimeFor(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() ?? ''
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg'
+  if (ext === 'png') return 'image/png'
+  if (ext === 'webp') return 'image/webp'
+  if (ext === 'gif') return 'image/gif'
+  if (ext === 'pdf') return 'application/pdf'
+  if (ext === 'html' || ext === 'htm') return 'text/html'
+  if (ext === 'svg') return 'image/svg+xml'
+  if (ext === 'csv') return 'text/csv'
+  if (ext === 'json') return 'application/json'
+  if (ext === 'md' || ext === 'txt') return 'text/plain'
+  return 'application/octet-stream'
+}
 import { lastAssistantText } from '../src/shell/commands/agent-sessions'
 import { startJobTicker } from './ticker'
 import { createThreadRouter } from './threads'
@@ -545,16 +561,43 @@ if (process.env.CELL_TELEGRAM === '1') {
       const apiBase = `https://api.telegram.org/bot${loaded.config.token}`
       const api = createTelegramApi(apiBase)
       const chatLabel = (chatId: number): string => `chat ${chatId}`
-      const runChat = async (chatId: number, text: string, threadId: string): Promise<string> => {
+      const runChat = async (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[] = []): Promise<string> => {
         const runCtx = buildRunContext(root, threadId)
         const outcome = await router.runExclusive(threadId, async () => {
           const controller = new AbortController()
           const timeout = setTimeout(() => controller.abort(), timeoutMs)
           try {
             let runSessionId = ''
-            const args = [text]
+            // stage uploads first (mirrors the web composer): binary files
+            // land on disk where every tool — and the vision input — finds them
+            const staged: string[] = []
+            if (attachments.length > 0) {
+              runCtx.vfs.mkdir(`${runCtx.cwd}/uploads`)
+              for (const file of attachments) {
+                const dest = `${runCtx.cwd}/uploads/${file.name}`
+                runCtx.vfs.writeBytes(dest, file.bytes)
+                staged.push(dest)
+              }
+            }
+            const startedAt = Date.now()
+            let prompt = text
+            if (staged.length > 0) {
+              prompt = `${text}\n[attached files on disk: ${staged.join(', ')}]`
+            }
+            prompt += '\n[Any files you create or update in this thread will be sent back to the chat — name the deliverable.]'
+            const args = [prompt]
             const continued = resolveSessionForThread(root, threadId)
             if (continued !== null) args.push('--resume', continued)
+            // vision: image attachments ride the first turn (never the
+            // session file); documents ride as staged files for tools
+            const images = attachments
+              .filter((file) => /\.(jpe?g|png|webp|gif)$/i.test(file.name) && file.bytes.length <= 4 * 1024 * 1024)
+              .slice(0, 3)
+              .map((file) => ({
+                name: file.name,
+                mime: /^image\//.test(file.mime) ? file.mime : 'image/jpeg',
+                base64: Buffer.from(file.bytes).toString('base64'),
+              }))
             const result = await runAgent(
               runCtx.vfs,
               args,
@@ -564,6 +607,7 @@ if (process.env.CELL_TELEGRAM === '1') {
                 jobShell: runCtx.jobShell,
                 signal: controller.signal,
                 maxSteps: 40,
+                ...(images.length > 0 ? { images } : {}),
                 // explicit non-interactive policy: the allowlisted DM chat
                 // IS the user, so ask-tools run — destructive bash shapes
                 // stay refused by the deny scans either way. Powerful
@@ -587,6 +631,18 @@ if (process.env.CELL_TELEGRAM === '1') {
               const err = result.stderr.trim().slice(-1500)
               return err !== '' ? `error: ${err}` : `error: agent exited ${result.exitCode}`
             }
+            // deliverables: files created or updated during this run go
+            // back as photos/documents — the agent names the deliverable,
+            // the chat receives the bytes
+            try {
+              for (const { path, name } of collectFreshFiles(runCtx.vfs, runCtx.cwd, startedAt)) {
+                const bytes = runCtx.vfs.readBytes(path)
+                if (bytes === null) continue
+                await api.sendFile(chatId, name, bytes, mimeFor(name))
+              }
+            } catch {
+              // deliverables are best-effort: the text reply still lands
+            }
             const reply = runSessionId !== '' ? lastAssistantText(runCtx.vfs, runSessionId) : null
             const final = (reply ?? result.stdout).trim()
             return final !== '' ? final : '(no output)'
@@ -600,7 +656,7 @@ if (process.env.CELL_TELEGRAM === '1') {
       }
       const poller = startTelegramPoller(tgVfs, apiBase, loaded.config, {
         log: (message) => process.stderr.write(`cell server: ${message}\n`),
-        onText: (chatId, text, threadId) => runChat(chatId, text, threadId),
+        onText: (chatId, text, threadId, attachments) => runChat(chatId, text, threadId, attachments),
         onCommand: async (chatId, command, threadId) => {
           if (command.command === 'new') return `fresh thread started (${threadId}) — what are we working on?`
           if (command.command === 'status') {

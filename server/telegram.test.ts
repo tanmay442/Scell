@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createVfs } from '../src/vfs/vfs'
 import {
   chunkTelegramMessage,
+  sanitizeAttachmentName,
   createTelegramApi,
   deliverDueReminders,
   loadTelegramConfig,
@@ -12,13 +13,16 @@ import {
 } from './telegram'
 import { addReminder } from '../src/shell/commands/agent-reminders'
 
-/** Fake Bot API: queued updates in, sent messages out. */
+/** Fake Bot API: queued updates in, sent messages/files out, file store. */
 function mockApi() {
-  const updates: Array<{ update_id: number; message?: { chat?: { id: number; type: string }; type?: string; text?: string; from?: { id: number } } }> = []
+  const updates: Array<{ update_id: number; message?: { chat?: { id: number; type: string }; type?: string; text?: string; caption?: string; from?: { id: number }; photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>; document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number } } }> = []
   const sent: Array<{ chatId: number; text: string }> = []
+  const sentFiles: Array<{ chatId: number; name: string; kind: string }> = []
+  const fileStore: Record<string, { path: string; bytes: number[] }> = {}
   let nextId = 1
   const fetch: TelegramFetch = async (url, init) => {
-    const body = init?.body !== undefined ? (JSON.parse(init.body) as { offset?: number; chat_id?: number; text?: string }) : {}
+    const rawBody = init?.body
+    const body = typeof rawBody === 'string' && rawBody !== '' ? (JSON.parse(rawBody) as { offset?: number; chat_id?: number; text?: string; file_id?: string }) : {}
     if (url.endsWith('/getMe')) return { ok: true, status: 200, json: async () => ({ ok: true, result: { username: 'testbot' } }) }
     if (url.endsWith('/getUpdates')) {
       const offset = body.offset ?? 0
@@ -29,15 +33,42 @@ function mockApi() {
       sent.push({ chatId: Number(body.chat_id), text: String(body.text ?? '') })
       return { ok: true, status: 200, json: async () => ({ ok: true }) }
     }
+    if (url.endsWith('/sendPhoto') || url.endsWith('/sendDocument')) {
+      const form = rawBody as unknown as FormData
+      const file = form.get('photo') ?? form.get('document')
+      const name = typeof (file as { name?: unknown })?.name === 'string' ? ((file as { name: string }).name) : 'file'
+      sentFiles.push({ chatId: Number(form.get('chat_id')), name, kind: url.endsWith('/sendPhoto') ? 'photo' : 'document' })
+      return { ok: true, status: 200, json: async () => ({ ok: true }) }
+    }
     if (url.endsWith('/sendChatAction')) return { ok: true, status: 200, json: async () => ({ ok: true }) }
+    if (url.endsWith('/getFile')) {
+      const stored = fileStore[String(body.file_id ?? '')]
+      if (!stored) return { ok: false, status: 404, json: async () => ({ ok: false }) }
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { file_path: stored.path } }) }
+    }
+    if (url.includes('/file/bot')) {
+      const stored = Object.values(fileStore).find((f) => url.endsWith(f.path))
+      if (!stored) return { ok: false, status: 404, json: async () => ({ ok: false }), arrayBuffer: async () => new ArrayBuffer(0) }
+      return { ok: true, status: 200, json: async () => ({ ok: true }), arrayBuffer: async () => new Uint8Array(stored.bytes).buffer }
+    }
     throw new Error(`unexpected ${url}`)
   }
   return {
     fetch,
     sent,
+    sentFiles,
     updates,
+    addFile: (fileId: string, path: string, bytes: number[]) => {
+      fileStore[fileId] = { path, bytes }
+    },
     pushText: (chatId: number, text: string, type = 'private') => {
       updates.push({ update_id: nextId++, message: { chat: { id: chatId, type }, text } })
+    },
+    pushPhoto: (chatId: number, fileId: string, caption = '') => {
+      updates.push({ update_id: nextId++, message: { chat: { id: chatId, type: 'private' }, caption, photo: [{ file_id: fileId, file_size: 1000, width: 800, height: 600 }] } })
+    },
+    pushDocument: (chatId: number, fileId: string, fileName: string, text = '') => {
+      updates.push({ update_id: nextId++, message: { chat: { id: chatId, type: 'private' }, text, document: { file_id: fileId, file_name: fileName, mime_type: 'application/pdf', file_size: 2000 } } })
     },
   }
 }
@@ -285,5 +316,102 @@ describe('telegram hardening', () => {
     expect(texts).toBe(1)
     expect(api.sent[0].text).toBe('got after poison')
     poller.stop()
+  })
+})
+
+describe('telegram media (photos, documents, files back)', () => {
+  it('downloads photos and hands bytes to the handler', async () => {
+    const vfs = createVfs()
+    const api = mockApi()
+    api.addFile('ph1', 'photos/a.jpg', [1, 2, 3, 4])
+    let got: Array<{ name: string; mime: string; bytes: Uint8Array }> = []
+    const poller = startTelegramPoller(
+      vfs,
+      'https://api.telegram.org/botX',
+      { token: 'X', allowFrom: [42] },
+      {
+        onText: async (_c, text, _t, attachments) => {
+          got = attachments
+          return `seen ${attachments.length} ${text}`
+        },
+        onCommand: async () => 'x',
+      },
+      api.fetch,
+    )
+    api.pushPhoto(42, 'ph1', 'shrink this')
+    await waitFor(() => api.sent.length >= 1)
+    expect(got.length).toBe(1)
+    expect(got[0].name).toMatch(/\.jpg$/)
+    expect([...got[0].bytes]).toEqual([1, 2, 3, 4])
+    expect(api.sent[0].text).toBe('seen 1 shrink this')
+    poller.stop()
+  })
+
+  it('downloads documents with their filenames, refuses oversize', async () => {
+    const vfs = createVfs()
+    const api = mockApi()
+    api.addFile('doc1', 'docs/a.pdf', [9, 9, 9])
+    let got: Array<{ name: string }> = []
+    const poller = startTelegramPoller(
+      vfs,
+      'https://api.telegram.org/botX',
+      { token: 'X', allowFrom: [42] },
+      {
+        onText: async (_c, _t, _th, attachments) => {
+          got = attachments
+          return `docs ${attachments.length}`
+        },
+        onCommand: async () => 'x',
+      },
+      api.fetch,
+    )
+    api.pushDocument(42, 'doc1', '../../evil.pdf', 'summarize')
+    await waitFor(() => api.sent.length >= 1)
+    expect(got.length).toBe(1)
+    expect(got[0].name).toBe('evil.pdf')
+    expect(api.sent[0].text).toBe('docs 1')
+    poller.stop()
+  })
+
+  it('sanitizes hostile attachment names', () => {
+    expect(sanitizeAttachmentName('../../etc/passwd', 'fb')).toBe('passwd')
+    expect(sanitizeAttachmentName('...', 'fb')).toBe('fb')
+    expect(sanitizeAttachmentName('my report (1).PDF', 'fb')).toBe('my_report_1_.PDF')
+  })
+
+  it('sends images as photos and PDFs as documents', async () => {
+    const sender = createTelegramApi('https://api.telegram.org/botX', mockApi().fetch)
+    void sender
+    const api = mockApi()
+    const sender2 = createTelegramApi('https://api.telegram.org/botX', api.fetch)
+    await sender2.sendFile(42, 'chart.png', new Uint8Array([1]), 'image/png')
+    await sender2.sendFile(42, 'report.pdf', new Uint8Array([2]), 'application/pdf')
+    expect(api.sentFiles).toEqual([
+      { chatId: 42, name: 'chart.png', kind: 'photo' },
+      { chatId: 42, name: 'report.pdf', kind: 'document' },
+    ])
+  })
+})
+
+describe('telegram deliverables', () => {
+  it('collects only fresh thread files, newest first, capped', async () => {
+    const { collectFreshFiles } = await import('./telegram')
+    const { createDiskVfs } = await import('./disk-vfs')
+    const { mkdtempSync, writeFileSync, utimesSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const root = mkdtempSync(join(tmpdir(), 'tg-fresh-'))
+    const vfs = createDiskVfs(root)
+    const old = Date.now() - 100_000
+    const now = Date.now()
+    vfs.write('/home/user/threads/tg-1/old.txt', 'old')
+    utimesSync(join(root, 'home/user/threads/tg-1/old.txt'), new Date(old), new Date(old))
+    vfs.write('/home/user/threads/tg-1/new.png', 'new')
+    vfs.write('/home/user/threads/tg-1/.hidden', 'x')
+    vfs.write('/home/user/threads/tg-1/sub/deep.txt', 'deep')
+    vfs.write('/home/user/threads/tg-2/other.txt', 'other')
+    const fresh = collectFreshFiles(vfs, '/home/user/threads/tg-1', now - 1000)
+    const names = fresh.map((f) => f.name).sort()
+    expect(names).toEqual(['deep.txt', 'new.png'])
   })
 })

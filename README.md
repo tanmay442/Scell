@@ -330,7 +330,13 @@ memory, the same skill index — in web chat, Telegram, and headless runs.
 
 `CELL_TELEGRAM=1` starts a long-poll loop next to the server: DMs only,
 one stable thread per chat (`tg-<chatId>`), `/new` rotates it, `/status`
-shows jobs, `/help` explains itself. Non-text messages are ignored.
+shows jobs, `/help` explains itself. Photos and documents (PDFs, files,
+up to 12 MB) download into the thread's `uploads/` and ride the first
+model turn — images go to the model as vision input (never stored in
+session files), documents as staged files for tools. Anything the run
+creates or updates in the thread comes back to the chat (photos for
+images, documents for the rest, newest 5, 45 MB cap each). Stickers,
+voice and video are ignored; a caption counts as the message text.
 
 ```sh
 CELL_TELEGRAM=1 CELL_TELEGRAM_TOKEN=<botfather-token> \

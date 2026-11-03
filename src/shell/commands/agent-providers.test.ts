@@ -231,3 +231,16 @@ describe('meta chain-expiry re-anchor (builder gap)', () => {
     expect(final).toMatchObject({ id: 'r' })
   })
 })
+
+describe('vision attachments', () => {
+  it('builds image parts for all three providers, text-only without images', async () => {
+    const { newProviderState } = await import('./agent-providers')
+    const plain = newProviderState('hi')
+    expect(plain.anthropicMessages[0].content).toBe('hi')
+    const withImg = newProviderState('look', [{ name: 'a.jpg', mime: 'image/jpeg', base64: 'AAA' }])
+    expect(JSON.stringify(withImg.anthropicMessages[0].content)).toContain('"type":"image"')
+    expect(JSON.stringify(withImg.openaiMessages[0].content)).toContain('image_url')
+    const meta = withImg.metaFirstInput?.content as Array<Record<string, unknown>>
+    expect(meta.some((part) => part['type'] === 'input_image')).toBe(true)
+  })
+})

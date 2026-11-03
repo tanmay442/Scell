@@ -26,6 +26,7 @@ import {
   setMetaResumeFlush,
   isOpenAIShaped,
   type AgentConfig,
+  type ImageAttachment,
   type ProviderKind,
   type ProviderState,
 } from './agent-providers'
@@ -240,6 +241,9 @@ export interface RunAgentOpts {
   chatId?: string
   /** thread the run belongs to (stable per chat on Telegram) */
   threadId?: string
+  /** vision input: shown to the model on the first turn, never persisted
+   * to the session file (bytes stay out of transcripts) */
+  images?: ImageAttachment[]
 }
 
 /**
@@ -362,7 +366,8 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const memoryBlock = memoryPromptBlock(vfs)
   const systemPrompt = `${BASE_SYSTEM_PROMPT}\n\nYou are ${bot.name}, the user's primary agent across every surface (web chat, Telegram, headless runs). Behave as one continuous assistant: use history_search to recall what you did in other threads, memory_save for durable user facts, and delegate for parallelizable sub-tasks. Your timezone is ${bot.timezone} — use it for "today/tomorrow" math in reminders.\n\nYour workspace for this thread is ${opts.cwd} — your own folder. Create files, projects and artifacts there by default (paths relative to it work in every tool). The open project and ~/.cell registries stay reachable by absolute path; other threads' folders are not visible to you and do not exist as far as your tools are concerned.${memoryBlock === '' ? '' : `\n\n${memoryBlock}`}\n\nSkills (one line each — use load_skill for the full body when the task needs it):\n${skillIndex(skills)}\n\nCustom tools: ${[...customTools.keys()].join(', ') || '(none)'} — declared in ~/.cell/tools/*.json, approval: ask.`
 
-  const state: ProviderState = resumeId !== null ? emptyProviderState() : newProviderState(expanded.prompt)
+  // first-turn images only: a resumed chain already carries them server-side
+  const state: ProviderState = resumeId !== null ? emptyProviderState() : newProviderState(expanded.prompt, opts.images ?? [])
   if (resumeId !== null) {
     rebuildState(state, config.provider, resumedTurns, resumedResponseId)
     if (expanded.prompt !== '') {
@@ -385,7 +390,10 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   for (const warning of skillWarnings) transcript.push(`agent warning: ${warning}`)
   if (skills.length > 0) transcript.push(`skills: ${skills.map((s) => s.name).join(', ')} (load_skill for the body)`)
 
-  let turns: SessionTurn[] = resumeId !== null ? [...resumedTurns] : [{ role: 'user', text: prompt }]
+  // image bytes never touch the session file: record names only, so a
+  // resumed run knows pictures were there without replaying megabytes
+  const imageNote = (opts.images ?? []).length === 0 ? '' : `\n[images attached: ${(opts.images ?? []).map((img) => img.name).join(', ')}]`
+  let turns: SessionTurn[] = resumeId !== null ? [...resumedTurns] : [{ role: 'user', text: `${prompt}${imageNote}` }]
   if (resumeId !== null && expanded.prompt !== '') turns.push({ role: 'user', text: expanded.prompt })
 
   // delegation: a subagent gets a fresh context window but the same tools

@@ -61,21 +61,54 @@ export interface ModelTurn {
 
 export interface ProviderState {
   anthropicMessages: { role: 'user' | 'assistant'; content: unknown }[]
-  openaiMessages: { role: string; content: string | null }[]
+  openaiMessages: { role: string; content: unknown }[]
   metaResponseId: string | null
-  metaFirstInput: { role: string; content: { type: string; text: string }[] } | null
+  metaFirstInput: { role: string; content: Record<string, unknown>[] } | null
   /** new user text awaiting send on the chained (previous_response_id) path */
   metaPendingUser: string | null
   /** function_call_output items awaiting send on the next chained request */
   metaPendingOutputs: { type: string; call_id: string; output: string }[] | null
 }
 
-export function newProviderState(prompt: string): ProviderState {
+export interface ImageAttachment {
+  name: string
+  mime: string
+  /** raw bytes as base64 (never persisted to sessions — too big) */
+  base64: string
+}
+
+export function newProviderState(prompt: string, images: ImageAttachment[] = []): ProviderState {
+  const anthropicContent: unknown =
+    images.length === 0
+      ? prompt
+      : [
+          { type: 'text', text: prompt },
+          ...images.map((img) => ({
+            type: 'image',
+            source: { type: 'base64', media_type: img.mime, data: img.base64 },
+          })),
+        ]
+  const openaiContent: unknown =
+    images.length === 0
+      ? prompt
+      : [
+          { type: 'text', text: prompt },
+          ...images.map((img) => ({
+            type: 'image_url',
+            image_url: { url: `data:${img.mime};base64,${img.base64}` },
+          })),
+        ]
   return {
-    anthropicMessages: [{ role: 'user', content: prompt }],
-    openaiMessages: [{ role: 'user', content: prompt }],
+    anthropicMessages: [{ role: 'user', content: anthropicContent }],
+    openaiMessages: [{ role: 'user', content: openaiContent }],
     metaResponseId: null,
-    metaFirstInput: { role: 'user', content: [{ type: 'input_text', text: prompt }] },
+    metaFirstInput: {
+      role: 'user',
+      content: [
+        { type: 'input_text', text: prompt },
+        ...images.map((img) => ({ type: 'input_image', image_url: `data:${img.mime};base64,${img.base64}` })),
+      ],
+    },
     metaPendingUser: prompt,
     metaPendingOutputs: null,
   }

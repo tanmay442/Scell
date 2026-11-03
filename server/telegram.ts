@@ -15,6 +15,9 @@ import { deleteReminder, dueReminders, noteFailedDelivery } from '../src/shell/c
 export const TELEGRAM_CONFIG_PATH = '/home/user/.cell/telegram.json'
 export const TELEGRAM_STATE_PATH = '/home/user/.cell/telegram-state.json'
 const MESSAGE_CHUNK = 4000
+/** attachments (and generated files back) cap: the Bot API allows 50MB,
+ * staying far under keeps memory and model context sane */
+export const MAX_ATTACHMENT_BYTES = 12 * 1024 * 1024
 const POLL_TIMEOUT_S = 25
 const FETCH_TIMEOUT_MS = 40_000
 const ERROR_BACKOFF_MS = 5_000
@@ -92,15 +95,64 @@ export function parseTelegramCommand(text: string): TelegramCommand | null {
   return { command, arg: (match[2] ?? '').trim() }
 }
 
-export type TelegramFetch = (url: string, init?: { method?: string; body?: string; headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{
+export type TelegramFetch = (url: string, init?: { method?: string; body?: string | FormData; headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{
   ok: boolean
   status: number
   json(): Promise<unknown>
+  arrayBuffer?(): Promise<ArrayBuffer>
 }>
 
-function defaultFetch(url: string, init?: { method?: string; body?: string; headers?: Record<string, string>; signal?: AbortSignal }):
-  Promise<{ ok: boolean; status: number; json(): Promise<unknown> }> {
-  return (globalThis.fetch as typeof fetch)(url, init) as unknown as Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>
+/** Files created or updated during a run: the deliverables sent back to
+ * the chat (newest first, capped). Skips dotfiles, registries and logs. */
+export interface FreshFile {
+  path: string
+  name: string
+  size: number
+}
+
+export function collectFreshFiles(
+  vfs: Vfs,
+  threadDir: string,
+  sinceMs: number,
+  maxFiles = 5,
+  maxBytes = 45 * 1024 * 1024,
+): FreshFile[] {
+  const fresh: Array<{ path: string; name: string; size: number; mtime: number }> = []
+  let all: string[] = []
+  try {
+    all = vfs.listAllFiles()
+  } catch {
+    return []
+  }
+  for (const path of all) {
+    if (!path.startsWith(`${threadDir}/`) || path.includes('/.cell/')) continue
+    const name = path.split('/').pop() ?? ''
+    if (name.startsWith('.')) continue
+    let stat
+    try {
+      stat = vfs.stat(path)
+    } catch {
+      continue
+    }
+    if (stat === null || stat.type !== 'file' || stat.mtime < sinceMs) continue
+    if (stat.size > maxBytes) continue
+    fresh.push({ path, name, size: stat.size, mtime: stat.mtime })
+  }
+  fresh.sort((a, b) => b.mtime - a.mtime)
+  return fresh.slice(0, maxFiles)
+}
+
+/** Filenames from chat input: basename only, safe charset, capped. */
+export function sanitizeAttachmentName(name: string, fallback: string): string {
+  const base = name.split('/').pop()?.split('\\').pop() ?? ''
+  const clean = base.replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^\.+/, '').slice(0, 80)
+  if (clean === '' || clean === '.' || clean === '..') return fallback
+  return clean
+}
+
+function defaultFetch(url: string, init?: { method?: string; body?: string | FormData; headers?: Record<string, string>; signal?: AbortSignal }):
+  Promise<{ ok: boolean; status: number; json(): Promise<unknown>; arrayBuffer(): Promise<ArrayBuffer> }> {
+  return (globalThis.fetch as typeof fetch)(url, init) as unknown as Promise<{ ok: boolean; status: number; json(): Promise<unknown>; arrayBuffer(): Promise<ArrayBuffer> }>
 }
 
 /** Split on newline boundaries so code blocks stay readable. */
@@ -134,10 +186,21 @@ export function chunkTelegramMessage(text: string, max = MESSAGE_CHUNK): string[
   return chunks
 }
 
+export interface TelegramAttachmentIn {
+  name: string
+  mime: string
+  bytes: Uint8Array
+}
+
 export interface TelegramApi {
   sendMessage(chatId: number, text: string): Promise<void>
+  /** generated files go back as photos (images) or documents (the rest) */
+  sendFile(chatId: number, name: string, bytes: Uint8Array, mime: string): Promise<void>
   sendTyping(chatId: number): Promise<void>
   getMe(): Promise<{ ok: boolean; username?: string }>
+  getFilePath(fileId: string): Promise<string>
+  /** raw bytes of an uploaded photo/document, size-capped */
+  downloadFile(filePath: string, maxBytes?: number): Promise<Uint8Array>
 }
 
 export function createTelegramApi(apiBase: string, fetchImpl: TelegramFetch = defaultFetch): TelegramApi {
@@ -161,6 +224,48 @@ export function createTelegramApi(apiBase: string, fetchImpl: TelegramFetch = de
     async sendMessage(chatId, text) {
       for (const chunk of chunkTelegramMessage(text)) {
         await call('sendMessage', { chat_id: chatId, text: chunk })
+      }
+    },
+    async sendFile(chatId, name, bytes, mime) {
+      const photo = /\.(jpe?g|png|webp|gif)$/i.test(name)
+      const form = new FormData()
+      form.append('chat_id', String(chatId))
+      form.append(photo ? 'photo' : 'document', new Blob([bytes as unknown as BlobPart], { type: mime }), name)
+      if (!photo) form.append('caption', name.slice(0, 200))
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS * 3)
+      try {
+        const res = await fetchImpl(`${apiBase}/${photo ? 'sendPhoto' : 'sendDocument'}`, {
+          method: 'POST',
+          body: form,
+          signal: controller.signal,
+        })
+        if (!res.ok) throw new Error(`telegram sendFile: HTTP ${res.status}`)
+        await res.json().catch(() => null)
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+    async getFilePath(fileId) {
+      const info = await call<{ ok: boolean; result?: { file_path?: string } }>('getFile', { file_id: fileId })
+      const path = info.result?.file_path
+      if (typeof path !== 'string' || path === '') throw new Error('telegram getFile: no file_path')
+      return path
+    },
+    async downloadFile(filePath, maxBytes = 12 * 1024 * 1024) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS * 3)
+      try {
+        const token = apiBase.split('/bot')[1] ?? ''
+        const res = await fetchImpl(`https://api.telegram.org/file/bot${token}/${filePath}`, {
+          signal: controller.signal,
+        })
+        if (!res.ok || typeof res.arrayBuffer !== 'function') throw new Error(`telegram download: HTTP ${res.status}`)
+        const buf = await res.arrayBuffer()
+        if (buf.byteLength > maxBytes) throw new Error(`telegram download: file is ${buf.byteLength} bytes (cap ${maxBytes})`)
+        return new Uint8Array(buf)
+      } finally {
+        clearTimeout(timer)
       }
     },
     async sendTyping(chatId) {
@@ -210,18 +315,35 @@ function saveState(vfs: Vfs, state: TelegramState): void {
   }
 }
 
+export interface TelegramPhotoSize {
+  file_id: string
+  file_size?: number
+  width: number
+  height: number
+}
+
+export interface TelegramDocument {
+  file_id: string
+  file_name?: string
+  mime_type?: string
+  file_size?: number
+}
+
 interface TelegramUpdate {
   update_id: number
   message?: {
     chat: { id: number; type: string }
     from?: { id: number }
     text?: string
+    caption?: string
+    photo?: TelegramPhotoSize[]
+    document?: TelegramDocument
   }
 }
 
 export interface TelegramPollHandlers {
-  /** plain chat text → the agent's reply text */
-  onText: (chatId: number, text: string, threadId: string) => Promise<string>
+  /** chat text (+ downloaded photo/document bytes) → the agent's reply */
+  onText: (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[]) => Promise<string>
   /** /new /status /help */
   onCommand: (chatId: number, command: TelegramCommand, threadId: string) => Promise<string | null>
   log?: (message: string) => void
@@ -279,22 +401,37 @@ export function startTelegramPoller(
     }
   }
 
+  /** biggest photo size under the byte cap (Telegram sends several) */
+  function pickPhoto(sizes: TelegramPhotoSize[]): TelegramPhotoSize | null {
+    const sorted = [...sizes].sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0))
+    let fallback: TelegramPhotoSize | null = null
+    for (const size of sorted) {
+      if ((size.file_size ?? 0) > MAX_ATTACHMENT_BYTES) continue
+      fallback = size
+    }
+    return fallback
+  }
+
   async function handleUpdate(update: TelegramUpdate): Promise<void> {
     const message = update.message
-    if (!message || message.chat.type !== 'private' || typeof message.text !== 'string') return
+    if (!message || message.chat.type !== 'private') return
     const chatId = message.chat.id
     if (!allowed.has(chatId)) {
       // fail closed and stay silent: no model call, no reply, no oracle
       log(`telegram: ignoring message from non-allowlisted chat ${chatId}`)
       return
     }
-    const text = message.text.trim()
-    if (text === '') return
+    // photos, documents (PDFs, files), or plain text — captions count as
+    // the message text; anything else (stickers, voice, video) is ignored
+    const photo = message.photo !== undefined && message.photo.length > 0 ? pickPhoto(message.photo) : null
+    const document = message.document
+    const text = (message.text ?? message.caption ?? '').trim()
+    if (photo === null && document === undefined && text === '') return
     const threadId = telegramThreadFor(chatId, state.chats)
     try {
       await api.sendTyping(chatId)
       const command = parseTelegramCommand(text)
-      let reply: string | null
+      let reply: string | null = null
       if (command !== null && command.command === 'new') {
         const fresh = `tg-${chatId}-${Date.now().toString(36)}${Math.floor(Math.random() * 0xffff).toString(16)}`
         state.chats[String(chatId)] = fresh
@@ -303,7 +440,28 @@ export function startTelegramPoller(
       } else if (command !== null) {
         reply = await handlers.onCommand(chatId, command, threadId)
       } else {
-        reply = await handlers.onText(chatId, text, threadId)
+        // download attachments BEFORE the model turn: the handler stages
+        // them into the thread workspace next to the prompt
+        const attachments: TelegramAttachmentIn[] = []
+        if (message.photo !== undefined && message.photo.length > 0 && photo === null) {
+          reply = `that photo is too big (cap ${MAX_ATTACHMENT_BYTES} bytes) — send a smaller one`
+        }
+        if (photo !== null) {
+          const path = await api.getFilePath(photo.file_id)
+          const bytes = await api.downloadFile(path)
+          attachments.push({ name: `photo-${photo.width}x${photo.height}.jpg`, mime: 'image/jpeg', bytes })
+        }
+        if (document !== undefined) {
+          if ((document.file_size ?? 0) > MAX_ATTACHMENT_BYTES) {
+            reply = `that file is too big (${document.file_size} bytes, cap ${MAX_ATTACHMENT_BYTES}) — send a smaller one`
+          } else {
+            const path = await api.getFilePath(document.file_id)
+            const bytes = await api.downloadFile(path)
+            const name = sanitizeAttachmentName(document.file_name ?? 'document', `upload-${Date.now().toString(36)}`)
+            attachments.push({ name, mime: document.mime_type ?? 'application/octet-stream', bytes })
+          }
+        }
+        reply = reply ?? (await handlers.onText(chatId, text, threadId, attachments))
       }
       if (reply !== null) {
         await api.sendMessage(chatId, reply)
