@@ -121,13 +121,14 @@ export function collectFreshFiles(
   sinceMs: number,
   maxFiles = 5,
   maxBytes = 45 * 1024 * 1024,
-): FreshFile[] {
+): { files: FreshFile[]; skippedOversize: string[] } {
   const fresh: Array<{ path: string; name: string; size: number; mtime: number }> = []
+  const skippedOversize: string[] = []
   let all: string[] = []
   try {
     all = vfs.listAllFiles()
   } catch {
-    return []
+    return { files: [], skippedOversize }
   }
   for (const path of all) {
     if (!path.startsWith(`${threadDir}/`) || path.includes('/.cell/')) continue
@@ -140,11 +141,16 @@ export function collectFreshFiles(
       continue
     }
     if (stat === null || stat.type !== 'file' || stat.mtime < sinceMs) continue
-    if (stat.size > maxBytes) continue
+    // oversize deliverables are NAMED, never silently dropped: the caller
+    // tells the chat to ask for a split
+    if (stat.size > maxBytes) {
+      skippedOversize.push(name)
+      continue
+    }
     fresh.push({ path, name, size: stat.size, mtime: stat.mtime })
   }
   fresh.sort((a, b) => b.mtime - a.mtime)
-  return fresh.slice(0, maxFiles)
+  return { files: fresh.slice(0, maxFiles), skippedOversize }
 }
 
 /** Filenames from chat input: basename only, safe charset, capped. */

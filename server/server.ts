@@ -614,13 +614,21 @@ async function fireJob(job: { id: string; threadId: string; prompt: string; kind
       })
       markNotified(runCtx.vfs, job.id)
       if (runError === null) {
-        for (const { path, name } of collectFreshFiles(runCtx.vfs, runCtx.cwd, startedAt)) {
+        const { files, skippedOversize } = collectFreshFiles(runCtx.vfs, runCtx.cwd, startedAt)
+        for (const { path, name } of files) {
           try {
             const bytes = runCtx.vfs.readBytes(path)
             if (bytes === null) continue
             await telegramJobNotify.api.sendFile(Number(job.notifyChatId), name, bytes, mimeFor(name))
           } catch (err) {
             process.stderr.write(`[job ${job.id}] deliverable ${name} failed: ${err instanceof Error ? err.message : String(err)}\n`)
+          }
+        }
+        if (skippedOversize.length > 0) {
+          try {
+            await telegramJobNotify.api.sendMessage(Number(job.notifyChatId), `note: ${skippedOversize.length} file(s) over the 45 MB cap were not sent (${skippedOversize.slice(0, 3).join(', ')}) — ask me to split one`)
+          } catch {
+            // best-effort note only
           }
         }
       }
@@ -818,12 +826,17 @@ if (process.env.CELL_TELEGRAM === '1') {
             }
             // deliverables: files created or updated during this run go
             // back as photos/documents — the agent names the deliverable,
-            // the chat receives the bytes
+            // the chat receives the bytes. Oversize files are named in a
+            // follow-up so the chat knows to ask for a split (never silent).
             try {
-              for (const { path, name } of collectFreshFiles(runCtx.vfs, runCtx.cwd, startedAt)) {
+              const { files, skippedOversize } = collectFreshFiles(runCtx.vfs, runCtx.cwd, startedAt)
+              for (const { path, name } of files) {
                 const bytes = runCtx.vfs.readBytes(path)
                 if (bytes === null) continue
                 await api.sendFile(chatId, name, bytes, mimeFor(name))
+              }
+              if (skippedOversize.length > 0) {
+                await api.sendMessage(chatId, `note: ${skippedOversize.length} file(s) over the 45 MB cap were not sent (${skippedOversize.slice(0, 3).join(', ')}) — ask me to split one`)
               }
             } catch {
               // deliverables are best-effort: the text reply still lands
