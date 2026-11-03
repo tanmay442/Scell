@@ -369,7 +369,7 @@ one.
 |---|---|---|
 | `CELL_TELEGRAM` | `1` enables the Telegram poll loop | off |
 | `CELL_TELEGRAM_TOKEN` | Bot API token (never logged, never committed) | — |
-| `CELL_TELEGRAM_TOKEN_FILE` | path to a file holding the token — must be outside the workspace | — |
+| `CELL_TELEGRAM_TOKEN_FILE` | path to a file holding the token — must be outside the workspace (0600 file in a 0700 dir) | — |
 | `CELL_TELEGRAM_ALLOW_FROM` | comma-separated chat ids (or `allowFrom` in `~/.cell/telegram.json`) | empty = poller refuses to start |
 
 ## Docs
