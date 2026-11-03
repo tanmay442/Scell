@@ -76,9 +76,13 @@ export async function pythonCommand(vfs: Vfs, args: string[], opts: { cwd: strin
   if (env.PYTHONUNBUFFERED === undefined) env.PYTHONUNBUFFERED = '1'
 
   // ISOLATE-GATE: worker-loader — spawning a nested Worker is how the
-  // browser/node gets pyodide off the main thread. On Cloudflare Workers
-  // (no nested workers) load python-worker.ts in-isolate instead: the DO
-  // already provides tenant isolation, so the extra worker buys nothing.
+  // browser/node gets pyodide off the main thread. HONEST STATUS: the
+  // in-isolate fallback for Cloudflare Workers (no nested workers) is
+  // NOT implemented — only this marker. A real port must also replace
+  // python-worker.ts's own non-isolate-clean loading (Blob-URL dynamic
+  // import, top-level self.onmessage) and the kill-switch
+  // (worker.terminate on timeout: in-isolate runs need DO-alarm CPU
+  // guards instead, with a defined fate for in-flight FS writes).
   // See docs/ISOLATE_SEAM.md.
   let worker: Worker
   try {

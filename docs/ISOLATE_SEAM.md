@@ -42,3 +42,15 @@ carry an `ISOLATE-GATE` marker; the gate requires the marker.
   bindings) composes only seam-clean pieces — no agent rewrite.
 - `server/` stays as the single-box self-host runner: same agent,
   machine-backed shell and disk. It is optional, never required.
+
+## Known limits (grep can't see these — reviewers eyeball for them)
+
+- `eval`/`Function` laundering of host access.
+- Worker-alias indirection (`const o = Worker; new o()` — only the
+direct spellings are grepped).
+- Whitespace-obfuscated member access (`process .env`).
+- `*.test.ts` files are trusted by name; the gate only verifies they
+also import from vitest (check 5).
+- The sanctioned `ISOLATE-ALLOW` site (agent.ts `hostMetaKey`): a
+guarded, degrading hint, never required. Any new `ISOLATE-ALLOW`
+needs adversarial review, not just a marker.

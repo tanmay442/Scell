@@ -100,6 +100,39 @@ img = img.convert('RGB')            # JPEG has no alpha; convert first
   frame 0 unless asked otherwise.`,
   },
   {
+    name: 'documents',
+    description: 'Read PDFs and document files in-isolate: pypdf text extraction via micropip, summarize and verify.',
+    body: `# documents
+
+Read document files with tools that run everywhere — no machine needed:
+
+## PDFs: pypdf (pure Python, installs itself via micropip)
+
+\`\`\`python
+from pypdf import PdfReader
+
+reader = PdfReader('uploads/notes.pdf')
+print('pages:', len(reader.pages))
+text = '\n'.join((page.extract_text() or '') for page in reader.pages)
+print(text[:2000])
+\`\`\`
+
+The runner scans imports and micropip-installs pure-Python packages
+automatically — just import pypdf and use it. No apt, no poppler, no
+workarounds. Scanned/image-only PDFs have no text layer: say so and
+extract what is there instead of inventing content.
+
+## Rules
+
+- Stage first: Telegram uploads land in \`uploads/\`; read from there.
+- Extract before summarizing — never summarize a PDF you have not read.
+- Large documents: extract per-page or in ranges, then synthesize; do
+  not paste the whole text into one reply when a summary was asked for.
+- Verify generated PDFs by reopening them (page count + first lines),
+  the same way images are verified by reopening.
+`,
+  },
+  {
     name: 'debug-tsc',
     description: 'Fix TypeScript errors: reproduce with tsc, edit precisely, re-check.',
     body: `# debug-tsc

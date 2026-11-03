@@ -100,8 +100,11 @@ The chat renders HTML live, inline in the thread — transparent background, no 
 - One idea per visual, values labelled, sized for a ~760px chat column.`
 
 function hostMetaKey(): string | null {
-  // Node-only path (unit tests, scripts): read the machine key without a
-  // static node:fs import (that would break the browser bundle).
+  // ISOLATE-ALLOW: degrading host-key hint, never required. Node-only
+  // path (unit tests, scripts): read the machine key without a static
+  // node:fs import (that would break the browser bundle). On Workers and
+  // in browsers globalThis.process is undefined and this returns null —
+  // the VFS mirror (~/.cell/agent.json) is the real config source.
   try {
     const proc = (globalThis as { process?: { getBuiltinModule?: (name: string) => unknown; env?: Record<string, string> } }).process
     const fromEnv = proc?.env?.CELL_AGENT_LIVE_KEY

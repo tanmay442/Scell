@@ -6,6 +6,64 @@
  * matplotlib output, and a filesystem write-back diff.
  */
 
+/** Pure-Python wheels pyodide cannot serve itself (PyPI sends no CORS
+ * headers, so the browser cannot micropip-install from
+ * files.pythonhosted.org). Vendored by scripts/vendor-public.mjs into
+ * public/vendor/wheels/ — PINNED THERE TOO, keep the two in sync.
+ * Install order per package: pyodide index (CDN) → same-origin vendor
+ * wheel (browser/workers, no CORS issue) → PyPI micropip (node/tests). */
+export const VENDOR_WHEELS: Record<string, string> = {
+  pypdf: 'pypdf-6.21.4-py3-none-any.whl',
+}
+
+/** Install one missing pure-Python package, same-origin first. Exported
+ * for tests. Throws when every source fails. */
+export async function installPureWheel(
+  pyodide: { loadPackage(p: string): Promise<unknown>; runPythonAsync(code: string): Promise<unknown>; FS: { mkdirTree(p: string): void; writeFile(p: string, data: Uint8Array): void } },
+  name: string,
+  onStatus?: (text: string) => void,
+): Promise<void> {
+  // allowlisted wheels skip the index probe: loadPackage consults the
+  // network for unknown names, which defeats offline/vendor installs
+  if (VENDOR_WHEELS[name] === undefined) {
+    try {
+      await pyodide.loadPackage(name)
+      return
+    } catch {
+      // not in the pyodide index — fall through to PyPI micropip
+    }
+  }
+  const wheel = VENDOR_WHEELS[name]
+  if (wheel !== undefined) {
+    try {
+      const res = await fetch(`/vendor/wheels/${wheel}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const bytes = new Uint8Array(await res.arrayBuffer())
+      try {
+        pyodide.FS.mkdirTree('/tmp/wheels')
+      } catch {
+        // exists
+      }
+      pyodide.FS.writeFile(`/tmp/wheels/${wheel}`, bytes)
+      // manual zip extraction, NOT micropip: micropip queries the PyPI
+      // index even for local files (network), but a pure wheel is just
+      // a zip whose top level belongs in site-packages (fully offline)
+      await pyodide.runPythonAsync(
+        `import zipfile as _zf, site as _site, importlib as _il\n` +
+          `_sp = [p for p in _site.getsitepackages() if p.endswith('site-packages')][0]\n` +
+          `with _zf.ZipFile(${JSON.stringify(`/tmp/wheels/${wheel}`)}) as _z: _z.extractall(_sp)\n` +
+          `_il.invalidate_caches()\n` +
+          `__import__(${JSON.stringify(name)})`,
+      )
+      return
+    } catch (err) {
+      onStatus?.(`vendor wheel unavailable (${err instanceof Error ? err.message : String(err)}), trying PyPI…`)
+    }
+  }
+  await pyodide.loadPackage('micropip')
+  await pyodide.runPythonAsync(`import micropip\nawait micropip.install(${JSON.stringify(name)})`)
+}
+
 export interface PythonPayload {
   buffer: Uint8Array
   // entries may carry kind 'dir' (empty dirs invisible to listAllFiles)
@@ -196,8 +254,7 @@ export async function runPython(pyodide: any, options: PythonRunOptions): Promis
     for (const name of missing) {
       options.onStatus?.(`pip installing ${name}…`)
       try {
-        await pyodide.loadPackage('micropip')
-        await pyodide.runPythonAsync(`import micropip\nawait micropip.install(${JSON.stringify(name)})`)
+        await installPureWheel(pyodide, name, options.onStatus)
         options.onStatus?.(`pip installed ${name}`)
       } catch (err) {
         options.onStatus?.(`pip: ${name} unavailable (${describeError(err).text.slice(0, 80)})`)

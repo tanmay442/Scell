@@ -33,6 +33,10 @@ export function startAutoSave(
   delayMs = 400,
   opts: AutoSaveOpts = {},
 ): () => void {
+  // DOM-gated: tab-close/tab-hide flush is browser-only. A Workers caller
+  // gets timer persistence only (no crash — feature-detect, don't assume).
+  const doc = typeof document === 'undefined' ? null : document
+  const win = typeof window === 'undefined' ? null : window
   let timer: ReturnType<typeof setTimeout> | null = null
   let stopped = false
   let flushing = false
@@ -215,17 +219,17 @@ export function startAutoSave(
   })
 
   const onHidden = () => {
-    if (document.visibilityState === 'hidden') flush()
+    if (doc !== null && doc.visibilityState === 'hidden') flush()
   }
   // beforeunload visibility is unreliable — flush outright on the way out
   const onLeaving = () => flush()
-  document.addEventListener('visibilitychange', onHidden)
-  window.addEventListener('beforeunload', onLeaving)
+  if (doc !== null) doc.addEventListener('visibilitychange', onHidden)
+  if (win !== null) win.addEventListener('beforeunload', onLeaving)
 
   return () => {
     unwatch()
-    document.removeEventListener('visibilitychange', onHidden)
-    window.removeEventListener('beforeunload', onLeaving)
+    if (doc !== null) doc.removeEventListener('visibilitychange', onHidden)
+    if (win !== null) win.removeEventListener('beforeunload', onLeaving)
     if (timer) {
       clearTimeout(timer)
       timer = null

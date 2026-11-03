@@ -505,3 +505,80 @@ describe('python empty-dir sync', () => {
     180_000,
   )
 })
+
+/** Minimal one-page PDF with real text, built with computed xref offsets
+ * (no external generator needed). Proves isolate-native document reading:
+ * pypdf installs via micropip and extracts text with zero machine help. */
+function minimalPdf(lines: string[]): Uint8Array {
+  const enc = new TextEncoder()
+  const textOps = lines.map((l, i) => `BT /F1 12 Tf 72 ${720 - i * 20} Td (${l}) Tj ET`).join('\n')
+  const objects: string[] = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${textOps.length} >>\nstream\n${textOps}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ]
+  let out = '%PDF-1.4\n'
+  const offsets: number[] = []
+  objects.forEach((body, i) => {
+    offsets.push(out.length)
+    out += `${i + 1} 0 obj\n${body}\nendobj\n`
+  })
+  const xrefAt = out.length
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`
+  for (const offset of offsets) out += `${String(offset).padStart(10, '0')} 00000 n \n`
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefAt}\n%%EOF`
+  return enc.encode(out)
+}
+
+describe('documents (isolate-native PDF)', () => {
+  it(
+    'pypdf extracts text from a staged PDF via micropip',
+    async () => {
+      const vfs = freshVfs()
+      vfs.writeBytes('/home/user/uploads/notes.pdf', minimalPdf(['Hello isolate PDF world.', 'Second sentence here.']))
+      const { result, stdout } = await runIn(
+        vfs,
+        [
+          'from pypdf import PdfReader',
+          "r = PdfReader('/home/user/uploads/notes.pdf')",
+          "print('pages:', len(r.pages))",
+          "print((r.pages[0].extract_text() or '').strip())",
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(stdout).toContain('pages: 1')
+      expect(stdout).toContain('Hello isolate PDF world.')
+      expect(stdout).toContain('Second sentence here.')
+    },
+    300_000,
+  )
+})
+
+describe('installPureWheel (isolate-safe packages)', () => {
+  it('installs the vendored pypdf wheel with PyPI fully blocked', async () => {
+    const { installPureWheel } = await import('./runner')
+    const { readFileSync } = await import('node:fs')
+    const wheelBytes = new Uint8Array(readFileSync(new URL('../../public/vendor/wheels/pypdf-6.21.4-py3-none-any.whl', import.meta.url).pathname))
+    expect(wheelBytes.length).toBeGreaterThan(100_000)
+    const { loadPyodide } = await import('pyodide')
+    const py = await loadPyodide({ indexURL: new URL('../../node_modules/pyodide/', import.meta.url).pathname })
+    // only same-origin /vendor/* succeeds; EVERYTHING else (PyPI index,
+    // wheel hosts, CDN) throws — the vendor path must stand alone
+    const realFetch = globalThis.fetch
+    ;(globalThis as { fetch: unknown }).fetch = async (url: unknown) => {
+      if (typeof url === 'string' && url.startsWith('/vendor/wheels/')) {
+        return new Response(wheelBytes, { status: 200, headers: { 'content-type': 'application/octet-stream' } })
+      }
+      throw new Error(`network blocked in test: ${String(url).slice(0, 80)}`)
+    }
+    try {
+      await installPureWheel(py, 'pypdf')
+      const probe = await py.runPythonAsync('from pypdf import PdfReader\nPdfReader.__module__')
+      expect(String(probe).trim()).toBe('pypdf._reader')
+    } finally {
+      ;(globalThis as { fetch: unknown }).fetch = realFetch
+    }
+  }, 300_000)
+})
