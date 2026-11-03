@@ -462,3 +462,30 @@ describe('python images (Pillow)', () => {
     180_000,
   )
 })
+
+describe('python runner write-back boundary', () => {
+  it(
+    'never syncs runtime-side-effect dirs (/share, /etc, ...) into the VFS',
+    async () => {
+      const vfs = freshVfs()
+      const { result, vfs: after } = await runIn(
+        vfs,
+        [
+          'import os',
+          'os.makedirs("/share/man/man1", exist_ok=True)',
+          'open("/share/man/man1/ttx.1", "w").write("phantom")',
+          'os.makedirs("/etc/fake", exist_ok=True)',
+          'open("/etc/fake/x", "w").write("phantom")',
+          'os.makedirs("/home/user/project/sub", exist_ok=True)',
+          'open("/home/user/project/sub/real.txt", "w").write("legit")',
+          'print("done")',
+        ].join('\n'),
+      )
+      expect(result.exitCode).toBe(0)
+      expect(after.exists('/share/man/man1/ttx.1')).toBe(false)
+      expect(after.exists('/etc/fake/x')).toBe(false)
+      expect(after.read('/home/user/project/sub/real.txt')).toBe('legit')
+    },
+    180_000,
+  )
+})

@@ -471,6 +471,14 @@ function seedHistoryEntries(thread: ThreadState, vfs: ReturnType<typeof platform
 // ---- actions --------------------------------------------------------------------
 
 const DRAFT_PREFIX = 'cell.draft:'
+const LAST_THREAD_KEY = 'cell.lastThread'
+
+function rememberLastThread(id: string | null): void {
+  try {
+    if (id === null) localStorage.removeItem(LAST_THREAD_KEY)
+    else localStorage.setItem(LAST_THREAD_KEY, id)
+  } catch { /* private mode */ }
+}
 
 function draftKey(threadId: string | null): string {
   return `${DRAFT_PREFIX}${threadId ?? 'new'}`
@@ -531,7 +539,9 @@ export const agentActions = {
     if (form.apiKey.trim() !== '') data.apiKey = form.apiKey.trim()
     if (form.provider === 'compat' && form.baseURL.trim() !== '') data.baseURL = form.baseURL.trim()
     platform().vfs.write(CONFIG_PATH, `${JSON.stringify(data, null, 2)}\n`)
-    set({ savedNote: 'saved to ~/.cell/agent.json' })
+    // the banner reads keyAvailable, not the form: refresh it now so the
+    // composer stops complaining the moment the key is saved
+    set({ savedNote: 'saved to ~/.cell/agent.json', keyAvailable: form.apiKey.trim() !== '' || form.provider === 'compat' })
   },
 
   setDraft(text: string): void {
@@ -569,6 +579,7 @@ export const agentActions = {
       thread.contextChars = 'error' in loaded ? 0 : loaded.session.turns.reduce((sum, turn) => sum + turn.text.length, 0)
       seedHistoryEntries(thread, vfs, id)
     }
+    rememberLastThread(id)
     set({ draft: readStoredDraft(id) })
     const opened = loadSession(vfs, id)
     if (!('error' in opened) && opened.session.interrupted === true) {
@@ -656,8 +667,26 @@ export const agentActions = {
   /** New chat: just change the view. Nothing is stopped. */
   clearChat(): void {
     visibleThreadId = null
+    rememberLastThread(null)
     set({ draft: readStoredDraft(null) })
     publish()
+  },
+
+  /** After a reload the chat is empty although sessions persisted: reopen
+   * the thread the user was on so history is one click away (openSession
+   * seeds it). Best-effort: unknown ids are forgotten. */
+  reopenLast(): void {
+    if (visibleThreadId !== null || snapshot.entries.length > 0 || snapshot.running) return
+    let id: string | null = null
+    try {
+      id = localStorage.getItem(LAST_THREAD_KEY)
+    } catch { /* private mode */ }
+    if (id === null) return
+    if (!snapshot.sessions.some((s) => s.id === id)) {
+      rememberLastThread(null)
+      return
+    }
+    agentActions.openSession(id)
   },
 
   decide(allowed: boolean): void {
@@ -690,6 +719,7 @@ export const agentActions = {
     const { vfs, bus } = platform()
     // a fresh chat becomes a thread (with its own workspace) on send
     if (visibleThreadId === null) visibleThreadId = sessionId()
+    rememberLastThread(visibleThreadId)
     const thread = getThread(visibleThreadId)
     if (thread.running) return
     const approve = makeApprove(thread)

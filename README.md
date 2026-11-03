@@ -35,7 +35,7 @@ both surfaces.
 | Capability | How it's real | Verified by |
 |---|---|---|
 | Filesystem | In-memory VFS, text + binary files, full user home (`~`), dotfiles, volatile `/tmp` | unit + e2e |
-| Persistence | Incremental IndexedDB saves (node_modules included), single-pass load, `navigator.storage.persist()`, flush on tab-hide; agent sessions persist after **every step** with a live-run flag, so a closed/crashed tab reopens threads with history intact and an "interrupted — send a message to continue" note; composer drafts and UI state (mode, editor tabs) survive reload too | e2e: deps survive reload; restart + mid-run kill verified |
+| Persistence | Incremental IndexedDB saves (node_modules included), single-pass load, `navigator.storage.persist()`, flush on tab-hide; agent sessions persist after **every step** with a live-run flag, so a closed/crashed tab reopens threads with history intact and an "interrupted — send a message to continue" note; composer drafts, the open thread (auto-reopened with history), and UI state (mode, editor tabs) survive reload too | e2e: deps survive reload; restart + mid-run kill verified |
 | bash | just-bash + session env, `~/.bashrc` sourced every command, shebang scripts, heredocs, pipes, subshells, `[[ ]]`, `set -e`, tar/gzip, sqlite3, `curl` (browser fetch, CORS applies) | `bash-audit.test.ts` (17 assertions) |
 | System identity | `uname`, `id`, `df`, `free`, `ps`, `uptime`, `hostname`, `which`, `man`, `less`, `/etc/os-release`, `/proc/*` | `bash-audit.test.ts` |
 | node | Fresh V8 worker per run, CommonJS resolver with walk-up, circular imports, shebangs, shell env → `process.env`, write-back to the VFS, 5 min ceiling | `worker-exec.test.ts` + e2e |

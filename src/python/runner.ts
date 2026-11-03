@@ -38,8 +38,11 @@ export interface PythonRunResult {
   deleted: string[]
 }
 
-/** dirs of the pyodide filesystem that belong to the runtime, not the user */
-const FS_SKIP = new Set(['/lib', '/usr', '/dev', '/proc', '/sys', '/bin', '/home/pydide', '/python312.zip', '/.webpy', '/tmp'])
+/** dirs of the pyodide filesystem that belong to the runtime, not the user.
+ * Package installs and runtime side-effects land outside /home/user
+ * (/share man pages, /etc, /opt, ...); without these entries the write-back
+ * walk would sync them into the VFS as phantom workspace files. */
+const FS_SKIP = new Set(['/lib', '/usr', '/dev', '/proc', '/sys', '/bin', '/home/pydide', '/python312.zip', '/.webpy', '/tmp', '/share', '/etc', '/opt', '/var', '/root'])
 
 function inSkip(path: string): boolean {
   if (FS_SKIP.has(path)) return true

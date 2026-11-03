@@ -694,6 +694,7 @@ export function AgentHome({ onOpenWorkspace }: { onOpenWorkspace: () => void }) 
 
   useEffect(() => {
     agentActions.refresh()
+    agentActions.reopenLast()
     agentActions.ensureTitles()
   }, [])
 
