@@ -1,0 +1,9 @@
+FROM node:22-slim
+WORKDIR /srv/cell
+# only the two runtime deps the server bundle requires (fflate, semver);
+# everything else in package.json is browser/build tooling
+RUN npm install --omit=dev --no-audit --no-fund fflate@0.8.3 semver@7.8.5
+COPY dist-server/ ./dist-server/
+ENV CELL_WORKSPACE=/workspace CELL_PORT=8787
+EXPOSE 8787
+CMD ["node", "dist-server/server/server.js"]

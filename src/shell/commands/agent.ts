@@ -1,5 +1,5 @@
 import type { Vfs } from '../../vfs/types'
-import type { CommandResult, ShellLike } from './npm'
+import type { CommandResult, ShellLike } from './shell-types'
 import { redactSecrets } from './agent-redact'
 import {
   JobManager,

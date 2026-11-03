@@ -14,7 +14,10 @@
     "e2e:gdg": "node scripts/e2e-gdg.mjs",
     "e2e:scribe": "node scripts/e2e-scribe.mjs",
     "e2e:agent": "node scripts/e2e-agent.mjs",
-    "postinstall": "node scripts/vendor-public.mjs"
+    "postinstall": "node scripts/vendor-public.mjs",
+    "server:build": "rm -rf dist-server && tsc -p tsconfig.server.json && printf '{\"type\":\"commonjs\"}\\n' > dist-server/package.json",
+    "server:start": "node dist-server/server/server.js",
+    "server:run": "node dist-server/server/run-once.js"
   },
   "dependencies": {
     "@astryxdesign/core": "^0.7.4",

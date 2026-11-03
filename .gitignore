@@ -5,3 +5,4 @@ vendor/
 *.local
 .DS_Store
 nohup.out
+dist-server/

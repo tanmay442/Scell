@@ -1,0 +1,31 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "outDir": "dist-server",
+    "types": ["node"],
+    "lib": ["ES2022", "DOM"]
+  },
+  "exclude": [
+    "**/*.test.ts"
+  ],
+  "include": [
+    "server/**/*.ts",
+    "src/vfs/types.ts",
+    "src/vfs/vfs.ts",
+    "src/vfs/skill-content.ts",
+    "src/vfs/protected-paths.ts",
+    "src/shell/commands/agent.ts",
+    "src/shell/commands/agent-tools.ts",
+    "src/shell/commands/agent-providers.ts",
+    "src/shell/commands/agent-skills.ts",
+    "src/shell/commands/agent-sessions.ts",
+    "src/shell/commands/agent-commands.ts",
+    "src/shell/commands/agent-redact.ts",
+    "src/shell/commands/shell-types.ts",
+    "src/shell/commands/install.ts",
+    "src/shell/commands/registry.ts"
+  ]
+}

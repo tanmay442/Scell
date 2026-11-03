@@ -6,7 +6,8 @@ import { runAgent } from './agent'
 import { vfsPath } from '../../vfs/types'
 import { isProtectedPath } from '../../vfs/protected-paths'
 import { tarFiles, untar } from './untar'
-import type { CommandResult, ShellLike } from './npm'
+import type { CommandResult } from './npm'
+import type { ShellLike } from './shell-types'
 import { platform } from '../../platform'
 
 function platformBusEmit(payload: { dir: string }): void {

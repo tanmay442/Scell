@@ -2,7 +2,7 @@ import type { Vfs } from '../../vfs/types'
 import { vfsPath } from '../../vfs/types'
 import { isProtectedPath, isWriteProtectedPath } from '../../vfs/protected-paths'
 import { redactSecrets } from './agent-redact'
-import type { ShellLike } from './npm'
+import type { ShellLike } from './shell-types'
 
 /**
  * Tool registry: built-ins (bash/read/edit/write/ls/load_skill) plus custom

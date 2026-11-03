@@ -174,6 +174,57 @@ access obeys CORS (hence the git relay chain). Long-running processes cap at
 5 minutes per run. Everything else behaves like the real thing — including
 the parts an agent would probe.
 
+## Headless agent (single box)
+
+The same `runAgent` loop as `cell agent`, without the browser: disk-backed
+VFS, real bash via `child_process`, fresh shell per request. Two entry
+points, compiled with `pnpm server:build` into `dist-server/`:
+`dist-server/server/run-once.js` (one task, then exit) and
+`dist-server/server/server.js` (HTTP+SSE on `CELL_PORT`).
+
+Agent config lives at VFS `/home/user/.cell/agent.json`, i.e. on disk at
+`$CELL_WORKSPACE/home/user/.cell/agent.json`. When that file is missing it
+is seeded from env (`CELL_PROVIDER` default `meta`, `CELL_MODEL`,
+`CELL_AGENT_KEY`, `CELL_BASE_URL`, and `CELL_AGENT_LIVE_KEY` as the meta
+key); when it exists the file wins.
+
+Quick start:
+
+```sh
+pnpm server:build
+docker build -f Dockerfile.agent -t cell-agent .
+
+# one-shot: runs run-once.js, container is removed on exit
+./scripts/agent-run.sh "fix the failing test" --steps 20
+./scripts/agent-run.sh "keep going" --resume agent-abc123 --workspace ./workspace
+
+# server mode: detached, restarts unless stopped
+./scripts/agent-server.sh --workspace ./workspace --port 8787
+curl http://localhost:8787/health
+# {"ok":true}
+```
+
+Agent runs stream as SSE `data:` lines (one JSON object per line):
+
+```
+data: {"type":"step","step":1,"output":"…"}
+data: {"type":"done","sessionId":"agent-abc123"}
+```
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `CELL_WORKSPACE` | VFS root on disk | `/workspace` (in container) |
+| `CELL_PORT` | server listen port | `8787` |
+| `CELL_PROVIDER` | `meta` \| `anthropic` \| `openai` \| `compat` | `meta` |
+| `CELL_MODEL` | model id override | provider default |
+| `CELL_AGENT_KEY` | api key written into `agent.json` | — |
+| `CELL_AGENT_LIVE_KEY` | meta key written into `agent.json` when provider is `meta` | — |
+| `CELL_BASE_URL` | base URL for `compat` provider | — |
+| `CELL_TIMEOUT_MS` | per-step model timeout (ms) | server default |
+
+Limits: no auth — bind to localhost or a private network. One box, no
+autoscaling — run one container per workspace.
+
 ## Docs
 
 Historical design documents live in [`docs/`](docs/): `ARCHITECTURE.md`,
