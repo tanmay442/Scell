@@ -166,3 +166,46 @@ describe('ticker timeouts', () => {
     expect(listJobs(vfs).find((job) => job.threadId === 'hang')?.attempts ?? 0).toBeGreaterThan(0)
   })
 })
+
+describe('task jobs + chat notify', () => {
+  it('schedules task jobs with a numeric notifyChatId', () => {
+    const vfs = createVfs()
+    const job = scheduleJob(vfs, {
+      threadId: 'tg-1-wabc',
+      prompt: 'summarize',
+      runAt: Date.now(),
+      kind: 'task',
+      notifyChatId: '42',
+    })
+    expect(job.kind).toBe('task')
+    expect(job.notifyChatId).toBe('42')
+    expect(listJobs(vfs).some((j) => j.id === job.id && j.notifyChatId === '42')).toBe(true)
+    // due like any other job
+    expect(dueJobs(vfs, Date.now() + 1000).some((j) => j.id === job.id)).toBe(true)
+  })
+
+  it('refuses bad kinds and non-numeric chat ids', () => {
+    const vfs = createVfs()
+    expect(() => scheduleJob(vfs, { threadId: 't', prompt: 'x', runAt: 1, kind: 'nope' as never })).toThrow()
+    expect(() => scheduleJob(vfs, { threadId: 't', prompt: 'x', runAt: 1, kind: 'task', notifyChatId: 'abc' })).toThrow(/numeric/)
+    expect(() => scheduleJob(vfs, { threadId: 't', prompt: 'x', runAt: 1, kind: 'task', notifyChatId: 'NaN' })).toThrow(/numeric/)
+  })
+
+  it('drops malformed notifyChatId on read', () => {
+    const vfs = createVfs()
+    vfs.write(JOB_QUEUE_PATH, JSON.stringify([{ id: 'j1', threadId: 't', prompt: 'p', runAt: 1, kind: 'task', createdAt: 1, status: 'pending', notifyChatId: 'evil' }]))
+    expect(listJobs(vfs).find((j) => j.id === 'j1')?.notifyChatId).toBeUndefined()
+  })
+})
+
+describe('exactly-once chat delivery', () => {
+  it('marks notified and survives a read cycle', async () => {
+    const { markNotified } = await import('./jobs')
+    const vfs = createVfs()
+    const job = scheduleJob(vfs, { threadId: 't', prompt: 'p', runAt: 1, kind: 'task', notifyChatId: '42' })
+    expect(job.notified).toBeUndefined()
+    markNotified(vfs, job.id)
+    expect(listJobs(vfs).find((j) => j.id === job.id)?.notified).toBe(true)
+    markNotified(vfs, 'missing')
+  })
+})

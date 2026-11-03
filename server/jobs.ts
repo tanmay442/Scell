@@ -1,7 +1,9 @@
 import type { Vfs } from '../src/vfs/types'
 import { isValidThreadId } from './bindings'
 
-export type JobKind = 'continue' | 'snapshot'
+/** 'task' = a fresh worker run (no session to resume) that reports back;
+ * 'continue' = resume the thread's session; 'snapshot' = push a snapshot */
+export type JobKind = 'continue' | 'snapshot' | 'task'
 export type JobStatus = 'pending' | 'done' | 'cancelled' | 'dead'
 
 export interface JobSpec {
@@ -15,6 +17,15 @@ export interface JobSpec {
   status: JobStatus
   /** failed attempts so far; jobs with attempts >= MAX_ATTEMPTS stop being due */
   attempts?: number
+  /** chat notification already delivered: retries after a crash must not
+   * re-send "done" (set only after the send succeeds) */
+  notified?: boolean
+  /** Telegram chat to notify with the result + deliverables on completion.
+   * Absent = silent (log only). Digits only — validated at schedule time. */
+  notifyChatId?: string
+  /** Thread that spawned the worker: the completion is appended to its
+   * session transcript too, so the main thread sees what finished. */
+  originThreadId?: string
 }
 
 export const JOB_QUEUE_PATH = '/home/user/.cell/job-queue.json'
@@ -35,12 +46,16 @@ function normalizeJob(value: unknown): JobSpec | null {
   if (typeof value.threadId !== 'string') return null
   if (typeof value.prompt !== 'string') return null
   if (typeof value.runAt !== 'number' || Number.isNaN(value.runAt)) return null
-  const kind: JobKind = value.kind === 'snapshot' ? 'snapshot' : 'continue'
+  const kind: JobKind = value.kind === 'snapshot' ? 'snapshot' : value.kind === 'task' ? 'task' : 'continue'
+  const notifyChatId =
+    typeof value.notifyChatId === 'string' && /^\d+$/.test(value.notifyChatId) ? value.notifyChatId : undefined
+  const originThreadId =
+    typeof value.originThreadId === 'string' && isValidThreadId(value.originThreadId) ? value.originThreadId : undefined
   const status: JobStatus =
     value.status === 'done' || value.status === 'cancelled' || value.status === 'dead' ? value.status : 'pending'
   const createdAt = typeof value.createdAt === 'number' ? value.createdAt : 0
-  const attempts =
-    typeof value.attempts === 'number' && value.attempts >= 0 ? Math.floor(value.attempts) : 0
+  const attempts = typeof value.attempts === 'number' && value.attempts >= 0 ? Math.floor(value.attempts) : 0
+  const notified = value.notified === true
   return {
     id: value.id,
     threadId: value.threadId,
@@ -50,6 +65,23 @@ function normalizeJob(value: unknown): JobSpec | null {
     createdAt,
     status,
     attempts,
+    ...(notifyChatId !== undefined ? { notifyChatId } : {}),
+    ...(originThreadId !== undefined ? { originThreadId } : {}),
+    ...(notified ? { notified: true } : {}),
+  }
+}
+
+/** Exactly-once chat delivery: set only after the send succeeds, so a
+ * crash between delivery and markDone never re-sends "done". */
+export function markNotified(vfs: Vfs, id: string): void {
+  try {
+    const jobs = readJobs(vfs)
+    const job = jobs.find((j) => j.id === id)
+    if (job === undefined) return
+    job.notified = true
+    writeJobs(vfs, jobs)
+  } catch {
+    // advisory only — worst case is a duplicate delivery, still rare
   }
 }
 
@@ -94,8 +126,14 @@ export function scheduleJob(
   if (typeof spec.runAt !== 'number' || !Number.isFinite(spec.runAt) || spec.runAt <= 0) {
     throw new Error('refused: runAt must be finite epoch ms')
   }
-  if (spec.kind !== 'continue' && spec.kind !== 'snapshot') {
+  if (spec.kind !== 'continue' && spec.kind !== 'snapshot' && spec.kind !== 'task') {
     throw new Error(`refused: unknown job kind '${String(spec.kind)}'`)
+  }
+  if (spec.notifyChatId !== undefined && !/^\d+$/.test(spec.notifyChatId)) {
+    throw new Error('refused: notifyChatId must be a numeric chat id')
+  }
+  if (spec.originThreadId !== undefined && !isValidThreadId(spec.originThreadId)) {
+    throw new Error('refused: originThreadId must be a bare session/thread stem')
   }
   try {
     const jobs = readJobs(vfs)
@@ -104,7 +142,9 @@ export function scheduleJob(
       threadId: spec.threadId,
       prompt: spec.prompt,
       runAt: spec.runAt,
-      kind: spec.kind === 'snapshot' ? 'snapshot' : 'continue',
+      kind: spec.kind,
+      ...(spec.notifyChatId !== undefined ? { notifyChatId: spec.notifyChatId } : {}),
+      ...(spec.originThreadId !== undefined ? { originThreadId: spec.originThreadId } : {}),
       id: spec.id ?? makeId(now),
       createdAt: now,
       status: 'pending',
@@ -119,7 +159,9 @@ export function scheduleJob(
       threadId: spec.threadId,
       prompt: spec.prompt,
       runAt: spec.runAt,
-      kind: spec.kind === 'snapshot' ? 'snapshot' : 'continue',
+      kind: spec.kind,
+      ...(spec.notifyChatId !== undefined ? { notifyChatId: spec.notifyChatId } : {}),
+      ...(spec.originThreadId !== undefined ? { originThreadId: spec.originThreadId } : {}),
       id: spec.id ?? makeId(now),
       createdAt: now,
       status: 'pending',

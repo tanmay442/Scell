@@ -260,3 +260,50 @@ describe('load_skill provenance banner', () => {
     expect(home.content).toMatch(/\[untrusted home skill 'unslop'/)
   })
 })
+
+describe('background_task dispatch', () => {
+  it('starts workers, refuses empties and giants, reports disabled runs', async () => {
+    const { runTool } = await import('./agent-tools')
+    const { createVfs } = await import('../../vfs/vfs')
+    const vfs = createVfs()
+    const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+    const scheduled: Array<{ task: string }> = []
+    const deps = {
+      vfs,
+      shell,
+      cwd: '/home/user',
+      scheduleBackground: async (input: { task: string }) => {
+        scheduled.push(input)
+        return { ok: true as const, jobId: 'job-1', threadId: 'tg-1-w1' }
+      },
+    }
+    const started = await runTool(deps as never, { id: 'a', name: 'background_task', input: { task: 'summarize the pdf' } })
+    expect(started.isError).toBeFalsy()
+    expect(started.content).toMatch(/job-1/)
+    expect(scheduled).toEqual([{ task: 'summarize the pdf' }])
+    const empty = await runTool(deps as never, { id: 'b', name: 'background_task', input: { task: '  ' } })
+    expect(empty.isError).toBe(true)
+    const giant = await runTool(deps as never, { id: 'c', name: 'background_task', input: { task: 'x'.repeat(9000) } })
+    expect(giant.isError).toBe(true)
+    const off = await runTool({ vfs, shell, cwd: '/home/user' } as never, { id: 'd', name: 'background_task', input: { task: 'x' } })
+    expect(off.content).toMatch(/not enabled/)
+  })
+})
+
+describe('subagent registry guard', () => {
+  it('refuses shared-registry writes at depth >= 1', async () => {
+    const { runTool } = await import('./agent-tools')
+    const { createVfs } = await import('../../vfs/vfs')
+    const vfs = createVfs()
+    const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+    const deps = { vfs, shell, cwd: '/home/user', delegateDepth: 1 }
+    const mem = await runTool(deps as never, { id: 'a', name: 'memory_save', input: { text: 'x' } })
+    expect(mem.isError).toBe(true)
+    expect(mem.content).toMatch(/subagents cannot use memory_save/)
+    const skill = await runTool(deps as never, { id: 'b', name: 'skill_install', input: { markdown: 'x'.repeat(50) } })
+    expect(skill.isError).toBe(true)
+    // depth 0 still works
+    const ok = await runTool({ vfs, shell, cwd: '/home/user', delegateDepth: 0 } as never, { id: 'c', name: 'memory_save', input: { text: 'likes tea' } })
+    expect(ok.isError).toBeFalsy()
+  })
+})

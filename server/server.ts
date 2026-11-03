@@ -2,15 +2,16 @@ import { mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'no
 import { join } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { runAgent } from '../src/shell/commands/agent'
-import { sessionId, loadSession } from '../src/shell/commands/agent-sessions'
+import { sessionId, loadSession, saveSession } from '../src/shell/commands/agent-sessions'
 import { buildRunContext, isValidThreadId, noteThreadId, resolveCwd, resolveSessionForThread, resolveThreadForResume, threadVfsPath, type RunContext } from './bindings'
 import { ensureAgentConfig } from './bootstrap'
 import { createDiskVfs } from './disk-vfs'
 import { loadTokens } from './auth'
 import { createRateLimiter } from './ratelimit'
 import { withGateway, type GatewayContext } from './gateway'
-import { cancelJob, listJobs, scheduleJob } from './jobs'
-import { collectFreshFiles, createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramAttachmentIn } from './telegram'
+import { cancelJob, listJobs, markNotified, scheduleJob } from './jobs'
+import { collectFreshFiles, createTelegramApi, deliverDueReminders, loadTelegramConfig, startTelegramPoller, type TelegramApi, type TelegramAttachmentIn } from './telegram'
+import type { Vfs } from '../src/vfs/types'
 
 /** extension → mime for files sent back to Telegram chats */
 function mimeFor(name: string): string {
@@ -390,8 +391,8 @@ async function handleJobsCreate(req: IncomingMessage, res: ServerResponse): Prom
     log('POST', '/jobs', 400)
     return
   }
-  if (body.kind !== undefined && body.kind !== 'continue' && body.kind !== 'snapshot') {
-    sendJson(res, 400, { error: "kind must be 'continue' or 'snapshot'" })
+  if (body.kind !== undefined && body.kind !== 'continue' && body.kind !== 'snapshot' && body.kind !== 'task') {
+    sendJson(res, 400, { error: "kind must be 'continue', 'snapshot' or 'task'" })
     log('POST', '/jobs', 400)
     return
   }
@@ -400,7 +401,7 @@ async function handleJobsCreate(req: IncomingMessage, res: ServerResponse): Prom
       threadId: body.threadId,
       prompt: body.prompt,
       runAt: body.runAt,
-      kind: body.kind === 'snapshot' ? 'snapshot' : 'continue',
+      kind: body.kind ?? 'continue',
     })
     sendJson(res, 201, { job })
     log('POST', '/jobs', 201)
@@ -456,9 +457,45 @@ async function handle(req: IncomingMessage, res: ServerResponse, ctx: GatewayCon
   log(req.method ?? '?', url.pathname, 404)
 }
 
+/** Set by the Telegram block: lets jobs report back to the chat that
+ * spawned them. Null on headless runs without Telegram. */
+let telegramJobNotify: { api: TelegramApi } | null = null
+
+export interface BackgroundSchedule {
+  ok: true
+  jobId: string
+  threadId: string
+}
+
+/** Spawn a background worker thread for a chat: own thread dir, 'task'
+ * job, result + deliverables reported back via notifyChatId. Exported
+ * for tests (uses only the vfs + job queue). */
+export async function scheduleBackgroundTask(
+  vfs: ReturnType<typeof createDiskVfs>,
+  threadId: string,
+  chatId: string,
+  task: string,
+): Promise<BackgroundSchedule | { error: string }> {
+  try {
+    const worker = `${threadId}-w${Date.now().toString(36)}${Math.floor(Math.random() * 0xffff).toString(16)}`
+    vfs.mkdir(threadVfsPath(worker))
+    const job = scheduleJob(vfs, {
+      threadId: worker,
+      prompt: `Background task for chat ${chatId} (origin thread ${threadId}). Brief from the main agent — do exactly this, then report back concisely with the deliverable named:\n\n${task}`,
+      runAt: Date.now(),
+      kind: 'task',
+      notifyChatId: String(chatId),
+      originThreadId: threadId,
+    })
+    return { ok: true, jobId: job.id, threadId: worker }
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 /** A fired job runs through the same per-thread capabilities as HTTP runs,
  * serialized by the router: a busy thread skips this tick (throw to retry). */
-async function fireJob(job: { id: string; threadId: string; prompt: string; kind: string }): Promise<void> {
+async function fireJob(job: { id: string; threadId: string; prompt: string; kind: string; notifyChatId?: string; originThreadId?: string; notified?: boolean }): Promise<void> {
   if (job.kind === 'snapshot') {
     // per-thread scope: the snapshot covers this thread's dir plus its
     // session records — never sibling threads or unrelated global state
@@ -471,26 +508,91 @@ async function fireJob(job: { id: string; threadId: string; prompt: string; kind
     process.stderr.write(`[job ${job.id}] snapshot ${job.threadId}: ${pushed.skipped ? 'unchanged, skipped' : 'pushed'}\n`)
     return
   }
-  // continue jobs resume the thread's session; a thread with no session
-  // yet (scheduled before anything ran there) fails loudly, not silently
+  // task jobs start fresh; a retry resumes the worker's own session when
+  // one exists (the first attempt notes it), so retries continue the work
+  // instead of restarting it. Continue jobs resume or fail loudly.
+  const isTask = job.kind === 'task'
   const session = resolveSessionForThread(root, job.threadId)
-  if (session === null) throw new Error(`job ${job.id}: thread ${job.threadId} has no session to continue`)
+  if (!isTask && session === null) {
+    throw new Error(`job ${job.id}: thread ${job.threadId} has no session to continue`)
+  }
+  const startedAt = Date.now()
   const outcome = await router.runExclusive(job.threadId, async () => {
     const runCtx = buildRunContext(root, job.threadId)
-    const result = await runAgent(
-      runCtx.vfs,
-      [job.prompt, '--resume', session],
-      {
-        cwd: runCtx.cwd,
-        shell: runCtx.shell,
-        jobShell: runCtx.jobShell,
-        signal: AbortSignal.timeout(timeoutMs),
-        maxSteps: Number.POSITIVE_INFINITY,
-        onProgress: (line) => process.stderr.write(`[job ${job.id}] ${line}\n`),
-        onSession: (id) => noteThreadId(runCtx.vfs, id, job.threadId),
-      },
-    )
-    if (result.exitCode !== 0) throw new Error(`job ${job.id} exit ${result.exitCode}: ${result.stderr.slice(0, 500)}`)
+    const args = session !== null ? [job.prompt, '--resume', session] : [job.prompt]
+    // execution and delivery are tracked separately (Grok/Hermes shape):
+    // a worker that fails still reports back loudly instead of going
+    // silent — the throw below keeps attempts/dead accounting intact
+    let runError: string | null = null
+    let final = ''
+    try {
+      const result = await runAgent(
+        runCtx.vfs,
+        args,
+        {
+          cwd: runCtx.cwd,
+          shell: runCtx.shell,
+          jobShell: runCtx.jobShell,
+          signal: AbortSignal.timeout(timeoutMs),
+          maxSteps: Number.POSITIVE_INFINITY,
+          ...(job.notifyChatId !== undefined ? { chatId: job.notifyChatId, threadId: job.threadId } : {}),
+          onProgress: (line) => process.stderr.write(`[job ${job.id}] ${line}\n`),
+          onSession: (id) => noteThreadId(runCtx.vfs, id, job.threadId),
+        },
+      )
+      if (result.exitCode !== 0) {
+        runError = result.stderr.trim().slice(-1500) || `exit ${result.exitCode}`
+      } else {
+        const replySession = resolveSessionForThread(root, job.threadId)
+        const reply = replySession !== null ? lastAssistantText(runCtx.vfs, replySession) : null
+        final = (reply ?? result.stdout).trim() || '(no output)'
+      }
+    } catch (err) {
+      runError = err instanceof Error ? err.message : String(err)
+    }
+    // workers report back to the chat that spawned them AND to the origin
+    // thread's transcript (so the main agent sees what finished): reply
+    // plus any files produced, success and failure alike
+    // exactly-once delivery: a crash between send and markDone must not
+    // re-send "done" on retry — skip when a previous attempt delivered
+    if (job.notifyChatId !== undefined && telegramJobNotify !== null && job.notified !== true) {
+      const headline = runError !== null ? `worker ${job.id} failed: ${runError}` : `done — ${job.id}:\n${final}`
+      try {
+        await telegramJobNotify.api.sendMessage(Number(job.notifyChatId), headline)
+        if (runError === null) {
+          for (const { path, name } of collectFreshFiles(runCtx.vfs, runCtx.cwd, startedAt)) {
+            const bytes = runCtx.vfs.readBytes(path)
+            if (bytes === null) continue
+            await telegramJobNotify.api.sendFile(Number(job.notifyChatId), name, bytes, mimeFor(name))
+          }
+        }
+        markNotified(runCtx.vfs, job.id)
+      } catch (err) {
+        process.stderr.write(`[job ${job.id}] notify failed: ${err instanceof Error ? err.message : String(err)}\n`)
+      }
+      // origin-thread transcript mirror (Hermes attach_to_session shape):
+      // a USER-role line with a delivery prefix — never assistant-role,
+      // which would break strict alternation on resume. Best-effort (a
+      // concurrent main-thread run may overwrite it — the chat message
+      // above is the durable copy).
+      if (job.originThreadId !== undefined) {
+        try {
+          const origin = loadSession(runCtx.vfs, job.originThreadId)
+          if (!('error' in origin)) {
+            const body = runError !== null ? `failed: ${runError}` : `finished: ${final.slice(0, 2000)}`
+            const line = `[Background delivery: ${job.id}] ${body}`
+            saveSession(runCtx.vfs, {
+              ...origin.session,
+              transcript: [...origin.session.transcript, line],
+              turns: [...origin.session.turns, { role: 'user', text: line }],
+            })
+          }
+        } catch {
+          // transcript append is advisory only
+        }
+      }
+    }
+    if (runError !== null) throw new Error(`job ${job.id}: ${runError.slice(0, 500)}`)
   }, { timeoutMs })
   if (outcome.status === 'busy') throw new Error(`job ${job.id}: thread ${job.threadId} busy — retrying next tick`)
   if (outcome.status === 'timeout') throw new Error(`job ${job.id}: thread ${job.threadId} timed out — retrying next tick`)
@@ -561,13 +663,34 @@ if (process.env.CELL_TELEGRAM === '1') {
       const apiBase = `https://api.telegram.org/bot${loaded.config.token}`
       const api = createTelegramApi(apiBase)
       const chatLabel = (chatId: number): string => `chat ${chatId}`
-      const runChat = async (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[] = []): Promise<string> => {
+      telegramJobNotify = { api }
+      // per-chat FIFO: a message arriving while its thread is busy QUEUES
+      // instead of dying with 'still working' — the drain below runs each
+      // queued turn in order after the current one finishes. Main-thread
+      // runs are triage-short, so the queue drains fast; workers run on
+      // their own threads and never block the chat.
+      const MAX_QUEUED = 5
+      const pendingTurns = new Map<string, Array<{ text: string; attachments: TelegramAttachmentIn[] }>>()
+      const runChat = async (chatId: number, text: string, threadId: string, attachments: TelegramAttachmentIn[] = [], fromQueue = false): Promise<string> => {
+        if (!fromQueue && router.isBusy(threadId)) {
+          const queued = pendingTurns.get(threadId) ?? []
+          if (queued.length >= MAX_QUEUED) {
+            return 'still catching up — hold that thought for a moment'
+          }
+          queued.push({ text, attachments })
+          pendingTurns.set(threadId, queued)
+          return `queued (position ${queued.length}) — still on the previous one, it runs next`
+        }
         const runCtx = buildRunContext(root, threadId)
         const outcome = await router.runExclusive(threadId, async () => {
           const controller = new AbortController()
           const timeout = setTimeout(() => controller.abort(), timeoutMs)
           try {
             let runSessionId = ''
+            // background workers: this chat stays responsive while a
+            // worker thread does the heavy lifting and reports back
+            const scheduleBackground = (input: { task: string }) =>
+              scheduleBackgroundTask(runCtx.vfs, threadId, String(chatId), input.task)
             // stage uploads first (mirrors the web composer): binary files
             // land on disk where every tool — and the vision input — finds them
             const staged: string[] = []
@@ -585,6 +708,7 @@ if (process.env.CELL_TELEGRAM === '1') {
               prompt = `${text}\n[attached files on disk: ${staged.join(', ')}]`
             }
             prompt += '\n[Any files you create or update in this thread will be sent back to the chat — name the deliverable.]'
+            prompt += '\n[This is the live chat thread: answer quick things yourself inline (a few steps). Anything bigger — documents, builds, long reads — goes to background_task so the chat stays responsive; the worker reports back when done.]'
             const args = [prompt]
             const continued = resolveSessionForThread(root, threadId)
             if (continued !== null) args.push('--resume', continued)
@@ -606,15 +730,18 @@ if (process.env.CELL_TELEGRAM === '1') {
                 shell: runCtx.shell,
                 jobShell: runCtx.jobShell,
                 signal: controller.signal,
-                maxSteps: 40,
+                // triage budget: the interactive run answers or delegates
+                // fast; heavy work belongs in background_task workers
+                maxSteps: 12,
                 ...(images.length > 0 ? { images } : {}),
+                scheduleBackground,
                 // explicit non-interactive policy: the allowlisted DM chat
                 // IS the user, so ask-tools run — destructive bash shapes
                 // stay refused by the deny scans either way. Powerful
                 // registry writes are audit-logged so a later look at
                 // stderr shows exactly what the chat installed/delegated.
                 approve: async (call) => {
-                  if (call.name === 'skill_install' || call.name === 'delegate') {
+                  if (call.name === 'skill_install' || call.name === 'delegate' || call.name === 'background_task') {
                     process.stderr.write(`cell server: telegram chat ${chatId} used ${call.name} in ${threadId}\n`)
                   }
                   return true
@@ -652,7 +779,30 @@ if (process.env.CELL_TELEGRAM === '1') {
         }, { timeoutMs })
         if (outcome.status === 'busy') return 'still working on the last one — one moment'
         if (outcome.status === 'timeout') return 'that took too long — try a smaller step'
-        return outcome.value
+        // drain the FIFO: each queued message runs as its own resumed
+        // turn, in order, with its own reply straight to the chat.
+        // fromQueue bypasses the busy check (the router is free here;
+        // a new arrival mid-drain re-queues behind us, order preserved).
+        const firstReply = outcome.value
+        void (async () => {
+          for (;;) {
+            const next = pendingTurns.get(threadId)?.shift()
+            if (next === undefined) break
+            if (pendingTurns.get(threadId)?.length === 0) pendingTurns.delete(threadId)
+            try {
+              const reply = await runChat(chatId, next.text, threadId, next.attachments, true)
+              await api.sendMessage(chatId, reply)
+            } catch (err) {
+              try {
+                await api.sendMessage(chatId, `error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 1000))
+              } catch {
+                // delivery failed; the error is already logged below
+              }
+              process.stderr.write(`cell server: queued turn failed for chat ${chatId}: ${err instanceof Error ? err.message : String(err)}\n`)
+            }
+          }
+        })()
+        return firstReply
       }
       const poller = startTelegramPoller(tgVfs, apiBase, loaded.config, {
         log: (message) => process.stderr.write(`cell server: ${message}\n`),

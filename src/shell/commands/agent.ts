@@ -241,6 +241,8 @@ export interface RunAgentOpts {
   chatId?: string
   /** thread the run belongs to (stable per chat on Telegram) */
   threadId?: string
+  /** background worker entry point (server runs with a job queue) */
+  scheduleBackground?: (input: { task: string }) => Promise<{ ok: true; jobId: string; threadId: string } | { error: string }>
   /** vision input: shown to the model on the first turn, never persisted
    * to the session file (bytes stay out of transcripts) */
   images?: ImageAttachment[]
@@ -445,6 +447,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     ...(delegate ? { delegate, delegateDepth: depth } : { delegateDepth: depth }),
     ...(opts.chatId !== undefined ? { chatId: opts.chatId } : {}),
     ...(opts.threadId !== undefined ? { threadId: opts.threadId } : {}),
+    ...(opts.scheduleBackground !== undefined ? { scheduleBackground: opts.scheduleBackground } : {}),
   }
   // strip a .json suffix so --resume x.json does not save x.json.json (P1-5)
   const id = resumeId !== null ? resumeId.replace(/\.json$/, '') : sessionId()
