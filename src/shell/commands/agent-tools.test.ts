@@ -204,3 +204,59 @@ describe('agent truncation + trailers (P0-5/P0-6)', () => {
     expect(clampTimeout('oops')).toBe(AGENT_BASH_TIMEOUT_MS)
   })
 })
+
+describe('host boundary + inline destructive code', () => {
+  it('/proc and /sys are never agent-readable', () => {
+    expect(bashDeniedPath('cat /proc/self/environ')).toBe('/proc/self/environ')
+    expect(bashDeniedPath('cat /sys/kernel/hostname')).toBe('/sys/kernel/hostname')
+    expect(bashDenyReason('F=/proc/self/environ; cat $F')).toMatch(/not reachable from bash/)
+    // ordinary tools that never spell those paths are unaffected
+    expect(bashDenyReason('ps aux')).toBeNull()
+  })
+
+  it('redirect without space cannot hide a denied path', () => {
+    expect(bashDeniedPath('cat<~/.cell/agent.json')).toBe('/home/user/.cell/agent.json')
+    expect(bashDenyReason('export F=~/.cell/agent.json;cat<$F')).toMatch(/not reachable from bash/)
+  })
+
+  it('${VAR:-default} uses the default branch when unset', () => {
+    expect(bashDeniedPath('cat ${P:-~/.cell/agent.json}')).toBe('/home/user/.cell/agent.json')
+    // known value wins over the default: denied here, allowed for /tmp
+    expect(bashDeniedPath('F=~/.cell/agent.json; cat ${F:-/tmp/x}')).toBe('/home/user/.cell/agent.json')
+    expect(bashDeniedPath('F=/tmp/x; cat ${F:-~/.cell/agent.json}')).toBeNull()
+  })
+
+  it('inline destructive code is refused; benign inline code runs', () => {
+    expect(bashDenyReason('python3 -c "import shutil; shutil.rmtree(\"/x\")"')).toMatch(/inline destructive/)
+    expect(bashDenyReason('node -e "require(\'fs\').rmSync(\"/x\",{recursive:true})"')).toMatch(/inline destructive/)
+    expect(bashDenyReason('python3 -c "import os; os.system(\"id\")"')).toMatch(/inline destructive/)
+    expect(bashDenyReason('find /tmp -name x -delete')).toMatch(/find -delete/)
+    expect(bashDenyReason('dd if=/dev/zero of=/tmp/z bs=1M')).toMatch(/dd of=/)
+    expect(bashDenyReason('chmod -R 777 proj')).toMatch(/chmod/)
+    expect(bashDenyReason('git clean -fdx')).toMatch(/git clean/)
+    expect(bashDenyReason('python3 -c "print(6*7)"')).toBeNull()
+    expect(bashDenyReason('node -e "console.log(1)"')).toBeNull()
+    expect(bashDenyReason('python3 script.py')).toBeNull()
+    expect(bashDenyReason('chmod -R u+x bin')).toBeNull()
+  })
+})
+
+describe('load_skill provenance banner', () => {
+  it('marks non-builtin skills, leaves builtins clean', async () => {
+    const { runTool } = await import('./agent-tools')
+    const { createVfs } = await import('../../vfs/vfs')
+    const vfs = createVfs()
+    const shell = { exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }) }
+    const deps = {
+      vfs,
+      shell,
+      cwd: '/home/user',
+      skills: new Map([['bot', '# bot\n\nbody'], ['unslop', '# unslop\n\nbody']]),
+      skillSources: new Map([['bot', 'builtin'], ['unslop', 'home']]),
+    }
+    const builtin = await runTool(deps as never, { id: 'a', name: 'load_skill', input: { name: 'bot' } })
+    expect(builtin.content.startsWith('[untrusted')).toBe(false)
+    const home = await runTool(deps as never, { id: 'b', name: 'load_skill', input: { name: 'unslop' } })
+    expect(home.content).toMatch(/\[untrusted home skill 'unslop'/)
+  })
+})

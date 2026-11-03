@@ -342,19 +342,28 @@ Security posture (all asserted by tests in `server/telegram.test.ts`):
 the token comes from `CELL_TELEGRAM_TOKEN` or a token file outside the
 workspace (`CELL_TELEGRAM_TOKEN_FILE` — refused when inside it), never
 from a workspace file: the agent's bash can read anything mounted in its
-shell (`F=…; cat $F` spells around the text scanner), so workspace
-secrets are not secrets. `~/.cell/telegram.json` holds only the
-non-secret allowlist (`{"allowFrom": [<chat-id>]}`); a `botToken`
-inside it fails closed with an error. An empty allowlist fails closed —
-the poller refuses to start; strangers get silence (no model call, no
-reply, no oracle — group/channel messages are dropped too); commands
-unknown to the bot fall through as plain chat text. Heads-up: server
-runs use full permission, so over Telegram `ask` tools
+shell, so workspace secrets are not secrets. The server scrubs the token
+from its environment after boot and refuses `/proc` and `/sys` to agent
+bash (that closes the `/proc/<pid>/environ` read); prefer file config —
+a 0600 file in a 0700 dir outside the workspace. `~/.cell/telegram.json`
+holds only the non-secret allowlist (`{"allowFrom": [<chat-id>]}`); a
+`botToken` inside it fails closed with an error. An empty allowlist fails
+closed — the poller refuses to start; strangers get silence (no model
+call, no reply, no oracle — group/channel messages are dropped too);
+`/status` shows only the requesting chat's own thread jobs; unknown
+`/commands` reach the model as plain chat text (built-in slash commands
+like `/commit` expand — any allowlisted chat can invoke them). Heads-up:
+server runs use full permission, so over Telegram `ask` tools
 (bash/edit/skill_install/delegate) execute without a human checkpoint —
 that is the point of a bound personal chat (the allowlist is the
-authority), and destructive bash shapes stay refused by the deny scans,
-including through one hop of variable aliasing. If a token ever passes
-through a chat log, `/revoke` it with BotFather and mint a fresh one.
+authority; Telegram use assumes a single operator). Destructive bash
+shapes stay refused by the deny scans — `rm -rf` in any spelling, `find
+-delete`, `dd of=`, numeric `chmod -R`, `git clean -fdx`, inline
+`python3 -c`/`node -e` destructive calls, and one hop of variable
+aliasing (`F=…; cat $F`, `${VAR:-default}`, `cat<file`). Skill installs
+are https-only with loopback/private hosts refused. If a token ever
+passes through a chat log, `/revoke` it with BotFather and mint a fresh
+one.
 
 | Env var | Purpose | Default |
 |---|---|---|

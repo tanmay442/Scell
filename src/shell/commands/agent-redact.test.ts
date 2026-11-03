@@ -40,3 +40,11 @@ describe('key redaction', () => {
     expect(JSON.stringify(out)).not.toContain('sk-ant-abc')
   })
 })
+
+describe('telegram token redaction', () => {
+  it('masks bot tokens and bot API URLs', () => {
+    expect(redactSecrets('token 123456789:AAH-53YvVrCtQHWg5f5H3rpcc5P-RgFDkmQ end')).not.toContain('AAH-53YvVrCt')
+    expect(redactSecrets('https://api.telegram.org/bot123456789:AAH-53YvVrCtQHWg5f5H3rpcc5P-RgFDkmQ/sendMessage')).not.toContain('AAH-')
+    expect(redactSecrets('meet at 10:30 tomorrow')).toBe('meet at 10:30 tomorrow')
+  })
+})

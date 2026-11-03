@@ -354,6 +354,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
   const customTools = new Map<string, CustomToolDef>(loadCustomTools(vfs).tools.map((tool) => [tool.name, tool]))
   const { skills, warnings: skillWarnings } = loadSkills(vfs, opts.cwd)
   const skillBodies = new Map(skills.map((skill) => [skill.name, `# ${skill.name}\n\n${skill.body}`]))
+  const skillSources = new Map(skills.map((skill) => [skill.name, skill.source]))
 
   // one bot, every surface: the same identity, memory and skill index in
   // the web UI, Telegram and headless runs — threads differ, the bot doesn't
@@ -412,7 +413,12 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
               opts.onSession?.(id)
             },
           })
-          if (child.exitCode !== 0) return { error: child.stderr.trim().slice(-2000) || `subagent exited ${child.exitCode}` }
+          // on failure report the transcript tail, not just stderr: a
+          // looping child dies with an empty stderr and its steps wasted
+          if (child.exitCode !== 0) {
+            const evidence = child.stdout.trim().slice(-2000) || child.stderr.trim().slice(-2000)
+            return { error: `subagent exited ${child.exitCode}${evidence === '' ? '' : ` — last output:\n${evidence}`}` }
+          }
           let childSteps = 0
           if (childSessionId !== '') {
             const loaded = loadSession(vfs, childSessionId)
@@ -425,6 +431,7 @@ export async function runAgent(vfs: Vfs, args: string[], opts: RunAgentOpts): Pr
     shell: opts.shell,
     cwd: opts.cwd,
     skills: skillBodies,
+    skillSources,
     customTools,
     ...(opts.jobShell ? { jobs: new JobManager(opts.jobShell, vfs) } : {}),
     ...(delegate ? { delegate, delegateDepth: depth } : { delegateDepth: depth }),

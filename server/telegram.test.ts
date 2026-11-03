@@ -14,7 +14,7 @@ import { addReminder } from '../src/shell/commands/agent-reminders'
 
 /** Fake Bot API: queued updates in, sent messages out. */
 function mockApi() {
-  const updates: Array<{ update_id: number; message?: { chat: { id: number; type: string }; text?: string } }> = []
+  const updates: Array<{ update_id: number; message?: { chat?: { id: number; type: string }; type?: string; text?: string; from?: { id: number } } }> = []
   const sent: Array<{ chatId: number; text: string }> = []
   let nextId = 1
   const fetch: TelegramFetch = async (url, init) => {
@@ -35,6 +35,7 @@ function mockApi() {
   return {
     fetch,
     sent,
+    updates,
     pushText: (chatId: number, text: string, type = 'private') => {
       updates.push({ update_id: nextId++, message: { chat: { id: chatId, type }, text } })
     },
@@ -242,5 +243,47 @@ describe('telegram poller (mock Bot API)', () => {
     // fired reminders are gone; nothing due anymore
     const again = await deliverDueReminders(vfs, sender, now)
     expect(again.delivered).toBe(0)
+  })
+})
+
+describe('telegram hardening', () => {
+  it('never splits a surrogate pair across chunks', () => {
+    const chunks = chunkTelegramMessage('😀'.repeat(10), 5)
+    expect(chunks.join('')).toBe('😀'.repeat(10))
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++) {
+        const code = chunk.charCodeAt(i)
+        // no lone surrogates anywhere in any chunk
+        if (code >= 0xd800 && code <= 0xdbff) expect(chunk.charCodeAt(i + 1)).toBeGreaterThanOrEqual(0xdc00)
+        if (code >= 0xdc00 && code <= 0xdfff) expect(chunk.charCodeAt(i - 1)).toBeLessThanOrEqual(0xdbff)
+      }
+    }
+  })
+
+  it('one malformed update does not abort its batch', async () => {
+    const vfs = createVfs()
+    const api = mockApi()
+    let texts = 0
+    const poller = startTelegramPoller(
+      vfs,
+      'https://api.telegram.org/botX',
+      { token: 'X', allowFrom: [42] },
+      {
+        log: () => {},
+        onText: async (_c, text) => {
+          texts++
+          return `got ${text}`
+        },
+        onCommand: async () => 'x',
+      },
+      api.fetch,
+    )
+    // malformed (no chat) + good in one batch: good one still delivers
+    api.updates.push({ update_id: 900, message: { chat: undefined as never, type: 'private' } })
+    api.pushText(42, 'after poison')
+    await waitFor(() => api.sent.length >= 1)
+    expect(texts).toBe(1)
+    expect(api.sent[0].text).toBe('got after poison')
+    poller.stop()
   })
 })

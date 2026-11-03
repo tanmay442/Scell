@@ -1,5 +1,13 @@
 import { listSessions, loadSession } from './agent-sessions'
+import { redactSecrets } from './agent-redact'
 import type { Vfs } from '../../vfs/types'
+
+export const MAX_HISTORY_SCANNED = 200
+
+/** Total session files (for the searched-N-of-M receipt). */
+export function historySessionCount(vfs: Vfs): number {
+  return listSessions(vfs).length
+}
 
 /**
  * Cross-thread search: full-text over saved session prompts, titles and
@@ -15,7 +23,6 @@ export interface HistoryHit {
   score: number
 }
 
-const MAX_SESSIONS_SCANNED = 200
 const SNIPPET_RADIUS = 140
 
 function snippetAround(text: string, index: number): string {
@@ -31,7 +38,7 @@ export function searchHistory(vfs: Vfs, query: string, limit = 8): HistoryHit[] 
   if (needle === '') return []
   const terms = needle.split(/\s+/).filter((t) => t.length > 1)
   if (terms.length === 0) return []
-  const files = listSessions(vfs).slice(0, MAX_SESSIONS_SCANNED)
+  const files = listSessions(vfs).slice(0, MAX_HISTORY_SCANNED)
   const hits: HistoryHit[] = []
   for (const file of files) {
     const id = file.replace(/\.json$/, '')
@@ -46,6 +53,11 @@ export function searchHistory(vfs: Vfs, query: string, limit = 8): HistoryHit[] 
     const texts: string[] = [session.prompt, session.title ?? '']
     for (const turn of session.turns ?? []) {
       if (typeof turn.text === 'string') texts.push(turn.text)
+      // tool outputs are searchable too (and redacted below) — errors and
+      // command output are the most-asked-about history
+      for (const result of turn.toolResults ?? []) {
+        if (typeof result.content === 'string') texts.push(result.content)
+      }
     }
     const haystack = texts.join('\n')
     const lower = haystack.toLowerCase()
@@ -62,11 +74,14 @@ export function searchHistory(vfs: Vfs, query: string, limit = 8): HistoryHit[] 
       score += count
     }
     if (score === 0) continue
+    // defense in depth: sessions are redacted at save time, but legacy or
+    // hand-written files may not be — never surface a raw secret in a hit
+    const rawSnippet = first === -1 ? haystack.slice(0, 200).replace(/\s+/g, ' ') : snippetAround(haystack, first)
     hits.push({
       sessionId: id,
       title: session.title ?? null,
       startedAt: session.startedAt ?? null,
-      snippet: first === -1 ? haystack.slice(0, 200).replace(/\s+/g, ' ') : snippetAround(haystack, first),
+      snippet: redactSecrets(rawSnippet),
       score,
     })
   }

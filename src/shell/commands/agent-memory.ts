@@ -74,9 +74,21 @@ export function loadMemory(vfs: Vfs): MemoryFact[] {
   }
 }
 
+/** Classic injection shapes have no business as durable facts. Narrow by
+ * design: only direct instruction-override phrasing is refused — broader
+ * policing would false-positive on legit preferences. */
+const MEMORY_REFUSALS = [
+  /ignore\s+((all|previous|prior)\s+)*instructions/i,
+  /disregard\s+((all|previous|prior)\s+)*(instructions|.*system prompt)/i,
+  /jailbreak/i,
+]
+
 export function saveMemoryFact(vfs: Vfs, text: string): { ok: true; total: number } | { error: string } {
   const clean = text.trim().replace(/\s+/g, ' ')
   if (clean === '') return { error: 'memory_save: empty fact — nothing stored' }
+  if (MEMORY_REFUSALS.some((re) => re.test(clean))) {
+    return { error: 'memory_save: refusing instruction-override phrasing — memory holds user facts, not directives' }
+  }
   if (clean.length > MAX_FACT_CHARS) return { error: `memory_save: fact is ${clean.length} chars, cap is ${MAX_FACT_CHARS} — shorten it` }
   const facts = loadMemory(vfs)
   if (facts.some((f) => f.text.toLowerCase() === clean.toLowerCase())) {

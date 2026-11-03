@@ -45,3 +45,30 @@ describe('agent-reminders', () => {
     expect(dueReminders(vfs, Date.now())).toEqual([])
   })
 })
+
+describe('agent-reminders hardening', () => {
+  it('rejects non-numeric chat ids and immediate times', () => {
+    const vfs = createVfs()
+    const now = Date.parse('2026-01-01T12:00:00Z')
+    expect(addReminder(vfs, { text: 'x', when: 'in 5m', chatId: 'abc' }, now)).toEqual({
+      error: expect.stringContaining('numeric'),
+    })
+    expect(addReminder(vfs, { text: 'x', when: 'in 0m' }, now)).toEqual({
+      error: expect.stringContaining('future'),
+    })
+    expect(loadReminders(vfs)).toEqual([])
+  })
+
+  it('drops reminders after 5 failed deliveries', async () => {
+    const { noteFailedDelivery, MAX_DELIVERY_ATTEMPTS } = await import('./agent-reminders')
+    expect(MAX_DELIVERY_ATTEMPTS).toBe(5)
+    const vfs = createVfs()
+    const now = Date.now()
+    const added = addReminder(vfs, { text: 'x', when: new Date(now - 1000).toISOString(), chatId: '1' }, now - 2000)
+    if (!('ok' in added)) throw new Error('setup failed')
+    for (let i = 0; i < 4; i++) expect(noteFailedDelivery(vfs, added.reminder.id)).toBe(true)
+    expect(loadReminders(vfs)).toHaveLength(1)
+    expect(noteFailedDelivery(vfs, added.reminder.id)).toBe(false)
+    expect(loadReminders(vfs)).toHaveLength(0)
+  })
+})

@@ -90,3 +90,25 @@ describe('agent-skill-install trust boundary', () => {
     expect(vfs.isFile(`${SKILLS_DIR}/commit/SKILL.md`)).toBe(false)
   })
 })
+
+describe('agent-skill-install network + name hardening', () => {
+  it('refuses plaintext http and internal hosts', async () => {
+    const vfs = (await import('../../vfs/vfs')).createVfs()
+    const fetch = async () => ({ ok: true, status: 200, text: async () => '# s\n\nbody text here ok' })
+    expect(await installSkill(vfs, { url: 'http://example.com/s/SKILL.md' }, fetch)).toEqual({
+      error: expect.stringContaining('non-https'),
+    })
+    for (const host of ['127.0.0.1', 'localhost', '169.254.169.254', '10.0.0.5', '192.168.1.1', '[::1]']) {
+      const out = await installSkill(vfs, { url: `https://${host}/s/SKILL.md` }, fetch)
+      expect(out).toEqual({ error: expect.stringContaining('internal') })
+    }
+    expect(vfs.listAllFiles()).toEqual([])
+  })
+
+  it('rejects over-long derived names instead of truncating', async () => {
+    const vfs = (await import('../../vfs/vfs')).createVfs()
+    const out = await installSkill(vfs, { name: 'a'.repeat(41), markdown: '# skill\n\nEnough body text here.' })
+    expect(out).toEqual({ error: expect.stringContaining('max 40') })
+    expect(vfs.listAllFiles()).toEqual([])
+  })
+})

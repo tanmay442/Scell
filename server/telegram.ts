@@ -1,5 +1,5 @@
 import type { Vfs } from '../src/vfs/types'
-import { deleteReminder, dueReminders } from '../src/shell/commands/agent-reminders'
+import { deleteReminder, dueReminders, noteFailedDelivery } from '../src/shell/commands/agent-reminders'
 
 /**
  * Telegram connector: the one global bot on a second surface. Long-poll
@@ -112,12 +112,15 @@ export function chunkTelegramMessage(text: string, max = MESSAGE_CHUNK): string[
   const lines = clean.split('\n')
   let current = ''
   for (const line of lines) {
-    if (line.length > max) {
+    // slice on code points, not UTF-16 units: an odd max must not split
+    // a surrogate pair into lone surrogates (renders as U+FFFD)
+    const points = Array.from(line)
+    if (points.length > max) {
       if (current !== '') {
         chunks.push(current)
         current = ''
       }
-      for (let i = 0; i < line.length; i += max) chunks.push(line.slice(i, i + max))
+      for (let i = 0; i < points.length; i += max) chunks.push(points.slice(i, i + max).join(''))
       continue
     }
     if ((current + '\n' + line).length > max && current !== '') {
@@ -259,8 +262,16 @@ export function startTelegramPoller(
       const body = (await res.json()) as { ok: boolean; result?: TelegramUpdate[] }
       if (body.ok !== true || !Array.isArray(body.result)) throw new Error('getUpdates: bad response')
       for (const update of body.result) {
-        state.offset = Math.max(state.offset, update.update_id + 1)
-        await handleUpdate(update)
+        // one poisoned update must not abort its batch: handle each in
+        // isolation, and only advance the offset past well-formed ones
+        try {
+          await handleUpdate(update)
+          if (typeof update.update_id === 'number' && Number.isFinite(update.update_id)) {
+            state.offset = Math.max(state.offset, update.update_id + 1)
+          }
+        } catch (err) {
+          log(`telegram: skipping malformed update: ${err instanceof Error ? err.message : String(err)}`)
+        }
       }
       saveState(vfs, state)
     } finally {
@@ -347,7 +358,10 @@ export async function deliverDueReminders(
       await api.sendMessage(Number(reminder.chatId), `reminder: ${reminder.text}`)
       delivered++
     } catch {
+      // retained for retry, but dropped past the cap so one bad chat
+      // cannot clog the table (or nag) forever
       undeliverable++
+      noteFailedDelivery(vfs, reminder.id)
       continue
     }
     deleteReminder(vfs, reminder.id)

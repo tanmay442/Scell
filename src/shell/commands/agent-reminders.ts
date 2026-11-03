@@ -19,6 +19,8 @@ export interface Reminder {
   chatId: string | null
   threadId: string | null
   createdAt: string
+  /** failed delivery attempts; dropped after MAX_DELIVERY_ATTEMPTS */
+  attempts?: number
 }
 
 function rid(): string {
@@ -59,6 +61,7 @@ export function parseReminderWhen(when: string, now = Date.now()): { at: number 
     const unit = relative[2].toLowerCase()
     const mult = unit.startsWith('m') ? 60_000 : unit.startsWith('h') ? 3_600_000 : 86_400_000
     const at = now + Math.round(n * mult)
+    if (at <= now) return { error: 'remind: must be in the future' }
     if (at - now > MAX_FUTURE_MS) return { error: `remind: at most 7 days out` }
     return { at }
   }
@@ -77,6 +80,11 @@ export function addReminder(
   const text = input.text.trim().replace(/\s+/g, ' ')
   if (text === '') return { error: 'remind: empty text — say what to remind about' }
   if (text.length > MAX_TEXT_CHARS) return { error: `remind: text is ${text.length} chars, cap is ${MAX_TEXT_CHARS}` }
+  // chat ids are Telegram numerics (or null for chatless runs): anything
+  // else would fail every delivery tick and clog the 50-slot table
+  if (input.chatId !== undefined && input.chatId !== null && !/^\d+$/.test(input.chatId)) {
+    return { error: 'remind: bad chat id — reminders address numeric chats only' }
+  }
   const parsed = parseReminderWhen(input.when, now)
   if ('error' in parsed) return parsed
   const reminders = loadReminders(vfs)
@@ -96,6 +104,23 @@ export function addReminder(
 
 export function dueReminders(vfs: Vfs, now = Date.now()): Reminder[] {
   return loadReminders(vfs).filter((r) => Date.parse(r.runAt) <= now)
+}
+
+export const MAX_DELIVERY_ATTEMPTS = 5
+
+/** A failed send: count it, and drop the reminder past the cap so one bad
+ * chat id cannot clog the table forever. Returns false when dropped. */
+export function noteFailedDelivery(vfs: Vfs, id: string): boolean {
+  const reminders = loadReminders(vfs)
+  const found = reminders.find((r) => r.id === id)
+  if (!found) return false
+  found.attempts = (found.attempts ?? 0) + 1
+  if (found.attempts >= MAX_DELIVERY_ATTEMPTS) {
+    saveAll(vfs, reminders.filter((r) => r.id !== id))
+    return false
+  }
+  saveAll(vfs, reminders)
+  return true
 }
 
 /** Firing is delete-on-delivery: a reminder can never nag twice. */

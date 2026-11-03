@@ -29,8 +29,45 @@ export function skillUrlToRaw(url: string): string {
   return url.trim()
 }
 
+/** Hosts a skill fetch must never touch: loopback, private nets, link-local
+ * (cloud metadata lives at 169.254.169.254) and opaque local names.
+ * DNS rebinding (evil.com resolving to 127.0.0.1) is NOT covered — the
+ * explicit user request plus ask-approval remain the gate for those. */
+const BLOCKED_HOSTS = [
+  /^localhost$/i,
+  /\.localhost$/i,
+  /\.local$/i,
+  /\.internal$/i,
+  /^metadata\.google\.internal$/i,
+  /^instance-data$/i,
+]
+
+function blockedSkillHost(host: string): boolean {
+  const clean = host.trim().toLowerCase().replace(/\.$/, '')
+  if (BLOCKED_HOSTS.some((re) => re.test(clean))) return true
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(clean)
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])]
+    if (v4.slice(1).some((n) => Number(n) > 255)) return false
+    if (a === 127) return true
+    if (a === 10) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 192 && b === 168) return true
+    if (a === 169 && b === 254) return true
+    if (a === 0) return true
+    return false
+  }
+  if (/^\[.*\]$/.test(clean)) {
+    const inner = clean.slice(1, -1).toLowerCase()
+    return inner === '::1' || inner.startsWith('fe80:') || inner.startsWith('fc00:') || inner.startsWith('fd00:')
+  }
+  return false
+}
+
 function slugify(name: string): string {
-  return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)
+  // no length cap here: over-long names must ERROR (never silently
+  // truncate onto a colliding prefix) — length is checked at install
+  return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
 }
 
 function nameFromFrontmatter(body: string): string | null {
@@ -72,7 +109,17 @@ export async function installSkill(
   let body = typeof input.markdown === 'string' ? input.markdown : ''
   const rawUrl = typeof input.url === 'string' && input.url.trim() !== '' ? skillUrlToRaw(input.url) : null
   if (rawUrl !== null) {
-    if (!/^https?:\/\//i.test(rawUrl)) return { error: `skill_install: refusing non-http(s) URL` }
+    // https-only (no MITM-rewritable plaintext) + no internal hosts: the
+    // fetched body is fed straight to the model, so the transport and
+    // the host must both be trustworthy — beyond the user's own request
+    if (!/^https:\/\//i.test(rawUrl)) return { error: 'skill_install: refusing non-https URL (paste the markdown directly for local files)' }
+    try {
+      if (blockedSkillHost(new URL(rawUrl).hostname)) {
+        return { error: 'skill_install: refusing internal/local host (paste the markdown directly instead)' }
+      }
+    } catch {
+      return { error: 'skill_install: malformed URL' }
+    }
     const fetchFn: FetchImpl =
       fetchImpl ?? ((url, init) => (globalThis.fetch as typeof fetch)(url, init) as unknown as Promise<{ ok: boolean; status: number; text(): Promise<string> }>)
     const controller = new AbortController()
@@ -92,7 +139,15 @@ export async function installSkill(
     return { error: `skill_install: body is ${body.length} bytes, cap is ${MAX_SKILL_BYTES} — skills must be focused` }
   }
   if (body.trim().length < 20) return { error: 'skill_install: body too short to be a skill' }
-  const explicit = typeof input.name === 'string' && input.name.trim() !== '' ? slugify(input.name) : ''
+  const explicitRaw = typeof input.name === 'string' && input.name.trim() !== '' ? input.name : null
+  if (explicitRaw !== null) {
+    const slug = slugify(explicitRaw)
+    if (slug.length > 40) return { error: `skill_install: derived name '${slug}' is ${slug.length} chars (max 40) — pass a shorter name` }
+    if (!NAME_RE.test(slug)) {
+      return { error: `skill_install: derived name '${slug}' is unusable (use 2-40 lowercase letters/digits/dashes)` }
+    }
+  }
+  const explicit = explicitRaw !== null ? slugify(explicitRaw) : ''
   const name = (explicit !== '' && NAME_RE.test(explicit) ? explicit : null) ?? nameFromFrontmatter(body) ?? (rawUrl !== null ? nameFromUrl(rawUrl) : null)
   if (name === null || !NAME_RE.test(name)) {
     return { error: 'skill_install: could not derive a skill name (use 2-40 lowercase letters/digits/dashes, or pass name explicitly)' }

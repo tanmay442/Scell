@@ -566,8 +566,15 @@ if (process.env.CELL_TELEGRAM === '1') {
                 maxSteps: 40,
                 // explicit non-interactive policy: the allowlisted DM chat
                 // IS the user, so ask-tools run — destructive bash shapes
-                // stay refused by the deny scans either way
-                approve: async () => true,
+                // stay refused by the deny scans either way. Powerful
+                // registry writes are audit-logged so a later look at
+                // stderr shows exactly what the chat installed/delegated.
+                approve: async (call) => {
+                  if (call.name === 'skill_install' || call.name === 'delegate') {
+                    process.stderr.write(`cell server: telegram chat ${chatId} used ${call.name} in ${threadId}\n`)
+                  }
+                  return true
+                },
                 chatId: String(chatId),
                 threadId,
                 onSession: (id) => {
@@ -597,14 +604,22 @@ if (process.env.CELL_TELEGRAM === '1') {
         onCommand: async (chatId, command, threadId) => {
           if (command.command === 'new') return `fresh thread started (${threadId}) — what are we working on?`
           if (command.command === 'status') {
-            const jobs = listJobs(tgVfs)
-            const live = jobs.filter((j) => j.status === 'pending')
+            // per-thread view only: one chat learns nothing about other
+            // chats' jobs (not even their existence)
+            const live = listJobs(tgVfs).filter((j) => j.status === 'pending' && j.threadId === threadId)
             return live.length === 0 ? `thread ${threadId} — idle, no jobs running` : `thread ${threadId} — ${live.map((j) => `${j.id} ${j.status}`).join(', ')}`
           }
           return `${chatLabel(chatId)} bound to thread ${threadId}. Send anything to work; /new starts fresh, /status shows jobs.`
         },
       })
       void poller
+      // the token must not linger in this process's environment: same-uid
+      // /proc/<pid>/environ readers (including agent shells) see the boot
+      // environment. Children already spawned keep their copy; everything
+      // spawned from here on inherits the scrubbed one. File-based config
+      // (0600 file in a 0700 dir outside the workspace) stays preferred.
+      delete process.env.CELL_TELEGRAM_TOKEN
+      delete process.env.CELL_TELEGRAM_TOKEN_FILE
       api
         .getMe()
         .then(
@@ -614,8 +629,9 @@ if (process.env.CELL_TELEGRAM === '1') {
       // promised follow-ups deliver back to the chat, every 30s
       setInterval(() => {
         deliverDueReminders(createDiskVfs(root), api).then(
-          ({ delivered }) => {
+          ({ delivered, undeliverable }) => {
             if (delivered > 0) process.stderr.write(`cell server: delivered ${delivered} telegram reminder(s)\n`)
+            if (undeliverable > 0) process.stderr.write(`cell server: ${undeliverable} telegram reminder(s) undeliverable (kept for retry, dropped after 5 failures)\n`)
           },
           () => {},
         )

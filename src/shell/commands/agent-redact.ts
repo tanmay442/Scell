@@ -22,6 +22,10 @@ const PATTERNS: { re: RegExp; replace: string }[] = [
   { re: /AKIA[0-9A-Z]{16}/g, replace: 'AKIA…[redacted]' },
   { re: /AIza[0-9A-Za-z_-]{8,}/g, replace: 'AIza…[redacted]' },
   { re: /xai-[A-Za-z0-9_-]{8,}/g, replace: 'xai-…[redacted]' },
+  // Telegram bot tokens (123456:AAH-…) and bot API URLs embedding them:
+  // pasted tokens must never persist into transcripts/sessions
+  { re: /\b\d{5,}:[A-Za-z0-9_-]{20,}/g, replace: '[redacted-telegram-token]' },
+  { re: /(https:\/\/api\.telegram\.org\/bot)[^/\s]+/g, replace: '$1[redacted]' },
   // Authorization: Bearer <token> (any case)
   { re: /bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, replace: 'Bearer …[redacted]' },
   // JSON / JS fields: "apiKey", "api_key", "key", secretAccessKey, secret, token —
